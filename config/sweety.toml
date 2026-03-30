@@ -9,6 +9,9 @@
 worker_threads = 0
 # 最大并发连接数（等价 Nginx worker_connections）
 worker_connections = 51200
+# 最大并发 HTTP 连接数（0 = 不限制，生产建议 10000-50000）
+# 超出时返回 503，防止内存爆涨（等价 Nginx limit_conn）
+max_connections = 10000
 # Keep-Alive 超时（秒，等价 Nginx keepalive_timeout）
 keepalive_timeout = 60
 # 客户端最大请求体（MB，等价 Nginx client_max_body_size）

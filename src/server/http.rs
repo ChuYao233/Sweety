@@ -124,6 +124,8 @@ impl SweetyServer {
             sni_resolvers: Arc::new(port_resolvers),
             access_loggers,
             proxy_caches,
+            active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_connections: cfg.global.max_connections,
         };
 
         // 第三步：构建 xitca-web App
@@ -234,14 +236,38 @@ pub struct AppState {
     pub access_loggers: Arc<HashMap<String, Arc<AccessLogger>>>,
     /// 反代响应缓存（按站点名索引）
     pub proxy_caches: Arc<HashMap<String, Arc<ProxyCache>>>,
+    /// 当前活跃连接数（原子计数器，无锁）
+    pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// 最大并发连接数（0 = 不限制）
+    pub max_connections: usize,
 }
 
 /// 多站点请求分发处理器
 ///
 /// 参数必须是 `&WebContext` 引用（xitca-web handler_service FromRequest 约束）
 async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
+    use std::sync::atomic::Ordering;
     let state = ctx.state();
     let req_start = std::time::Instant::now();
+
+    // max_connections 限流：超出并发上限时返回 503（与 Nginx limit_conn 行为一致）
+    if state.max_connections > 0 {
+        let cur = state.active_connections.fetch_add(1, Ordering::Relaxed);
+        if cur >= state.max_connections {
+            state.active_connections.fetch_sub(1, Ordering::Relaxed);
+            state.metrics.record_status(503);
+            return make_error_resp(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    } else {
+        state.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+    // 使用 defer 模式：无论如何退出都减计数器
+    struct ConnGuard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for ConnGuard {
+        fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Relaxed); }
+    }
+    let _guard = ConnGuard(state.active_connections.clone());
+
     state.metrics.inc_requests();
 
     // 提取 Host（去掉端口）

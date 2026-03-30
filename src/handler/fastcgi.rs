@@ -271,8 +271,12 @@ pub async fn handle_xitca(
         FcgiAddr::Tcp(p)  => (p.clone(), false),
     };
 
-    // 最多重试一次（idle 连接可能已被 PHP-FPM 关闭）
+    // 最多重试一次：第一次用 idle 连接，失败后清空 idle 并强制新建
     for attempt in 0u8..2 {
+        if attempt == 1 {
+            // idle 连接已失效，清空该地址全部 idle，下次 acquire 强制新建
+            pool.evict(&addr_str);
+        }
         let conn = match pool.acquire(&addr_str, is_unix).await {
             Ok(c) => c,
             Err(e) => {
@@ -281,7 +285,6 @@ pub async fn handle_xitca(
             }
         };
 
-        // 带超时发送请求并读取响应头（body 用 Stream 流式传输）
         let header_result = tokio::time::timeout(
             read_tmo,
             fcgi_send_and_read_headers(conn, &params, &req_body),
@@ -289,10 +292,16 @@ pub async fn handle_xitca(
 
         match header_result {
             Ok(Ok(parsed)) => {
-                return build_streaming_response(parsed, pool.clone(), addr_str);
+                match tokio::time::timeout(
+                    read_tmo,
+                    build_streaming_response(parsed, pool.clone(), addr_str),
+                ).await {
+                    Ok(resp) => return resp,
+                    Err(_) => return fcgi_error(StatusCode::GATEWAY_TIMEOUT, "PHP-FPM body 读取超时"),
+                }
             }
             Ok(Err(e)) if attempt == 0 => {
-                tracing::debug!("FastCGI idle 连接失效，重试: {}", e);
+                tracing::debug!("FastCGI idle 连接失效，重试新建: {}", e);
                 continue;
             }
             Ok(Err(e)) => {
@@ -476,103 +485,81 @@ where
     Ok(FcgiRecord { rec_type, data: buf })
 }
 
-/// 构建流式响应（响应头已解析，body 用 spawn+channel 流式推送）
-fn build_streaming_response(
+/// FastCGI 响应处理：全量收集 body 再返回，附带正确 Content-Length
+/// 对于 PHP 页面（通常 < 1MB）性能完全可接受；
+/// 大文件下载（> 4MB）才走流式路径，避免内存占用
+async fn build_streaming_response(
     parsed: FcgiParsedHeaders,
     pool: std::sync::Arc<crate::handler::fastcgi_pool::FcgiPool>,
     addr: String,
 ) -> WebResponse {
     use xitca_web::http::header::HeaderName;
 
-    let http_status = StatusCode::from_u16(parsed.status).unwrap_or(StatusCode::OK);
-
-    // 如果 body 已经全部读完（短响应），直接用 Vec
-    if parsed.body_done && parsed.body_prefix.len() < 512 * 1024 {
-        // 短响应：直接返回，不建 channel
-        // 但 conn 还需要读完剩余记录（body_done=true 表示已读完）
-        pool.release(&addr, parsed.conn);
-        return make_complete_response(parsed.status, parsed.headers, parsed.body_prefix);
-    }
-
-    // 长响应 / body 未读完：spawn task 读剩余 STDOUT，通过 channel 流式传输
-    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(8);
-    let body_prefix = parsed.body_prefix;
+    // 收集完整 body
+    let mut body = parsed.body_prefix;
     let mut conn = parsed.conn;
-    let body_done = parsed.body_done;
 
-    tokio::spawn(async move {
-        // 先发 prefix
-        if !body_prefix.is_empty() {
-            if tx.send(Ok(bytes::Bytes::from(body_prefix))).await.is_err() {
-                return;
-            }
-        }
-        if body_done {
-            pool.release(&addr, conn);
-            return;
-        }
-        // 继续读 STDOUT 记录
+    if !parsed.body_done {
         loop {
             let rec = match read_fcgi_conn(&mut conn).await {
                 Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
+                Err(_) => break,
             };
             match rec.rec_type {
                 t if t == FCGI_STDOUT => {
-                    if rec.data.is_empty() {
-                        // STDOUT 结束，归还连接
-                        pool.release(&addr, conn);
-                        return;
-                    }
-                    if tx.send(Ok(bytes::Bytes::from(rec.data))).await.is_err() {
-                        // 客户端已断开
-                        return;
+                    if rec.data.is_empty() { break; } // STDOUT 空记录 = 结束
+                    body.extend_from_slice(&rec.data);
+                    // 超过 4MB 过大，就不继续缓存了（正常 PHP 页面不会到这个大小）
+                    if body.len() > 4 * 1024 * 1024 {
+                        // 大响应：残余 body 用流式发送
+                        let initial = bytes::Bytes::from(std::mem::take(&mut body));
+                        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(16);
+                        tokio::spawn(async move {
+                            let _ = tx.send(Ok(initial)).await;
+                            loop {
+                                let rec = match read_fcgi_conn(&mut conn).await {
+                                    Ok(r) => r,
+                                    Err(e) => { let _ = tx.send(Err(e)).await; return; }
+                                };
+                                match rec.rec_type {
+                                    t if t == FCGI_STDOUT => {
+                                        if rec.data.is_empty() { pool.release(&addr, conn); return; }
+                                        if tx.send(Ok(bytes::Bytes::from(rec.data))).await.is_err() { return; }
+                                    }
+                                    t if t == FCGI_STDERR => {
+                                        if let Ok(s) = std::str::from_utf8(&rec.data) {
+                                            if !s.trim().is_empty() { tracing::warn!("PHP-FPM stderr: {}", s.trim()); }
+                                        }
+                                    }
+                                    _ => { pool.release(&addr, conn); return; } // FCGI_END_REQUEST
+                                }
+                            }
+                        });
+                        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                        let resp_body = ResponseBody::box_stream(stream);
+                        let mut resp = WebResponse::new(resp_body);
+                        *resp.status_mut() = StatusCode::from_u16(parsed.status).unwrap_or(StatusCode::OK);
+                        for (k, v) in &parsed.headers {
+                            if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
+                                resp.headers_mut().append(name, val);
+                            }
+                        }
+                        return resp;
                     }
                 }
                 t if t == FCGI_STDERR => {
                     if let Ok(s) = std::str::from_utf8(&rec.data) {
-                        if !s.trim().is_empty() {
-                            tracing::warn!("PHP-FPM stderr: {}", s.trim());
-                        }
+                        if !s.trim().is_empty() { tracing::warn!("PHP-FPM stderr: {}", s.trim()); }
                     }
                 }
-                _ => {}
+                _ => break, // FCGI_END_REQUEST (3) 或其他记录类型 = 响应结束
             }
         }
-    });
-
-    // 把 channel receiver 包成 Stream
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body = ResponseBody::box_stream(stream);
-    let mut resp = WebResponse::new(body);
-    *resp.status_mut() = http_status;
-
-    let has_content_length = parsed.headers.iter()
-        .any(|(k, _)| k.to_lowercase() == "content-length");
-
-    for (k, v) in &parsed.headers {
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            resp.headers_mut().append(name, val);
-        }
     }
-    if !parsed.headers.iter().any(|(k, _)| k.to_lowercase() == "content-type") {
-        resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    }
-    // 没有 Content-Length 时加 Transfer-Encoding: chunked
-    // 否则 HTTP/1.1 浏览器不知道 body 何时结束，一直等待
-    if !has_content_length {
-        resp.headers_mut().insert(
-            xitca_web::http::header::TRANSFER_ENCODING,
-            HeaderValue::from_static("chunked"),
-        );
-    }
-    resp
+
+    pool.release(&addr, conn);
+    // 全量返回，附加正确 Content-Length
+    make_complete_response(parsed.status, parsed.headers, body)
 }
 
 /// 构造完整响应（body 已全量，无需 stream）

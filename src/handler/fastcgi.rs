@@ -136,7 +136,6 @@ pub async fn handle_xitca(
         let filename = format!("{}{}", root.trim_end_matches('/'), sname);
         (filename, sname.to_string(), pinfo.to_string())
     };
-    tracing::warn!("[FastCGI debug] path={} root={} SCRIPT_FILENAME={}", path_raw, root, script_filename);
 
     // ── 读取请求体 ────────────────────────────────────────────────────────
     // 使用 Content-Length 上限（等价 Nginx fastcgi_read_timeout）
@@ -551,6 +550,9 @@ fn build_streaming_response(
     let mut resp = WebResponse::new(body);
     *resp.status_mut() = http_status;
 
+    let has_content_length = parsed.headers.iter()
+        .any(|(k, _)| k.to_lowercase() == "content-length");
+
     for (k, v) in &parsed.headers {
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
@@ -561,6 +563,14 @@ fn build_streaming_response(
     }
     if !parsed.headers.iter().any(|(k, _)| k.to_lowercase() == "content-type") {
         resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    }
+    // 没有 Content-Length 时加 Transfer-Encoding: chunked
+    // 否则 HTTP/1.1 浏览器不知道 body 何时结束，一直等待
+    if !has_content_length {
+        resp.headers_mut().insert(
+            xitca_web::http::header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
     }
     resp
 }

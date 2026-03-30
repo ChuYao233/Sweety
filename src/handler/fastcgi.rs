@@ -485,21 +485,24 @@ where
     Ok(FcgiRecord { rec_type, data: buf })
 }
 
-/// FastCGI 响应处理：全量收集 body 再返回，附带正确 Content-Length
-/// 对于 PHP 页面（通常 < 1MB）性能完全可接受；
-/// 大文件下载（> 4MB）才走流式路径，避免内存占用
+/// FastCGI 响应处理：流式转发，首字节延迟最低
+/// - body 已读完（body_done=true）或 prefix < 16KB：直接返回，不建 task
+/// - 其他：spawn task 流式读剩余 STDOUT，正确处理 FCGI_END_REQUEST
 async fn build_streaming_response(
     parsed: FcgiParsedHeaders,
     pool: std::sync::Arc<crate::handler::fastcgi_pool::FcgiPool>,
     addr: String,
 ) -> WebResponse {
-    use xitca_web::http::header::HeaderName;
+    // body 已全部读完，直接返回
+    if parsed.body_done {
+        pool.release(&addr, parsed.conn);
+        return make_complete_response(parsed.status, parsed.headers, parsed.body_prefix);
+    }
 
-    // 收集完整 body
-    let mut body = parsed.body_prefix;
+    // prefix 很小（< 16KB）时，先全量收集再返回，避免为小资源 spawn task
     let mut conn = parsed.conn;
-
-    if !parsed.body_done {
+    if parsed.body_prefix.len() < 16 * 1024 {
+        let mut body = parsed.body_prefix;
         loop {
             let rec = match read_fcgi_conn(&mut conn).await {
                 Ok(r) => r,
@@ -507,44 +510,11 @@ async fn build_streaming_response(
             };
             match rec.rec_type {
                 t if t == FCGI_STDOUT => {
-                    if rec.data.is_empty() { break; } // STDOUT 空记录 = 结束
+                    if rec.data.is_empty() { break; }
                     body.extend_from_slice(&rec.data);
-                    // 超过 4MB 过大，就不继续缓存了（正常 PHP 页面不会到这个大小）
+                    // 超过 4MB，就改用流式，防止内存溢出
                     if body.len() > 4 * 1024 * 1024 {
-                        // 大响应：残余 body 用流式发送
-                        let initial = bytes::Bytes::from(std::mem::take(&mut body));
-                        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(16);
-                        tokio::spawn(async move {
-                            let _ = tx.send(Ok(initial)).await;
-                            loop {
-                                let rec = match read_fcgi_conn(&mut conn).await {
-                                    Ok(r) => r,
-                                    Err(e) => { let _ = tx.send(Err(e)).await; return; }
-                                };
-                                match rec.rec_type {
-                                    t if t == FCGI_STDOUT => {
-                                        if rec.data.is_empty() { pool.release(&addr, conn); return; }
-                                        if tx.send(Ok(bytes::Bytes::from(rec.data))).await.is_err() { return; }
-                                    }
-                                    t if t == FCGI_STDERR => {
-                                        if let Ok(s) = std::str::from_utf8(&rec.data) {
-                                            if !s.trim().is_empty() { tracing::warn!("PHP-FPM stderr: {}", s.trim()); }
-                                        }
-                                    }
-                                    _ => { pool.release(&addr, conn); return; } // FCGI_END_REQUEST
-                                }
-                            }
-                        });
-                        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-                        let resp_body = ResponseBody::box_stream(stream);
-                        let mut resp = WebResponse::new(resp_body);
-                        *resp.status_mut() = StatusCode::from_u16(parsed.status).unwrap_or(StatusCode::OK);
-                        for (k, v) in &parsed.headers {
-                            if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
-                                resp.headers_mut().append(name, val);
-                            }
-                        }
-                        return resp;
+                        return stream_remaining(body, conn, pool, addr, parsed.status, parsed.headers).await;
                     }
                 }
                 t if t == FCGI_STDERR => {
@@ -552,14 +522,70 @@ async fn build_streaming_response(
                         if !s.trim().is_empty() { tracing::warn!("PHP-FPM stderr: {}", s.trim()); }
                     }
                 }
-                _ => break, // FCGI_END_REQUEST (3) 或其他记录类型 = 响应结束
+                _ => break, // FCGI_END_REQUEST
             }
         }
+        pool.release(&addr, conn);
+        return make_complete_response(parsed.status, parsed.headers, body);
     }
 
-    pool.release(&addr, conn);
-    // 全量返回，附加正确 Content-Length
-    make_complete_response(parsed.status, parsed.headers, body)
+    // prefix >= 16KB：直接进入流式路径
+    stream_remaining(parsed.body_prefix, conn, pool, addr, parsed.status, parsed.headers).await
+}
+
+/// 流式转发剩余 FCGI STDOUT——已有部分 body 缓冲，用 spawn task 继续读取
+async fn stream_remaining(
+    initial: Vec<u8>,
+    mut conn: crate::handler::fastcgi_pool::FcgiConn,
+    pool: std::sync::Arc<crate::handler::fastcgi_pool::FcgiPool>,
+    addr: String,
+    status: u16,
+    headers: Vec<(String, String)>,
+) -> WebResponse {
+    use xitca_web::http::header::HeaderName;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(16);
+
+    tokio::spawn(async move {
+        if !initial.is_empty() {
+            if tx.send(Ok(bytes::Bytes::from(initial))).await.is_err() { return; }
+        }
+        loop {
+            let rec = match read_fcgi_conn(&mut conn).await {
+                Ok(r) => r,
+                Err(e) => { let _ = tx.send(Err(e)).await; return; }
+            };
+            match rec.rec_type {
+                t if t == FCGI_STDOUT => {
+                    if rec.data.is_empty() { pool.release(&addr, conn); return; }
+                    if tx.send(Ok(bytes::Bytes::from(rec.data))).await.is_err() { return; }
+                }
+                t if t == FCGI_STDERR => {
+                    if let Ok(s) = std::str::from_utf8(&rec.data) {
+                        if !s.trim().is_empty() { tracing::warn!("PHP-FPM stderr: {}", s.trim()); }
+                    }
+                }
+                _ => { pool.release(&addr, conn); return; } // FCGI_END_REQUEST
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = ResponseBody::box_stream(stream);
+    let mut resp = WebResponse::new(body);
+    *resp.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    for (k, v) in &headers {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            resp.headers_mut().append(name, val);
+        }
+    }
+    if !headers.iter().any(|(k, _)| k.to_lowercase() == "content-type") {
+        resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    }
+    resp
 }
 
 /// 构造完整响应（body 已全量，无需 stream）

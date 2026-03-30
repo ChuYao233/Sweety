@@ -15,95 +15,103 @@ name = "sweety_lib"
 path = "src/lib.rs"
 
 # ─────────────────────────────────────────────
-# 依赖库
+# 核心依赖
 # ─────────────────────────────────────────────
 [dependencies]
 # 异步运行时
-tokio          = { version = "1",  features = ["full"] }
+tokio = { version = "1", features = ["full"] }
 
-# Web 框架（Xitca-Web）
-xitca-web      = { version = "0.6", features = ["io-uring"] }
-xitca-http     = { version = "0.6" }
+# ── Web 框架（xitca-web 0.8）──────────────────
+# http1/http2/http3 协议支持
+# rustls TLS（纯 Rust，无 C 依赖）
+# websocket 内置 WS 支持
+# file 静态文件服务
+# rate-limit 内置限流
+# logger tracing 日志中间件
+# json/compress-gz 可选扩展
+# xitca-io：xitca-web HTTP/3 依赖的 IO 层（QuicConfig 等类型在此）
+xitca-io  = { version = "0.5", features = ["quic"] }
+xitca-web = { version = "0.7", features = [
+    "http1", "http2", "http3",
+    "rustls",
+    "websocket",
+    "file",
+    "rate-limit",
+    "logger",
+    "json",
+    "compress-gz",
+    "compress-br",
+] }
 
-# HTTP 客户端（反向代理使用）
-hyper          = { version = "1", features = ["client", "http1", "http2"] }
-hyper-util     = { version = "0.1", features = ["tokio", "client", "client-legacy"] }
-http-body-util = "0.1"
+# ── TLS / 证书 ────────────────────────────────
+# rustls 纯 Rust TLS，使用 ring 后端（无 C 依赖）
+rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile  = "2"
+tokio-rustls    = { version = "0.26", default-features = false, features = ["ring"] }
+# TLS 客户端根证书（反向代理证书验证）
+webpki-roots    = "0.26"
+# ACME 自动证书（ring 后端，纯 Rust）
+rustls-acme    = { version = "0.15", default-features = false, features = ["ring", "tokio", "webpki-roots"] }
+# WebSocket 协议库（xitca-web websocket feature 已引入此 crate）
+http-ws        = { version = "0.3", features = ["stream"] }
+# http 基础类型（WebSocket handler 需要）
+http           = "1"
+# 证书生成（CSR/自签名，ring 后端）
+rcgen          = { version = "0.13", default-features = false, features = ["ring"] }
 
-# TLS
-rustls              = { version = "0.23", features = ["ring"] }
-tokio-rustls        = "0.26"
-rustls-pemfile      = "2"
+# ── 序列化 / 配置 ─────────────────────────────
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+serde_yaml  = "0.9"
 
-# ACME 自动证书（可选，默认开启）
-instant-acme        = { version = "0.7", optional = true }
+# ── 正则（Rewrite 规则）──────────────────────
+regex = "1"
 
-# QUIC / HTTP3（可选）
-quinn              = { version = "0.11", optional = true }
-h3                 = { version = "0.0.6", optional = true }
-h3-quinn           = { version = "0.0.7", optional = true }
+# ── 文件监听（热重载）────────────────────────
+notify = "6"
 
-# 序列化 / 配置解析
-serde        = { version = "1", features = ["derive"] }
-serde_json   = "1"
-toml         = "0.8"
-serde_yaml   = "0.9"
-
-# 正则表达式（Rewrite 规则）
-regex        = "1"
-
-# 文件监听（热重载）
-notify       = { version = "6", features = ["serde"] }
-
-# 日志框架
+# ── 日志 ──────────────────────────────────────
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# 并发数据结构（限流计数器等）
-dashmap      = "6"
+# ── 并发数据结构 ──────────────────────────────
+dashmap = "6"
 
-# CLI 参数解析
-clap         = { version = "4", features = ["derive"] }
+# ── CLI 参数 ──────────────────────────────────
+clap = { version = "4", features = ["derive"] }
 
-# 时间处理
-chrono       = { version = "0.4", features = ["serde"] }
+# ── 时间 ──────────────────────────────────────
+chrono = { version = "0.4", features = ["serde"] }
 
-# 异步工具
-futures      = "0.3"
+# ── 通用工具 ────────────────────────────────
+futures-util = "0.3"
 bytes        = "1"
-pin-project  = "1"
-
-# 错误处理
-thiserror    = "1"
 anyhow       = "1"
-
-# URL 解析
+thiserror    = "1"
 url          = "2"
-
-# 随机数（连接池 ID 等）
-rand         = "0.8"
-
-# 国密（可选 feature）
-[dependencies.libsm]
-version  = "0.6"
-optional = true
+mime_guess   = "2"
+# HTTP 日期格式（ETag/Last-Modified 需要）
+httpdate     = "1"
+# 系统目录（ACME 证书缓存目录）
+dirs-next    = "2"
 
 # ─────────────────────────────────────────────
-# 可选 Features
+# 可选 Features（国密 SM2/SM3/SM4）
 # ─────────────────────────────────────────────
 [features]
-default = ["acme"]
-acme    = ["dep:instant-acme"]
-quic    = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
-gm      = ["dep:libsm"]
-full    = ["acme", "quic", "gm"]
+default = []
+# 国密支持（启用：cargo build --features gm）
+gm = []
+# HTTP/3 支持（由 xitca-web http3 feature 提供，此处仅作开关标志）
+http3 = []
 
 # ─────────────────────────────────────────────
 # 测试依赖
 # ─────────────────────────────────────────────
 [dev-dependencies]
-tokio       = { version = "1", features = ["full", "test-util"] }
-tempfile    = "3"
+tokio    = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
 
 # ─────────────────────────────────────────────
 # 编译优化

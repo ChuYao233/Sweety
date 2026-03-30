@@ -309,6 +309,18 @@ pub struct UpstreamNode {
     /// 权重（用于 Weighted 策略）
     #[serde(default = "default_weight")]
     pub weight: u32,
+
+    /// 是否使用 TLS 连接上游（true = HTTPS/TLS，false = HTTP 明文）
+    #[serde(default)]
+    pub tls: bool,
+
+    /// TLS SNI 主机名（不设则使用 addr 的 host 部分）
+    #[serde(default)]
+    pub tls_sni: Option<String>,
+
+    /// 是否跳过上游证书验证（仅用于内网自签名证书，生产慎用）
+    #[serde(default)]
+    pub tls_insecure: bool,
 }
 
 /// 健康检查配置

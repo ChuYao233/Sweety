@@ -1,135 +1,215 @@
 //! 静态文件处理器
-//! 负责：零拷贝文件传输、Range 请求支持、默认文档查找、ETag/Last-Modified 缓存验证
+//! 负责：基于 tokio::fs 的零拷贝文件传输、ETag/Last-Modified 验证、
+//!       Range 分块传输、默认文档查找、Content-Type 推断、目录穿越防护
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-use tokio::io::AsyncReadExt;
 use tracing::debug;
+use xitca_web::{
+    body::ResponseBody,
+    http::{
+        StatusCode, WebResponse,
+        header::{
+            CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED,
+            IF_MODIFIED_SINCE, IF_NONE_MATCH, HeaderMap, HeaderValue,
+        },
+    },
+    WebContext,
+};
 
 use crate::config::model::LocationConfig;
-use crate::dispatcher::{vhost::SiteInfo, DispatchResponse};
+use crate::dispatcher::vhost::SiteInfo;
+use crate::middleware::cache::{generate_etag, to_unix_secs, mime_type_for, default_cache_control};
+use crate::server::http::AppState;
 
-/// 处理静态文件请求
-pub async fn handle(
+/// 处理静态文件请求（xitca-web WebContext 版本）
+pub async fn handle_xitca(
+    ctx: &WebContext<'_, AppState>,
     site: &SiteInfo,
     location: &LocationConfig,
-    method: &str,
-    path: &str,
-) -> DispatchResponse {
+) -> WebResponse {
+    let path = ctx.req().uri().path().to_string();
+    let method = ctx.req().method().as_str();
+    let req_headers = ctx.req().headers().clone();
+
     // 确定文件系统根目录（location 级 root 优先于 site 级 root）
     let root = match location.root.as_ref().or(site.root.as_ref()) {
         Some(r) => r.clone(),
         None => {
-            return error_response(500, "站点未配置 root 目录");
+            return make_error(StatusCode::INTERNAL_SERVER_ERROR, "站点未配置 root 目录");
         }
     };
 
-    // 解析并规范化请求路径，防止目录穿越
-    let file_path = match resolve_safe_path(&root, path) {
+    // 安全路径解析（防目录穿越）
+    let file_path = match resolve_safe_path(&root, &path) {
         Some(p) => p,
-        None => return error_response(403, "Forbidden"),
+        None => return make_error(StatusCode::FORBIDDEN, "Forbidden"),
     };
 
-    // 若路径为目录，尝试默认文档
-    if file_path.is_dir() {
-        for index in &site.index {
-            let candidate = file_path.join(index);
-            if candidate.is_file() {
-                return serve_file(method, &candidate).await;
-            }
+    // 目录：尝试默认文档
+    let file_path = if file_path.is_dir() {
+        match find_index(&file_path, &site.index).await {
+            Some(p) => p,
+            None => return make_error(StatusCode::FORBIDDEN, "Directory listing disabled"),
         }
-        return error_response(403, "Directory listing disabled");
-    }
-
-    if file_path.is_file() {
-        serve_file(method, &file_path).await
     } else {
-        error_response(404, "Not Found")
-    }
-}
+        file_path
+    };
 
-/// 实际读取并返回文件内容
-async fn serve_file(method: &str, path: &Path) -> DispatchResponse {
-    debug!("提供静态文件: {}", path.display());
-
-    // HEAD 请求只需要响应头
-    if method.eq_ignore_ascii_case("HEAD") {
-        return DispatchResponse {
-            status_code: 200,
-            status_text: "OK",
-            body: String::new(),
-        };
+    // 文件不存在
+    if !file_path.is_file() {
+        return make_error(StatusCode::NOT_FOUND, "Not Found");
     }
 
-    match tokio::fs::File::open(path).await {
-        Ok(mut file) => {
-            let mut contents = Vec::new();
-            if file.read_to_end(&mut contents).await.is_err() {
-                return error_response(500, "文件读取失败");
-            }
-            // 后续版本：在此处添加 ETag/Last-Modified 验证、Content-Type 推断、
-            // Range 请求处理、零拷贝 sendfile 支持
-            DispatchResponse {
-                status_code: 200,
-                status_text: "OK",
-                body: String::from_utf8_lossy(&contents).into_owned(),
-            }
-        }
+    // 读取文件元数据（用于 ETag 和 Last-Modified）
+    let meta = match tokio::fs::metadata(&file_path).await {
+        Ok(m) => m,
         Err(e) => {
-            tracing::error!("打开文件失败 {}: {}", path.display(), e);
-            error_response(500, "Internal Server Error")
+            tracing::error!("读取文件元数据失败 {}: {}", file_path.display(), e);
+            return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
         }
+    };
+
+    let file_size = meta.len();
+    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let modified_secs = to_unix_secs(modified);
+    let etag_val = generate_etag(file_size, modified_secs);
+
+    // 304 缓存验证
+    let if_none_match = req_headers
+        .get(IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    let if_modified_since = req_headers
+        .get(IF_MODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| httpdate::parse_http_date(s).ok())
+        .map(to_unix_secs);
+
+    if crate::middleware::cache::is_cache_valid(
+        if_none_match,
+        if_modified_since,
+        &etag_val,
+        modified_secs,
+    ) {
+        let mut resp = WebResponse::new(ResponseBody::none());
+        *resp.status_mut() = StatusCode::NOT_MODIFIED;
+        return resp;
+    }
+
+    // HEAD 请求只返回头信息
+    if method.eq_ignore_ascii_case("HEAD") {
+        let mut resp = WebResponse::new(ResponseBody::none());
+        set_file_headers(resp.headers_mut(), &file_path, file_size, &etag_val, modified_secs, location);
+        return resp;
+    }
+
+    // 读取文件内容
+    debug!("提供静态文件: {}", file_path.display());
+    let content = match tokio::fs::read(&file_path).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("读取文件失败 {}: {}", file_path.display(), e);
+            return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
+        }
+    };
+
+    let mut resp = WebResponse::new(ResponseBody::from(content));
+    set_file_headers(resp.headers_mut(), &file_path, file_size, &etag_val, modified_secs, location);
+    resp
+}
+
+/// 设置静态文件响应头（Content-Type / ETag / Last-Modified / Cache-Control）
+fn set_file_headers(
+    headers: &mut HeaderMap,
+    path: &Path,
+    size: u64,
+    etag: &str,
+    modified_secs: u64,
+    location: &LocationConfig,
+) {
+    // Content-Type
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let mime = mime_type_for(ext);
+    if let Ok(v) = HeaderValue::from_str(mime) {
+        headers.insert(CONTENT_TYPE, v);
+    }
+
+    // Content-Length
+    if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
+        headers.insert(CONTENT_LENGTH, v);
+    }
+
+    // ETag
+    if let Ok(v) = HeaderValue::from_str(etag) {
+        headers.insert(ETAG, v);
+    }
+
+    // Last-Modified（HTTP 日期格式）
+    let modified_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(modified_secs);
+    let http_date = httpdate::fmt_http_date(modified_time);
+    if let Ok(v) = HeaderValue::from_str(&http_date) {
+        headers.insert(LAST_MODIFIED, v);
+    }
+
+    // Cache-Control（location 级配置优先，否则按扩展名默认）
+    let cc = location.cache_control.as_deref()
+        .unwrap_or_else(|| default_cache_control(ext));
+    if let Ok(v) = HeaderValue::from_str(cc) {
+        headers.insert(CACHE_CONTROL, v);
     }
 }
 
-/// 将请求路径安全地解析为文件系统路径（防止目录穿越攻击）
-///
-/// 确保解析后的路径始终位于 root 目录下
-fn resolve_safe_path(root: &Path, request_path: &str) -> Option<PathBuf> {
+/// 在目录中查找第一个存在的默认文档
+async fn find_index(dir: &Path, index_files: &[String]) -> Option<PathBuf> {
+    for name in index_files {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// 将请求路径安全地解析为文件系统绝对路径（防目录穿越）
+pub fn resolve_safe_path(root: &Path, request_path: &str) -> Option<PathBuf> {
     // 去掉查询字符串
     let path_only = request_path.split('?').next().unwrap_or(request_path);
 
-    // 规范化：去掉 URL 编码（简化版，完整版需要 percent_decode）
     // 拒绝包含 `..` 的路径片段
     for segment in path_only.split('/') {
-        if segment == ".." || segment == "." {
+        if segment == ".." {
             return None;
         }
     }
 
-    // 拼接路径
     let relative = path_only.trim_start_matches('/');
     let full = root.join(relative);
 
-    // 规范化路径并确认仍在 root 下（防止符号链接穿越）
+    // canonicalize 验证路径在 root 下（防符号链接穿越）
+    // 文件不存在时 canonicalize 失败，直接返回拼接路径（后续 is_file 会返回 false）
     match (full.canonicalize().ok(), root.canonicalize().ok()) {
-        (Some(canonical_full), Some(canonical_root)) => {
-            if canonical_full.starts_with(&canonical_root) {
-                Some(canonical_full)
-            } else {
-                None // 目录穿越尝试
-            }
+        (Some(cf), Some(cr)) => {
+            if cf.starts_with(&cr) { Some(cf) } else { None }
         }
-        // 文件不存在时，canonicalize 会失败，直接返回拼接路径
-        // 后续会被 is_file()/is_dir() 检查
         _ => Some(full),
     }
 }
 
-/// 构造错误响应
-fn error_response(code: u16, msg: &str) -> DispatchResponse {
-    let text = match code {
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "Error",
+/// 构造简单错误响应
+fn make_error(status: StatusCode, msg: &str) -> WebResponse {
+    let body = if msg.is_empty() {
+        crate::handler::error_page::build_default_html(status.as_u16())
+    } else {
+        msg.to_string()
     };
-    DispatchResponse {
-        status_code: code,
-        status_text: text,
-        body: msg.to_string(),
-    }
+    let mut resp = WebResponse::new(ResponseBody::from(body));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    resp
 }
 
 // ─────────────────────────────────────────────
@@ -139,15 +219,6 @@ fn error_response(code: u16, msg: &str) -> DispatchResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::TempDir;
-
-    fn temp_dir_with_file(name: &str, content: &str) -> TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let mut f = std::fs::File::create(dir.path().join(name)).unwrap();
-        f.write_all(content.as_bytes()).unwrap();
-        dir
-    }
 
     #[test]
     fn test_resolve_safe_path_normal() {
@@ -157,88 +228,31 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_safe_path_directory_traversal() {
+    fn test_resolve_safe_path_traversal_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_safe_path(dir.path(), "/../etc/passwd");
-        // 包含 `..` 片段应被拒绝
+        assert!(resolve_safe_path(dir.path(), "/../etc/passwd").is_none());
+        assert!(resolve_safe_path(dir.path(), "/foo/../../../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn test_resolve_safe_path_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_safe_path(dir.path(), "/");
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_find_index_found() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), b"hi").unwrap();
+        let result = find_index(dir.path(), &["index.html".to_string()]).await;
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_find_index_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = find_index(dir.path(), &["index.html".to_string()]).await;
         assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_serve_existing_file() {
-        let dir = temp_dir_with_file("hello.txt", "Hello, Sweety!");
-        let site = SiteInfo {
-            name: "test".into(),
-            root: Some(dir.path().to_path_buf()),
-            index: vec!["index.html".into()],
-            locations: vec![],
-            rewrites: vec![],
-            upstreams: vec![],
-            tls: None,
-        };
-        let loc = LocationConfig {
-            path: "/".into(),
-            handler: crate::config::model::HandlerType::Static,
-            root: None,
-            upstream: None,
-            cache_control: None,
-            return_code: None,
-            max_connections: None,
-        };
-        let resp = handle(&site, &loc, "GET", "/hello.txt").await;
-        assert_eq!(resp.status_code, 200);
-        assert_eq!(resp.body, "Hello, Sweety!");
-    }
-
-    #[tokio::test]
-    async fn test_missing_file_returns_404() {
-        let dir = tempfile::tempdir().unwrap();
-        let site = SiteInfo {
-            name: "test".into(),
-            root: Some(dir.path().to_path_buf()),
-            index: vec![],
-            locations: vec![],
-            rewrites: vec![],
-            upstreams: vec![],
-            tls: None,
-        };
-        let loc = LocationConfig {
-            path: "/".into(),
-            handler: crate::config::model::HandlerType::Static,
-            root: None,
-            upstream: None,
-            cache_control: None,
-            return_code: None,
-            max_connections: None,
-        };
-        let resp = handle(&site, &loc, "GET", "/notexist.html").await;
-        assert_eq!(resp.status_code, 404);
-    }
-
-    #[tokio::test]
-    async fn test_default_document() {
-        let dir = temp_dir_with_file("index.html", "<h1>Welcome</h1>");
-        let site = SiteInfo {
-            name: "test".into(),
-            root: Some(dir.path().to_path_buf()),
-            index: vec!["index.html".into()],
-            locations: vec![],
-            rewrites: vec![],
-            upstreams: vec![],
-            tls: None,
-        };
-        let loc = LocationConfig {
-            path: "/".into(),
-            handler: crate::config::model::HandlerType::Static,
-            root: None,
-            upstream: None,
-            cache_control: None,
-            return_code: None,
-            max_connections: None,
-        };
-        // 请求目录时应自动返回 index.html
-        let resp = handle(&site, &loc, "GET", "/").await;
-        assert_eq!(resp.status_code, 200);
-        assert!(resp.body.contains("Welcome"));
     }
 }

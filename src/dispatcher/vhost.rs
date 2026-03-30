@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::config::model::{LocationConfig, RewriteRule, SiteConfig, TlsConfig, UpstreamConfig};
+use crate::config::model::{FastCgiConfig, LocationConfig, RewriteRule, SiteConfig, TlsConfig, UpstreamConfig};
 
 /// 运行时站点信息（从 SiteConfig 提取，去掉不需要运行时使用的字段）
 #[derive(Debug, Clone)]
@@ -23,6 +23,8 @@ pub struct SiteInfo {
     pub upstreams: Vec<UpstreamConfig>,
     /// TLS 配置
     pub tls: Option<TlsConfig>,
+    /// FastCGI 配置
+    pub fastcgi: Option<FastCgiConfig>,
 }
 
 impl SiteInfo {
@@ -40,6 +42,7 @@ impl SiteInfo {
             rewrites: cfg.rewrites.clone(),
             upstreams: cfg.upstreams.clone(),
             tls: cfg.tls.clone(),
+            fastcgi: cfg.fastcgi.clone(),
         }
     }
 }

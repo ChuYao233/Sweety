@@ -79,10 +79,14 @@ fn encode_nv_pair(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
 // ─────────────────────────────────────────────
 
 /// 处理 FastCGI / PHP 请求
+///
+/// `resolved_script`：由 try_files 解析得到的绝对脚本路径；
+/// 若为 None，则回退到从请求路径推断（直接访问 .php 文件时）。
 pub async fn handle_xitca(
     ctx: &WebContext<'_, AppState>,
     site: &SiteInfo,
     location: &LocationConfig,
+    resolved_script: Option<&std::path::Path>,
 ) -> WebResponse {
     // ── FastCGI 后端地址 ──────────────────────────────────────────────────
     let fcgi_cfg = site.fastcgi.as_ref();
@@ -119,14 +123,20 @@ pub async fn handle_xitca(
     };
 
     // ── SCRIPT_FILENAME / SCRIPT_NAME / PATH_INFO 解析 ───────────────────
-    // 规则（与 Nginx 一致）：
-    //   1. 若 path 以 .php 结尾 → SCRIPT_FILENAME = root + path, PATH_INFO = ""
-    //   2. 若 path 包含 .php/ → 分割出 script 和 path_info
-    //   3. 否则（rewrite 到 index.php）→ SCRIPT_FILENAME = root/index.php
-    // 注意：不在此处检查文件是否存在，与 Nginx fastcgi_pass 行为一致——
-    //       文件不存在由 PHP-FPM 返回错误，location 层用 try_files 负责路由
-    let (script_name, path_info) = split_script_path(path_raw);
-    let script_filename = format!("{}{}", root.trim_end_matches('/'), script_name);
+    // 优先使用 try_files 解析到的绝对路径（最准确）；
+    // 否则从请求路径推断（直接访问 .php 时）。
+    let (script_filename, script_name, path_info) = if let Some(abs) = resolved_script {
+        let abs_str = abs.to_string_lossy().into_owned();
+        // SCRIPT_NAME 是相对 root 的 URL 路径
+        let rel = abs_str.strip_prefix(root.trim_end_matches('/')).unwrap_or(&abs_str);
+        let sname = rel.replace('\\', "/");
+        (abs_str, sname, "".to_string())
+    } else {
+        let (sname, pinfo) = split_script_path(path_raw);
+        let filename = format!("{}{}", root.trim_end_matches('/'), sname);
+        (filename, sname.to_string(), pinfo.to_string())
+    };
+    tracing::warn!("[FastCGI debug] path={} root={} SCRIPT_FILENAME={}", path_raw, root, script_filename);
 
     // ── 读取请求体 ────────────────────────────────────────────────────────
     // 使用 Content-Length 上限（等价 Nginx fastcgi_read_timeout）

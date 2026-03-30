@@ -50,8 +50,8 @@ rustls-pemfile  = "2"
 tokio-rustls    = { version = "0.26", default-features = false, features = ["ring"] }
 # TLS 客户端根证书（反向代理证书验证）
 webpki-roots    = "0.26"
-# ACME 自动证书（ring 后端，纯 Rust）
-rustls-acme    = { version = "0.15", default-features = false, features = ["ring", "tokio", "webpki-roots"] }
+# ACME 自动证书（HTTP-01，instant-acme）
+instant-acme   = "0.7"
 # WebSocket 协议库（xitca-web websocket feature 已引入此 crate）
 http-ws        = { version = "0.3", features = ["stream"] }
 # http 基础类型（WebSocket handler 需要）
@@ -93,6 +93,7 @@ bytes        = "1"
 flate2       = "1"
 x509-parser  = { version = "0.16", default-features = false }
 anyhow       = "1"
+base64       = "0.22"
 thiserror    = "1"
 url          = "2"
 mime_guess   = "2"

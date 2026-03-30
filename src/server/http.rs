@@ -278,6 +278,24 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
 
     state.metrics.inc_requests();
 
+    // ACME HTTP-01 challenge 响应（优先于所有站点匹配）
+    // Let's Encrypt 访问 http://domain/.well-known/acme-challenge/<token>
+    {
+        let path = ctx.req().uri().path();
+        if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+            if let Some(entry) = crate::server::tls::ACME_HTTP01_TOKENS.get(token) {
+                let body = entry.value().clone();
+                let mut resp = WebResponse::new(ResponseBody::from(body));
+                *resp.status_mut() = StatusCode::OK;
+                resp.headers_mut().insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain"),
+                );
+                return resp;
+            }
+        }
+    }
+
     // 一次解析 Host 头，后续复用（避免多次 get）
     let host_raw = ctx.req().headers()
         .get("host")
@@ -434,7 +452,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
                     // 找到文件：根据扩展名分流（.php → FastCGI，其他 → 静态）
                     TryFilesResult::File(p) => {
                         if p.extension().and_then(|e| e.to_str()) == Some("php") {
-                            crate::handler::fastcgi::handle_xitca(ctx, &site, &location).await
+                            crate::handler::fastcgi::handle_xitca(ctx, &site, &location, Some(&p)).await
                         } else {
                             let mut static_loc = location.clone();
                             static_loc.handler = HandlerType::Static;
@@ -448,11 +466,11 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
                     }
                     // 所有路径不存在，fallback 到 FastCGI（与 Nginx 行为一致）
                     TryFilesResult::NotFound => {
-                        crate::handler::fastcgi::handle_xitca(ctx, &site, &location).await
+                        crate::handler::fastcgi::handle_xitca(ctx, &site, &location, None).await
                     }
                 }
             } else {
-                crate::handler::fastcgi::handle_xitca(ctx, &site, &location).await
+                crate::handler::fastcgi::handle_xitca(ctx, &site, &location, None).await
             }
         }
         HandlerType::Websocket => {

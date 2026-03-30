@@ -2,14 +2,16 @@
 //! 负责：请求完成后记录访问日志，支持 JSON 和 Apache Combined 两种格式
 //!
 //! # 架构
-//! - 请求侧：`logger.send(entry)` — 非阻塞 `try_send` 到 channel，零 spawn，零锁
-//! - 写入侧：单一后台 task，用 `BufWriter` 批量刷盘，每 1024 条或 1 秒 flush 一次
+//! - 请求侧：`logger.send(entry)` — 非阻塞 `try_send`，零锁，零 spawn
+//! - 写入侧：独立系统线程（不占 tokio worker），std::io::BufWriter 批量刷盘
+//! - 可在 tokio runtime 启动前安全创建
 
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
 
 use chrono::Local;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
 
 /// 日志格式
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,29 +49,30 @@ pub struct AccessLogEntry {
 
 /// 访问日志写入器
 ///
-/// 内部持有一个 mpsc Sender；请求侧调用 `send()` 非阻塞投递，
-/// 单一后台 task 负责格式化 + BufWriter 批量写文件。
+/// 请求侧 `try_send` 非阻塞投递；独立系统线程负责写文件，不占 tokio worker。
+/// 可在 tokio runtime 启动前安全调用 `file_sync`。
 pub struct AccessLogger {
-    tx: Option<mpsc::Sender<AccessLogEntry>>,
+    tx: Option<std_mpsc::SyncSender<AccessLogEntry>>,
 }
 
 impl AccessLogger {
-    /// 创建写入文件的日志器，同时启动后台写入 task
+    /// 创建写文件日志器，同时启动独立写入线程
     pub fn file_sync(path: &PathBuf, format: LogFormat) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let std_file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
 
-        let (tx, rx) = mpsc::channel::<AccessLogEntry>(4096);
+        // 容量 4096：满时 try_send 直接丢弃，不阻塞请求
+        let (tx, rx) = std_mpsc::sync_channel::<AccessLogEntry>(4096);
 
-        // 单一后台 task：从 channel 接收日志行，BufWriter 批量写文件
-        tokio::spawn(async move {
-            writer_task(rx, std_file, format).await;
-        });
+        // 独立系统线程：完全不依赖 tokio runtime
+        std::thread::Builder::new()
+            .name("access-log-writer".into())
+            .spawn(move || writer_thread(rx, file, format))?;
 
         Ok(Self { tx: Some(tx) })
     }
@@ -82,46 +85,43 @@ impl AccessLogger {
     }
 }
 
-/// 后台写入 task：tokio BufWriter 缓冲 + 定时 flush
-async fn writer_task(
-    mut rx: mpsc::Receiver<AccessLogEntry>,
+/// 后台写入线程：BufWriter 256 KiB 缓冲 + 每 1024 条或每秒 flush 一次
+fn writer_thread(
+    rx: std_mpsc::Receiver<AccessLogEntry>,
     file: std::fs::File,
     format: LogFormat,
 ) {
-    use tokio::time::{Duration, interval};
-    let tokio_file = tokio::fs::File::from_std(file);
-    let mut buf = tokio::io::BufWriter::with_capacity(256 * 1024, tokio_file);
-    let mut ticker = interval(Duration::from_secs(1));
+    let mut buf = BufWriter::with_capacity(256 * 1024, file);
     let mut pending = 0usize;
+    let flush_interval = Duration::from_secs(1);
 
     loop {
-        tokio::select! {
-            entry = rx.recv() => {
-                match entry {
-                    None => break, // 所有 sender drop，退出
-                    Some(e) => {
-                        let line = format_entry(&e, &format);
-                        let bytes = format!("{}\n", line);
-                        let _ = buf.write_all(bytes.as_bytes()).await;
-                        pending += 1;
-                        // 每 1024 条强制 flush 一次
-                        if pending >= 1024 {
-                            let _ = buf.flush().await;
-                            pending = 0;
-                        }
-                    }
-                }
-            }
-            _ = ticker.tick() => {
-                // 每秒 flush 一次，低流量时日志也能及时落盘
-                if pending > 0 {
-                    let _ = buf.flush().await;
+        // 带超时的 recv：超时后触发定时 flush
+        match rx.recv_timeout(flush_interval) {
+            Ok(e) => {
+                let line = format_entry(&e, &format);
+                let _ = writeln!(buf, "{}", line);
+                pending += 1;
+                // 每 1024 条强制 flush 一次
+                if pending >= 1024 {
+                    let _ = buf.flush();
                     pending = 0;
                 }
             }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                // 每秒 flush 一次，低流量时日志也能及时落盘
+                if pending > 0 {
+                    let _ = buf.flush();
+                    pending = 0;
+                }
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                // 所有 sender drop（进程退出），flush 后退出
+                break;
+            }
         }
     }
-    let _ = buf.flush().await;
+    let _ = buf.flush();
 }
 
 /// 将日志记录格式化为字符串
@@ -205,15 +205,15 @@ mod tests {
         assert_eq!(v["method"], "GET");
     }
 
-    #[tokio::test]
-    async fn test_file_logger_writes() {
+    #[test]
+    fn test_file_logger_writes() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("access.log");
         let logger = AccessLogger::file_sync(&log_path, LogFormat::Combined).unwrap();
         logger.send(sample_entry());
-        // 等后台 task flush（最多 1.5 秒）
-        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+        // 等写入线程 flush（最多 1.5 秒，超过定时 flush 间隔）
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let content = std::fs::read_to_string(&log_path).unwrap();
         assert!(!content.is_empty());
         assert!(content.contains("200"));
     }

@@ -1,8 +1,24 @@
 //! 配置结构体定义模块
 //! 所有配置项对应的 Rust 数据结构，通过 serde 实现多格式反序列化
 
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// 将字符串 key 的 HashMap 反序列化为 u16 key（TOML 规范要求 table key 为字符串）
+fn deserialize_u16_map<'de, D>(de: D) -> Result<HashMap<u16, String>, D::Error>
+where D: Deserializer<'de>
+{
+    let raw = HashMap::<String, String>::deserialize(de)?;
+    raw.into_iter()
+        .map(|(k, v)| {
+            k.parse::<u16>()
+                .map(|n| (n, v))
+                .map_err(|_| serde::de::Error::custom(format!("invalid status code key: '{}'", k)))
+        })
+        .collect()
+}
 
 // ─────────────────────────────────────────────
 // 顶层配置
@@ -211,9 +227,9 @@ pub struct SiteConfig {
     pub force_https: bool,
 
     /// 自定义错误页（等价 Nginx error_page 404 /404.html）
-    /// key = HTTP 状态码，value = 静态文件路径（相对于 root）
-    #[serde(default)]
-    pub error_pages: std::collections::HashMap<u16, String>,
+    /// key = HTTP 状态码（TOML 内用字符串写法：\"404\")，value = 静态文件路径
+    #[serde(default, deserialize_with = "deserialize_u16_map")]
+    pub error_pages: HashMap<u16, String>,
 
     /// 反代响应缓存配置（等价 Nginx proxy_cache）
     #[serde(default)]

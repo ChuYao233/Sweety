@@ -78,64 +78,105 @@ path = "/"
 handler = "static"
 
 # ─────────────────────────────────────────────
-# 站点 2：PHP + FastCGI 站点
+# 站点 2：WordPress / PHP 站点（生产级配置）
+# 等价宝塔面板 Nginx PHP 站点模板
 # ─────────────────────────────────────────────
 [[sites]]
-name = "example-php"
-server_name = ["php.example.com"]
-listen = [80]
-listen_tls = [443]
-root = "/var/www/php-site"
-index = ["index.php", "index.html"]
-access_log = "/var/log/sweety/php_access.log"
+name        = "wordpress"
+server_name = ["www.example.com", "example.com"]
+listen      = [80]
+listen_tls  = [443]
+root        = "/var/www/wordpress"
+index       = ["index.php", "index.html"]
+access_log  = "/var/log/sweety/wordpress_access.log"
+# 强制 HTTP → HTTPS（需配置 listen_tls）
+force_https = true
+# WordPress 上传文件大小限制（需与 php.ini upload_max_filesize 一致）
+# client_max_body_size 在 [global] 里设置，这里继承
 
+# ACME 自动证书
 [sites.tls]
-acme = true
-acme_email = "admin@example.com"
+acme                   = true
+acme_email             = "admin@example.com"
+acme_provider          = "letsencrypt"   # 可选: letsencrypt / zerossl / letsencrypt_staging
+acme_renew_days_before = 30
 
-# FastCGI（PHP）全局配置
+# 自定义错误页
+[sites.error_pages]
+404 = "/404.html"
+500 = "/500.html"
+
+# PHP-FPM 连接（优先用 Unix socket，性能优于 TCP）
 [sites.fastcgi]
-# PHP-FPM socket 路径（优先于 host:port）
-socket = "/var/run/php/php8.2-fpm.sock"
-# 或 TCP 地址
+socket       = "/var/run/php/php8.2-fpm.sock"
+# 备选 TCP 模式（容器化部署时常用）：
 # host = "127.0.0.1"
 # port = 9000
-# 连接池大小
-pool_size = 32
-# 连接超时（秒）
+pool_size    = 32   # 连接池 idle 连接数
 connect_timeout = 5
-# 读取超时（秒）
-read_timeout = 30
+read_timeout = 60   # WordPress 后台操作可能耗时较长
 
-# Rewrite 规则（伪静态，WordPress 风格）
-[[sites.rewrites]]
-pattern = "^/(.*)$"
-target  = "/index.php?$1"
-flag    = "last"
-# 仅当文件不存在时触发
-condition = "!-f"
+# ── Location 1：静态资源强缓存（等价宝塔 Nginx 静态文件规则）──────────────
+[[sites.locations]]
+path          = "^~ /wp-content/uploads/"
+handler       = "static"
+cache_control = "public, max-age=2592000"  # 30 天
 
 [[sites.locations]]
-# PHP 文件处理
-path = "~ \\.php$"
+path          = "^~ /wp-content/"
+handler       = "static"
+cache_control = "public, max-age=604800"   # 7 天
+
+[[sites.locations]]
+path          = "^~ /wp-includes/"
+handler       = "static"
+cache_control = "public, max-age=604800"
+
+# ── Location 2：拒绝访问敏感文件（等价宝塔安全规则）────────────────────────
+[[sites.locations]]
+path        = "~ /\\."
+handler     = "static"
+return_code = 403
+
+[[sites.locations]]
+# 禁止直接访问 xmlrpc.php（防 DDoS 攻击，WordPress 特有）
+path        = "= /xmlrpc.php"
+handler     = "static"
+return_code = 403
+
+# ── Location 3：PHP 文件执行（等价 Nginx ~ \.php$ 块）───────────────────────
+# Sweety 的 FastCGI handler 会自动：
+#   - 检查 SCRIPT_FILENAME 文件是否存在（防 Primary script unknown）
+#   - 传递 HTTPS=on（WordPress is_ssl() 正常工作）
+#   - 传递所有 HTTP_* 头（Cookie、Authorization 等）
+#   - POST 请求体通过 STDIN 传给 PHP-FPM
+[[sites.locations]]
+path    = "~ \\.php$"
 handler = "fastcgi"
 
+# ── Location 4：WordPress 伪静态（等价宝塔 try_files 规则）─────────────────
+# 访问 /wp-admin/ 等非 .php 路径时：
+#   1. 先尝试静态文件（$uri）
+#   2. 再尝试目录（$uri/）
+#   3. 最后 fallback 到 index.php（WordPress 路由入口）
+# FastCGI handler 会检查 /var/www/wordpress/index.php 是否存在
 [[sites.locations]]
-path = "/"
-handler = "static"
+path      = "/"
+handler   = "fastcgi"
+try_files = ["$uri", "$uri/", "/index.php"]
 
-# 限流配置（站点级）
+# ── 限流配置（防爆破 wp-login.php）────────────────────────────────────────
 [sites.rate_limit]
-# 按 IP 限流：每秒 100 请求，突发 200
+[[sites.rate_limit.rules]]
+dimension    = "path"
+path_pattern = "^/wp-login\\.php"
+rate         = 5      # 每秒最多 5 次登录请求
+burst        = 10
+
 [[sites.rate_limit.rules]]
 dimension = "ip"
-rate = 100
-burst = 200
-[[sites.rate_limit.rules]]
-dimension = "path"
-path_pattern = "^/api/"
-rate = 50
-burst = 100
+rate      = 100
+burst     = 200
 
 # ─────────────────────────────────────────────
 # 站点 3：反向代理站点（负载均衡）

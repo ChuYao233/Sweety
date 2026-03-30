@@ -14,6 +14,10 @@ worker_connections = 51200
 max_connections = 10000
 # Keep-Alive 超时（秒，等价 Nginx keepalive_timeout）
 keepalive_timeout = 60
+# FastCGI 连接超时（秒，等价 Nginx fastcgi_connect_timeout）
+fastcgi_connect_timeout = 5
+# FastCGI 读取超时（秒，等价 Nginx fastcgi_read_timeout）
+fastcgi_read_timeout = 60
 # 客户端最大请求体（MB，等价 Nginx client_max_body_size）
 client_max_body_size = 50
 # 请求头缓冲区（KB，等价 Nginx client_header_buffer_size）

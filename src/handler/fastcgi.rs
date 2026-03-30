@@ -123,6 +123,8 @@ pub async fn handle_xitca(
     //   1. 若 path 以 .php 结尾 → SCRIPT_FILENAME = root + path, PATH_INFO = ""
     //   2. 若 path 包含 .php/ → 分割出 script 和 path_info
     //   3. 否则（rewrite 到 index.php）→ SCRIPT_FILENAME = root/index.php
+    // 注意：不在此处检查文件是否存在，与 Nginx fastcgi_pass 行为一致——
+    //       文件不存在由 PHP-FPM 返回错误，location 层用 try_files 负责路由
     let (script_name, path_info) = split_script_path(path_raw);
     let script_filename = format!("{}{}", root.trim_end_matches('/'), script_name);
 
@@ -143,12 +145,15 @@ pub async fn handle_xitca(
         .unwrap_or("")
         .to_string();
 
+    // 超出限制时拒绝，避免 CONTENT_LENGTH 与实际 body 不一致
+    if content_length > max_body && max_body > 0 {
+        return fcgi_error(StatusCode::PAYLOAD_TOO_LARGE, "请求体超过 client_max_body_size 限制");
+    }
+
     // 读取请求体（与 reverse_proxy 相同方式：ctx.body_borrow_mut() + StreamExt）
-    let req_body: Vec<u8> = if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE")
-        && content_length <= max_body
-    {
+    let req_body: Vec<u8> = if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
         use futures_util::StreamExt;
-        let mut collected = Vec::with_capacity(content_length as usize);
+        let mut collected = Vec::with_capacity(content_length.min(16 * 1024 * 1024) as usize);
         let mut body = ctx.body_borrow_mut();
         while let Some(chunk) = body.next().await {
             match chunk {
@@ -160,6 +165,54 @@ pub async fn handle_xitca(
     } else {
         Vec::new()
     };
+
+    // ── 判断是否 HTTPS（用于 HTTPS=on 和 SERVER_PORT）───────────────────
+    let is_https = {
+        // 优先用 URI scheme（HTTP/2、HTTP/3 有效）
+        let scheme = ctx.req().uri().scheme_str();
+        match scheme {
+            Some("https") => true,
+            Some("http")  => false,
+            _ => {
+                // HTTP/1 fallback：从 Host 头端口判断是否在 TLS 端口列表里
+                let port: u16 = host_hdr.split(':')
+                    .nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                if port > 0 {
+                    ctx.state().tls_ports.contains(&port)
+                } else {
+                    // 无端口：若站点有 TLS 端口则默认视为 HTTPS
+                    !ctx.state().tls_ports.is_empty()
+                }
+            }
+        }
+    };
+
+    // SERVER_PORT：HTTPS 时优先用 443（或站点 TLS 端口），HTTP 时用 Host 里的端口
+    let server_port = if is_https {
+        if host_hdr.contains(':') {
+            host_hdr.split(':').nth(1).unwrap_or("443").to_string()
+        } else {
+            // HTTPS 无端口 = 标准 443
+            "443".to_string()
+        }
+    } else {
+        host_port_str.clone()
+    };
+
+    // REMOTE_ADDR：反代后优先读 X-Real-IP，再读 X-Forwarded-For 第一个 IP
+    // 与 Nginx fastcgi_param REMOTE_ADDR $remote_addr 配合 realip 模块效果一致
+    let real_ip = ctx.req().headers()
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .or_else(|| {
+            ctx.req().headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| peer_ip.clone());
 
     // ── 构建 CGI 参数（RFC 3875）────────────────────────────────────────
     let mut params: Vec<(String, String)> = vec![
@@ -174,9 +227,9 @@ pub async fn handle_xitca(
         ("SERVER_PROTOCOL".into(), "HTTP/1.1".into()),
         ("GATEWAY_INTERFACE".into(),"CGI/1.1".into()),
         ("SERVER_NAME".into(),     host_name),
-        ("SERVER_PORT".into(),     host_port_str),
-        ("REMOTE_ADDR".into(),     peer_ip),
-        ("REMOTE_HOST".into(),     peer.ip().to_string()),
+        ("SERVER_PORT".into(),     server_port),
+        ("REMOTE_ADDR".into(),     real_ip.clone()),
+        ("REMOTE_HOST".into(),     real_ip),
         ("REMOTE_PORT".into(),     peer_port),
         ("DOCUMENT_ROOT".into(),   root.clone()),
         // CONTENT_TYPE / CONTENT_LENGTH 是 POST 必须参数
@@ -184,12 +237,7 @@ pub async fn handle_xitca(
         ("CONTENT_LENGTH".into(),  req_body.len().to_string()),
     ];
 
-    // 判断是否 HTTPS（注入 HTTPS=on，WordPress 依赖此变量判断 is_ssl()）
-    let is_https = {
-        let port: u16 = host_hdr.split(':').nth(1)
-            .and_then(|s| s.parse().ok()).unwrap_or(80);
-        ctx.state().tls_ports.contains(&port)
-    };
+    // HTTPS=on（WordPress is_ssl()、其他框架判断协议依赖此变量）
     if is_https {
         params.push(("HTTPS".into(), "on".into()));
     }
@@ -228,22 +276,17 @@ pub async fn handle_xitca(
             }
         };
 
-        // 带读超时发送请求
-        let result = tokio::time::timeout(
+        // 带超时发送请求并读取响应头（body 用 Stream 流式传输）
+        let header_result = tokio::time::timeout(
             read_tmo,
-            send_on_conn(conn, &params_ref, &req_body),
+            fcgi_send_and_read_headers(conn, &params_ref, &req_body),
         ).await;
 
-        match result {
-            Ok(Ok((stdout, maybe_conn))) => {
-                // 归还连接到池
-                if let Some(c) = maybe_conn {
-                    pool.release(&addr_str, c);
-                }
-                return parse_fcgi_response(stdout);
+        match header_result {
+            Ok(Ok(parsed)) => {
+                return build_streaming_response(parsed, pool.clone(), addr_str);
             }
             Ok(Err(e)) if attempt == 0 => {
-                // idle 连接可能已断开，重试新建
                 tracing::debug!("FastCGI idle 连接失效，重试: {}", e);
                 continue;
             }
@@ -297,109 +340,330 @@ fn fcgi_error(status: StatusCode, msg: &str) -> WebResponse {
     resp
 }
 
-/// 在给定连接上发送 FastCGI 请求，返回 (stdout, Option<conn>)
-/// Option<conn> 为 Some 表示连接可归还到池（PHP-FPM 保持了 keep-alive）
-async fn send_on_conn(
+// ─────────────────────────────────────────────
+// 流式 FastCGI 响应架构
+// ─────────────────────────────────────────────
+
+/// FastCGI 响应头解析结果（发送请求 + 读取响应头后返回）
+struct FcgiParsedHeaders {
+    /// HTTP 状态码
+    status: u16,
+    /// 响应头列表
+    headers: Vec<(String, String)>,
+    /// 已读入但属于 body 的前缀数据
+    body_prefix: Vec<u8>,
+    /// 连接读端（body 剩余数据从此读取）
+    conn: crate::handler::fastcgi_pool::FcgiConn,
+    /// body 是否已读完（PHP 输出很短时可能一次就读完了）
+    body_done: bool,
+}
+
+/// 发送 FastCGI 请求并读取响应头（直到 \r\n\r\n），body 留在 conn 里流式读
+/// 用 macro 消除 TCP/Unix 分支重复，不使用 trait object
+async fn fcgi_send_and_read_headers(
     conn: crate::handler::fastcgi_pool::FcgiConn,
     params: &[(&str, &str)],
     stdin_body: &[u8],
-) -> anyhow::Result<(Vec<u8>, Option<crate::handler::fastcgi_pool::FcgiConn>)> {
+) -> anyhow::Result<FcgiParsedHeaders> {
     use crate::handler::fastcgi_pool::FcgiConn;
-    match conn {
-        FcgiConn::Tcp(stream) => {
-            let (r, w) = tokio::io::split(stream);
-            let stdout = fcgi_send_recv(r, w, params, stdin_body).await?;
-            // TCP 连接不复用（PHP-FPM flags=0 表示关闭连接）
-            Ok((stdout, None))
-        }
-        #[cfg(unix)]
-        FcgiConn::Unix(stream) => {
-            let (r, w) = tokio::io::split(stream);
-            let stdout = fcgi_send_recv(r, w, params, stdin_body).await?;
-            Ok((stdout, None))
-        }
-    }
-}
 
-/// FastCGI 协议发送/接收（通用，与传输类型无关）
-async fn fcgi_send_recv<R, W>(
-    mut reader: R,
-    mut writer: W,
-    params: &[(&str, &str)],
-    stdin_body: &[u8],
-) -> anyhow::Result<Vec<u8>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // 构建请求包（与连接类型无关）
     let rid: u16 = 1;
     let mut pkt = Vec::with_capacity(4096);
-
-    // 1. BEGIN_REQUEST
     write_fcgi_header(&mut pkt, FCGI_BEGIN_REQUEST, rid, 8, 0);
     pkt.extend_from_slice(&FCGI_RESPONDER.to_be_bytes());
-    pkt.push(0); // flags = 0（不复用连接）
+    pkt.push(1); // FCGI_KEEP_CONN
     pkt.extend_from_slice(&[0u8; 5]);
-
-    // 2. PARAMS（name-value 编码后分片写入）
     {
         let mut body = Vec::new();
         for (k, v) in params {
             encode_nv_pair(&mut body, k.as_bytes(), v.as_bytes());
         }
         write_fcgi_record(&mut pkt, FCGI_PARAMS, rid, &body);
-        write_fcgi_record(&mut pkt, FCGI_PARAMS, rid, &[]); // 空记录表示 PARAMS 结束
+        write_fcgi_record(&mut pkt, FCGI_PARAMS, rid, &[]);
+    }
+    write_fcgi_record(&mut pkt, FCGI_STDIN, rid, stdin_body);
+    write_fcgi_record(&mut pkt, FCGI_STDIN, rid, &[]);
+
+    // 用宏消除 TCP / Unix 分支重复代码
+    macro_rules! do_send_recv {
+        ($stream:expr, $wrap:expr) => {{
+            use tokio::io::AsyncWriteExt;
+            $stream.write_all(&pkt).await?;
+            $stream.flush().await?;
+            let (status, headers, body_prefix, body_done) =
+                read_headers_from_stream(&mut $stream).await?;
+            Ok(FcgiParsedHeaders {
+                status,
+                headers,
+                body_prefix,
+                conn: $wrap($stream),
+                body_done,
+            })
+        }};
     }
 
-    // 3. STDIN（请求体，POST/PUT 时非空；分片发送，单片最大 65535 字节）
-    write_fcgi_record(&mut pkt, FCGI_STDIN, rid, stdin_body);
-    write_fcgi_record(&mut pkt, FCGI_STDIN, rid, &[]); // 空记录表示 STDIN 结束
+    match conn {
+        FcgiConn::Tcp(mut s) => do_send_recv!(s, FcgiConn::Tcp),
+        #[cfg(unix)]
+        FcgiConn::Unix(mut s) => do_send_recv!(s, FcgiConn::Unix),
+    }
+}
 
-    writer.write_all(&pkt).await?;
-    writer.flush().await?;
-
-    // 4. 读取所有 STDOUT 记录（直到 EOF）
-    let mut stdout = Vec::new();
-    let mut header = [0u8; 8];
+/// 从已建立的流读取 STDOUT 直到找到头部分隔符
+/// 返回 (status, headers, body_prefix, body_done)
+async fn read_headers_from_stream<S>(stream: &mut S)
+    -> anyhow::Result<(u16, Vec<(String, String)>, Vec<u8>, bool)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut header_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut body_prefix: Vec<u8> = Vec::new();
+    let mut body_done = false;
 
     loop {
-        if reader.read_exact(&mut header).await.is_err() {
-            break; // EOF 或连接关闭
-        }
-        let rec_type    = header[1];
-        let content_len = u16::from_be_bytes([header[4], header[5]]) as usize;
-        let padding_len = header[6] as usize;
-
-        let total = content_len + padding_len;
-        let mut data = vec![0u8; total];
-        if total > 0 {
-            reader.read_exact(&mut data).await?;
-        }
-
-        match rec_type {
-            t if t == FCGI_STDOUT => stdout.extend_from_slice(&data[..content_len]),
+        let rec = read_fcgi_from_stream(stream).await?;
+        match rec.rec_type {
+            t if t == FCGI_STDOUT => {
+                if rec.data.is_empty() {
+                    body_done = true;
+                    break;
+                }
+                header_buf.extend_from_slice(&rec.data);
+                // find_header_end 返回 (body_start, header_text_end)
+                if let Some((body_start, hdr_text_end)) = find_header_end(&header_buf) {
+                    body_prefix = header_buf[body_start..].to_vec();
+                    header_buf.truncate(hdr_text_end); // 只保留纯头部文本（不含 \r\n\r\n）
+                    break;
+                }
+            }
             t if t == FCGI_STDERR => {
-                if let Ok(s) = std::str::from_utf8(&data[..content_len]) {
-                    tracing::warn!("PHP-FPM stderr: {}", s.trim());
+                if let Ok(s) = std::str::from_utf8(&rec.data) {
+                    if !s.trim().is_empty() {
+                        tracing::warn!("PHP-FPM stderr: {}", s.trim());
+                    }
                 }
             }
             _ => {}
         }
-
-        // STDOUT 空记录 = PHP 输出结束
-        if rec_type == FCGI_STDOUT && content_len == 0 {
-            break;
-        }
     }
 
-    Ok(stdout)
+    let header_str = String::from_utf8_lossy(&header_buf);
+    let (status, headers) = parse_fcgi_headers(&header_str);
+    Ok((status, headers, body_prefix, body_done))
 }
 
-/// 解析 PHP-FPM 输出为 HTTP 响应
-///
-/// PHP 输出格式：`响应头\r\n\r\n响应体` 或 `响应头\n\n响应体`
-/// 所有响应头全量透传给客户端（Set-Cookie、Location、Content-Type 等）
+/// 从流读一条 FCGI 记录（泛型，与传输类型无关）
+async fn read_fcgi_from_stream<S>(stream: &mut S) -> anyhow::Result<FcgiRecord>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut hdr = [0u8; 8];
+    stream.read_exact(&mut hdr).await?;
+    let rec_type    = hdr[1];
+    let content_len = u16::from_be_bytes([hdr[4], hdr[5]]) as usize;
+    let padding_len = hdr[6] as usize;
+    let total = content_len + padding_len;
+    let mut buf = vec![0u8; total];
+    if total > 0 { stream.read_exact(&mut buf).await?; }
+    buf.truncate(content_len);
+    Ok(FcgiRecord { rec_type, data: buf })
+}
+
+/// 构建流式响应（响应头已解析，body 用 spawn+channel 流式推送）
+fn build_streaming_response(
+    parsed: FcgiParsedHeaders,
+    pool: std::sync::Arc<crate::handler::fastcgi_pool::FcgiPool>,
+    addr: String,
+) -> WebResponse {
+    use xitca_web::http::header::HeaderName;
+
+    let http_status = StatusCode::from_u16(parsed.status).unwrap_or(StatusCode::OK);
+
+    // 如果 body 已经全部读完（短响应），直接用 Vec
+    if parsed.body_done && parsed.body_prefix.len() < 512 * 1024 {
+        // 短响应：直接返回，不建 channel
+        // 但 conn 还需要读完剩余记录（body_done=true 表示已读完）
+        pool.release(&addr, parsed.conn);
+        return make_complete_response(parsed.status, parsed.headers, parsed.body_prefix);
+    }
+
+    // 长响应 / body 未读完：spawn task 读剩余 STDOUT，通过 channel 流式传输
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(8);
+    let body_prefix = parsed.body_prefix;
+    let mut conn = parsed.conn;
+    let body_done = parsed.body_done;
+
+    tokio::spawn(async move {
+        // 先发 prefix
+        if !body_prefix.is_empty() {
+            if tx.send(Ok(bytes::Bytes::from(body_prefix))).await.is_err() {
+                return;
+            }
+        }
+        if body_done {
+            pool.release(&addr, conn);
+            return;
+        }
+        // 继续读 STDOUT 记录
+        loop {
+            let rec = match read_fcgi_conn(&mut conn).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            match rec.rec_type {
+                t if t == FCGI_STDOUT => {
+                    if rec.data.is_empty() {
+                        // STDOUT 结束，归还连接
+                        pool.release(&addr, conn);
+                        return;
+                    }
+                    if tx.send(Ok(bytes::Bytes::from(rec.data))).await.is_err() {
+                        // 客户端已断开
+                        return;
+                    }
+                }
+                t if t == FCGI_STDERR => {
+                    if let Ok(s) = std::str::from_utf8(&rec.data) {
+                        if !s.trim().is_empty() {
+                            tracing::warn!("PHP-FPM stderr: {}", s.trim());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // 把 channel receiver 包成 Stream
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = ResponseBody::box_stream(stream);
+    let mut resp = WebResponse::new(body);
+    *resp.status_mut() = http_status;
+
+    for (k, v) in &parsed.headers {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            resp.headers_mut().append(name, val);
+        }
+    }
+    if !parsed.headers.iter().any(|(k, _)| k.to_lowercase() == "content-type") {
+        resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    }
+    resp
+}
+
+/// 构造完整响应（body 已全量，无需 stream）
+fn make_complete_response(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> WebResponse {
+    use xitca_web::http::header::HeaderName;
+    let http_status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    let body_len = body.len();
+    let mut resp = WebResponse::new(ResponseBody::from(body));
+    *resp.status_mut() = http_status;
+    for (k, v) in &headers {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            resp.headers_mut().append(name, val);
+        }
+    }
+    if !headers.iter().any(|(k, _)| k.to_lowercase() == "content-type") {
+        resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    }
+    if let Ok(v) = HeaderValue::from_str(&body_len.to_string()) {
+        resp.headers_mut().insert(xitca_web::http::header::CONTENT_LENGTH, v);
+    }
+    resp
+}
+
+// ─────────────────────────────────────────────
+// FCGI 记录读取 + 头部解析辅助
+// ─────────────────────────────────────────────
+
+struct FcgiRecord {
+    rec_type: u8,
+    data: Vec<u8>,
+}
+
+/// 从 FcgiConn 读一条 FCGI 记录—— enum dispatch，无 trait object 开销
+async fn read_fcgi_conn(conn: &mut crate::handler::fastcgi_pool::FcgiConn) -> std::io::Result<FcgiRecord> {
+    use tokio::io::AsyncReadExt;
+    use crate::handler::fastcgi_pool::FcgiConn;
+    let mut hdr = [0u8; 8];
+    match conn {
+        FcgiConn::Tcp(s)  => s.read_exact(&mut hdr).await?,
+        #[cfg(unix)]
+        FcgiConn::Unix(s) => s.read_exact(&mut hdr).await?,
+    };
+    let rec_type    = hdr[1];
+    let content_len = u16::from_be_bytes([hdr[4], hdr[5]]) as usize;
+    let padding_len = hdr[6] as usize;
+    let total = content_len + padding_len;
+    let mut buf = vec![0u8; total];
+    if total > 0 {
+        match conn {
+            FcgiConn::Tcp(s)  => s.read_exact(&mut buf).await?,
+            #[cfg(unix)]
+            FcgiConn::Unix(s) => s.read_exact(&mut buf).await?,
+        };
+    }
+    buf.truncate(content_len);
+    Ok(FcgiRecord { rec_type, data: buf })
+}
+
+/// 寻找 HTTP 头尾分隔符（\r\n\r\n 或 \n\n），返回 body 起始位置和头部文本长度
+/// 返回 (body_start, header_text_len)
+fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    for i in 0..buf.len().saturating_sub(3) {
+        if buf[i] == b'\r' && buf[i+1] == b'\n' && buf[i+2] == b'\r' && buf[i+3] == b'\n' {
+            return Some((i + 4, i)); // body 从 i+4 开始，头部文本到 i
+        }
+    }
+    for i in 0..buf.len().saturating_sub(1) {
+        if buf[i] == b'\n' && buf[i+1] == b'\n' {
+            return Some((i + 2, i)); // body 从 i+2 开始，头部文本到 i
+        }
+    }
+    None
+}
+
+/// 找头部文本结束位置（不包含分隔符），为兼容旧调用保留
+#[allow(dead_code)]
+fn find_header_text_end(buf: &[u8]) -> Option<usize> {
+    find_header_end(buf).map(|(_, text_end)| text_end)
+}
+
+/// 解析 FastCGI 响应头文本（不含 body），返回状态码和头列表
+fn parse_fcgi_headers(header_str: &str) -> (u16, Vec<(String, String)>) {
+    let mut status_code: u16 = 200;
+    let mut response_headers: Vec<(String, String)> = Vec::new();
+    for line in header_str.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if let Some(rest) = line.strip_prefix("Status:").or_else(|| line.strip_prefix("status:")) {
+            if let Some(code_str) = rest.trim().split_whitespace().next() {
+                status_code = code_str.parse().unwrap_or(200);
+            }
+            continue;
+        }
+        if let Some(colon) = line.find(':') {
+            let name  = line[..colon].trim().to_string();
+            let value = line[colon+1..].trim().to_string();
+            response_headers.push((name, value));
+        }
+    }
+    (status_code, response_headers)
+}
+
+/// 全量缓冲解析（已被流式架构替代，保留备用）
+#[allow(dead_code)]
 fn parse_fcgi_response(stdout: Vec<u8>) -> WebResponse {
     // 分割头部和 body：支持 \r\n\r\n 和 \n\n
     let (header_part, body_part) = 'split: {

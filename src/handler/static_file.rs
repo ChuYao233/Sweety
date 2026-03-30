@@ -74,7 +74,7 @@ pub async fn handle_xitca(
     // 文件不存在时应用 try_files（等价 Nginx try_files $uri $uri/ /index.html）
     let file_path = if !file_path.is_file() {
         if !location.try_files.is_empty() {
-            match try_files_resolve(&root, &path, &location.try_files, &site.index).await {
+            match try_files_resolve_inner(&root, &path, &location.try_files, &site.index).await {
                 TryFilesResult::File(p) => p,
                 TryFilesResult::Code(code) => {
                     return make_error(StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND), "");
@@ -376,7 +376,7 @@ fn set_file_headers(
 
 /// try_files 解析结果
 pub enum TryFilesResult {
-    /// 找到可用文件
+    /// 找到可用文件（静态文件或 PHP 脚本，调用方根据扩展名分流）
     File(PathBuf),
     /// 返回指定错误码（如 =404）
     Code(u16),
@@ -391,7 +391,22 @@ pub enum TryFilesResult {
 /// - `$uri/`     → 请求路径对应的目录（查找 index 文件）
 /// - `/path`     → 固定路径的文件
 /// - `=<code>`   → 返回指定 HTTP 状态码（必须是最后一项）
+/// 供 http.rs 调用（root 为 Option）
 pub async fn try_files_resolve(
+    try_files_list: &[String],
+    request_path: &str,
+    root: Option<&std::path::PathBuf>,
+) -> TryFilesResult {
+    let index_files = vec!["index.php".to_string(), "index.html".to_string()];
+    let root_path = match root {
+        Some(r) => r.as_path(),
+        None => return TryFilesResult::NotFound,
+    };
+    try_files_resolve_inner(root_path, request_path, try_files_list, &index_files).await
+}
+
+/// 内部实现（保持原始变体不变）
+async fn try_files_resolve_inner(
     root: &Path,
     request_path: &str,
     try_files: &[String],

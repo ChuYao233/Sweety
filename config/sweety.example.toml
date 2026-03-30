@@ -206,3 +206,126 @@ max_connections = 10000
 path = "/"
 handler = "static"
 root = "/var/www/ws-site"
+
+# ─────────────────────────────────────────────
+# 站点 5：新功能综合示例
+# 展示：return/try_files/error_page/sub_filter/
+#       proxy_cache/访问日志/force_https
+# ─────────────────────────────────────────────
+[[sites]]
+name        = "example-full"
+server_name = ["full.example.com"]
+listen      = [80]
+listen_tls  = [443]
+root        = "/var/www/full-site"
+access_log  = "/var/log/sweety/full_access.log"
+# HTTP → HTTPS 强制跳转（需配置 listen_tls 才生效）
+force_https = true
+
+# 自定义错误页（等价 Nginx error_page 404 /404.html）
+# key = HTTP 状态码（字符串），value = 相对于 root 的路径
+[sites.error_pages]
+404 = "/404.html"
+500 = "/500.html"
+503 = "/503.html"
+
+# 反代响应缓存（等价 Nginx proxy_cache）
+[sites.proxy_cache]
+# 磁盘缓存目录（不设则仅用内存）
+path        = "/var/cache/sweety/full"
+# 内存最大缓存条数
+max_entries = 2000
+# 缓存 TTL（秒）
+ttl         = 300
+# 可缓存状态码
+cacheable_statuses = [200, 301, 302, 304]
+# 可缓存方法
+cacheable_methods  = ["GET", "HEAD"]
+# 有以下请求头时跳过缓存
+bypass_headers     = ["Authorization", "Cookie", "X-No-Cache"]
+
+[sites.tls]
+acme                   = true
+acme_email             = "admin@example.com"
+acme_provider          = "letsencrypt"
+acme_renew_days_before = 30
+min_version            = "tls1.2"
+max_version            = "tls1.3"
+
+# 上游
+[[sites.upstreams]]
+name     = "app-backend"
+strategy = "round_robin"
+[[sites.upstreams.nodes]]
+addr = "127.0.0.1:3000"
+
+# Location 1：return 指令（带 URL，等价 Nginx return 301 https://...）
+[[sites.locations]]
+path       = "= /old-page"
+handler    = "static"
+# 301 永久跳转，支持 $request_uri 变量
+return_url = "301 https://full.example.com/new-page"
+
+# Location 2：try_files（等价 Nginx try_files $uri $uri/ /index.html）
+# 场景：SPA 单页应用，所有路径都 fallback 到 index.html
+[[sites.locations]]
+path      = "/"
+handler   = "static"
+try_files = ["$uri", "$uri/", "/index.html"]
+
+# Location 3：反代 + sub_filter + cache_rules + proxy_set_header
+[[sites.locations]]
+path     = "/api/"
+handler  = "reverse_proxy"
+upstream = "app-backend"
+
+# 自定义转发请求头（等价 Nginx proxy_set_header）
+# 支持变量: $remote_addr / $host / $scheme / $request_uri
+[[sites.locations.proxy_set_headers]]
+name  = "X-Real-IP"
+value = "$remote_addr"
+
+[[sites.locations.proxy_set_headers]]
+name  = "X-Forwarded-For"
+value = "$remote_addr"
+
+[[sites.locations.proxy_set_headers]]
+name  = "X-Forwarded-Proto"
+value = "$scheme"
+
+[[sites.locations.proxy_set_headers]]
+name  = "Host"
+value = "$host"
+
+# 向客户端响应注入自定义头（等价 Nginx add_header）
+[[sites.locations.add_headers]]
+name  = "X-Frame-Options"
+value = "SAMEORIGIN"
+
+[[sites.locations.add_headers]]
+name  = "X-Content-Type-Options"
+value = "nosniff"
+
+[[sites.locations.add_headers]]
+name  = "X-Cache-Status"
+value = "$upstream_cache_status"
+
+# 响应体内容替换（等价 Nginx sub_filter）
+# pattern 以 ~ 开头表示正则，否则为字符串替换
+[[sites.locations.sub_filter]]
+pattern     = "http://internal-api.local"
+replacement = "https://full.example.com"
+
+[[sites.locations.sub_filter]]
+# 正则替换：去掉 HTML 注释
+pattern     = "~ <!--.*?-->"
+replacement = ""
+
+# 按扩展名设置缓存（等价 Nginx if $uri ~* ... { expires ... }）
+[[sites.locations.cache_rules]]
+pattern       = "\\.(gif|png|jpg|jpeg|webp|css|js|woff2?)$"
+cache_control = "public, max-age=2592000, immutable"
+
+[[sites.locations.cache_rules]]
+pattern       = "\\.html$"
+cache_control = "no-cache"

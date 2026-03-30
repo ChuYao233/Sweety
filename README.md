@@ -16,21 +16,21 @@ Sweety 是一款以 Rust 编写、基于 [Xitca-Web](https://github.com/HFQR/xit
 | 功能分类 | 支持内容 |
 |---|---|
 | **协议** | HTTP/1.1、HTTP/2、HTTP/3（QUIC） |
-| **TLS** | Rustls 纯 Rust TLS、多证书（ECDSA + Ed25519 等）、ACME 自动证书、TLS 版本控制 |
+| **TLS** | Rustls 纯 Rust TLS、多证书（ECDSA + Ed25519 等）、ACME 自动证书、TLS 版本控制、证书透明度日志（CT Log）上报 |
 | **多站点** | 虚拟主机 SNI 隔离、HTTPS 跨站防护（421）、`fallback` 兜底站点 |
-| **静态文件** | 流式 0-copy（ReaderStream）、Range 分块、gzip 压缩、ETag/Last-Modified 缓存 |
+| **静态文件** | 流式 0-copy（ReaderStream）、Range 分块、gzip 压缩、ETag/Last-Modified 缓存、`try_files` |
 | **PHP/FastCGI** | 高并发连接池、沙箱隔离，与 Nginx 相同实现方式 |
 | **WebSocket** | 高并发 WS/WSS 反向代理、站点级 websocket 开关 |
-| **反向代理** | 负载均衡（轮询/加权/最小连接/IP哈希）、健康检查、连接池复用 |
+| **反向代理** | 负载均衡（轮询/加权/最少连接/IP哈希）、健康检查、连接池复用、`proxy_cache`（内存+磁盘双层） |
 | **Rewrite/伪静态** | 前缀匹配、正则重写、301/302 跳转 |
 | **限流** | 按 IP / 路径 / Header / User-Agent 多维度令牌桶限流 |
-| **安全** | 敏感文件拦截、HTTPS 跨站隔离、请求体大小限制（413）、HSTS |
+| **安全** | 敏感文件拦截、HTTPS 跨站隔离、请求体大小限制（413）、HSTS、`force_https` HTTP→HTTPS 强制跳转 |
 | **缓存** | 静态文件 ETag/Last-Modified、Cache-Control 按扩展名默认 |
 | **压缩** | 全局/站点级 gzip，可配置等级和最小文件大小 |
-| **日志** | 访问日志（JSON/文本双模式）、错误日志 |
+| **日志** | 访问日志异步写文件（Nginx combined 格式）、JSON 格式、错误日志 |
 | **监控** | 实时统计（QPS、带宽）、Prometheus 导出 |
 | **管理 API** | HTTP + WebSocket 双协议，动态增删站点 |
-| **热重载** | 配置/证书文件变更后自动 diff 更新，不断开现有连接 |
+| **热重载** | 配置/证书文件变更后自动 diff 更新，不断开现有连接；端口变更指引重启 |
 | **连接配置** | `worker_connections`、`keepalive_timeout`、`client_max_body_size` 等 Nginx 同名配置 |
 | **部署** | 单文件可执行，无 C 依赖（纯 Rust），轻量可移植 |
 
@@ -148,6 +148,13 @@ sweety/
 - [x] Nginx 同名连接配置（`worker_connections`、`keepalive_timeout` 等）
 - [x] Prometheus 指标导出
 - [x] 管理 API（HTTP + WebSocket）
+- [x] `return` 指令（带 URL 的 return 301/302，支持 `$request_uri` 变量）
+- [x] `try_files`（静态文件 fallback，支持 `$uri`/`$uri/`/固定路径/`=404`）
+- [x] `error_page` 自定义错误页（按状态码匹配）
+- [x] 访问日志异步写文件（Nginx combined 格式、JSON 格式）
+- [x] `proxy_cache`（内存+磁盘双层，TTL/可缓存状态码/bypass 头配置）
+- [x] `sub_filter`（反代响应体内容替换，支持字符串和正则）
+- [x] `force_https`（HTTP 自动跳转 HTTPS，与 Nginx 行为一致）
 - [ ] 流式 gzip（大文件在线压缩，当前 > 4MB 跳过）
 - [ ] HTTP/2 Server Push
 - [ ] 证书透明度日志（CT Log）上报

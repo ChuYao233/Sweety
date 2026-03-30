@@ -142,6 +142,13 @@ impl SweetyServer {
         };
         server = server.worker_threads(workers);
 
+        // Keep-Alive 超时：连接空闲超时后强制关闭，释放 File 句柄和读缓冲
+        // 等价于 Nginx keepalive_timeout，防止下载器断开后资源残留
+        let ka_timeout = std::time::Duration::from_secs(
+            if cfg.global.keepalive_timeout == 0 { 60 } else { cfg.global.keepalive_timeout }
+        );
+        server = server.keep_alive_timeout(ka_timeout);
+
         // 绑定各站点监听端口（HTTP 明文）
         let http_ports = collect_http_ports(&cfg);
         for port in &http_ports {
@@ -234,6 +241,7 @@ pub struct AppState {
 /// 参数必须是 `&WebContext` 引用（xitca-web handler_service FromRequest 约束）
 async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     let state = ctx.state();
+    let req_start = std::time::Instant::now();
     state.metrics.inc_requests();
 
     // 提取 Host（去掉端口）
@@ -377,7 +385,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     // return_url：带 URL 的 return 指令（等价 Nginx return 301 https://...）
     // 格式: "301 https://..." 或 "302 https://..." 或直接 URL（默认 301）
     if let Some(ref ret) = location.return_url {
-        let (code, url) = parse_return_directive(ret, &path);
+        let (code, url) = parse_return_directive(ret, &request_uri);
         state.metrics.record_status(code);
         return make_redirect_resp(&url, StatusCode::from_u16(code).unwrap_or(StatusCode::MOVED_PERMANENTLY));
     }
@@ -410,22 +418,21 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     state.metrics.record_status(resp.status().as_u16());
 
     // error_page：自定义错误页（等价 Nginx error_page 404 /404.html）
+    // 使用 tokio::fs::read 异步读取，不阻塞 worker thread
     let status_u16 = resp.status().as_u16();
     if (400..600).contains(&status_u16) {
         if let Some(ep_path) = site.error_pages.get(&status_u16) {
             if let Some(root) = location.root.as_ref().or(site.root.as_ref()) {
                 let ep_file = root.join(ep_path.trim_start_matches('/'));
-                if ep_file.is_file() {
-                    if let Ok(content) = std::fs::read(&ep_file) {
-                        let mut ep_resp = WebResponse::new(ResponseBody::from(content));
-                        *ep_resp.status_mut() = resp.status();
-                        let ext = ep_file.extension().and_then(|e| e.to_str()).unwrap_or("html");
-                        let mime = crate::middleware::cache::mime_type_for(ext);
-                        if let Ok(v) = HeaderValue::from_str(mime) {
-                            ep_resp.headers_mut().insert(CONTENT_TYPE, v);
-                        }
-                        return ep_resp;
+                if let Ok(content) = tokio::fs::read(&ep_file).await {
+                    let mut ep_resp = WebResponse::new(ResponseBody::from(content));
+                    *ep_resp.status_mut() = resp.status();
+                    let ext = ep_file.extension().and_then(|e| e.to_str()).unwrap_or("html");
+                    let mime = crate::middleware::cache::mime_type_for(ext);
+                    if let Ok(v) = HeaderValue::from_str(mime) {
+                        ep_resp.headers_mut().insert(CONTENT_TYPE, v);
                     }
+                    return ep_resp;
                 }
             }
         }
@@ -456,9 +463,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         let logger = logger.clone();
         let client_ip = ctx.req().body().socket_addr().ip().to_string();
         let method = ctx.req().method().as_str().to_string();
-        let uri = ctx.req().uri().path_and_query()
-            .map(|pq| pq.as_str().to_string())
-            .unwrap_or_else(|| path.clone());
+        let uri = request_uri.clone();
         let http_version = format!("{:?}", ctx.req().version());
         let status = resp.status().as_u16();
         let bytes_sent = resp.headers()
@@ -481,7 +486,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
             logger.write(&AccessLogEntry {
                 client_ip, method, uri, http_version,
                 status, bytes_sent, referer, user_agent,
-                duration_ms: 0,  // TODO: 计时
+                duration_ms: req_start.elapsed().as_millis() as u64,
                 site: site_name,
             }).await;
         });

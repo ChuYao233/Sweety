@@ -31,6 +31,11 @@ pub struct GlobalConfig {
     #[serde(default = "default_worker_connections")]
     pub worker_connections: usize,
 
+    /// 全局最大并发 HTTP 连接数（0 = 不限制，生产建议设为 10000-50000）
+    /// 超出时返回 503 Service Unavailable，防止内存爆涨
+    #[serde(default)]
+    pub max_connections: usize,
+
     /// Keep-Alive 超时（秒），0 = 禁用（等价 Nginx keepalive_timeout）
     #[serde(default = "default_keepalive_timeout")]
     pub keepalive_timeout: u64,
@@ -90,6 +95,7 @@ impl Default for GlobalConfig {
         Self {
             worker_threads: 0,
             worker_connections: default_worker_connections(),
+            max_connections: 0,
             keepalive_timeout: default_keepalive_timeout(),
             client_max_body_size: default_client_max_body_size(),
             client_header_buffer_size: default_client_header_buffer_size(),

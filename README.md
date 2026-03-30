@@ -30,7 +30,6 @@ Sweety 是一款以 Rust 编写、基于 [Xitca-Web](https://github.com/HFQR/xit
 | **监控** | 实时统计（QPS、带宽、WebSocket 连接数）、Prometheus 导出 |
 | **管理 API** | HTTP + WebSocket 双协议，动态增删站点、调整限流等 |
 | **热重载** | 配置文件修改后无需重启，实时生效 |
-| **国密** | SM2/SM3/SM4 可选（特性标志 `feature = "gm"`） |
 | **部署** | 单文件可执行，轻量可移植 |
 
 ---
@@ -126,18 +125,6 @@ sweety/
 
 ---
 
-## 国密支持（可选）
-
-编译时启用 `gm` feature 即可：
-
-```bash
-cargo build --release --features gm
-```
-
-提供 SM2 签名/加密、SM3 摘要、SM4 对称加密，可替代 TLS 握手中的 RSA/ECDSA + AES。
-
----
-
 ## 路线图
 
 - [x] 项目骨架与基础模块
@@ -150,7 +137,6 @@ cargo build --release --features gm
 - [ ] HTTP/3（QUIC）集成
 - [ ] Prometheus 导出完整实现
 - [ ] 管理 WebSocket API 完整实现
-- [ ] 国密（SM2/SM3/SM4）集成
 
 ---
 

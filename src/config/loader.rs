@@ -6,6 +6,14 @@ use anyhow::{Context, Result, bail};
 
 use super::model::AppConfig;
 
+/// 返回默认配置文件路径（环境变量 SWEETY_CONFIG > 默认 config/sweety.toml）
+pub fn default_config_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("SWEETY_CONFIG") {
+        return std::path::PathBuf::from(p);
+    }
+    std::path::PathBuf::from("config/sweety.toml")
+}
+
 /// 根据文件扩展名自动选择解析器加载配置文件
 pub fn load_config(path: &Path) -> Result<AppConfig> {
     let content = std::fs::read_to_string(path)
@@ -60,12 +68,12 @@ fn validate_config(cfg: &AppConfig) -> Result<()> {
                 }
             }
         }
-        // 校验 TLS：手动证书模式下 cert 和 key 都需指定
+        // 校验 TLS：手动证书模式下必须有 cert/key 或 certs 列表
         if let Some(tls) = &site.tls {
-            if !tls.acme {
+            if !tls.acme && tls.certs.is_empty() {
                 if tls.cert.is_none() || tls.key.is_none() {
                     bail!(
-                        "站点 '{}' 的 TLS 配置：非 ACME 模式必须同时指定 cert 和 key",
+                        "站点 '{}' 的 TLS 配置：非 ACME 模式必须指定 cert+key 或 certs 列表",
                         site.name
                     );
                 }

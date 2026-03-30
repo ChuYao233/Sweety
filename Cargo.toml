@@ -86,8 +86,11 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # ── 通用工具 ────────────────────────────────
 futures-util  = "0.3"
+tokio-util    = { version = "0.7", features = ["io"] }
 tokio-stream  = "0.1"
+h2            = "0.4"
 bytes        = "1"
+flate2       = "1"
 anyhow       = "1"
 thiserror    = "1"
 url          = "2"
@@ -98,12 +101,10 @@ httpdate     = "1"
 dirs-next    = "2"
 
 # ─────────────────────────────────────────────
-# 可选 Features（国密 SM2/SM3/SM4）
+# Features
 # ─────────────────────────────────────────────
 [features]
 default = []
-# 国密支持（启用：cargo build --features gm）
-gm = []
 # HTTP/3 支持（由 xitca-web http3 feature 提供，此处仅作开关标志）
 http3 = []
 

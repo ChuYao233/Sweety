@@ -13,12 +13,48 @@ use rustls::ServerConfig;
 use rustls_pemfile::Item;
 use tracing::{error, info, warn};
 
-use crate::config::model::{AppConfig, TlsConfig};
+use crate::config::model::{AppConfig, SiteConfig, TlsConfig};
+
+pub use sni_resolver::SniResolver;
 
 /// TLS 管理器（静态方法集合）
 pub struct TlsManager;
 
 impl TlsManager {
+    /// 构建支持 SNI 多证书的 ServerConfig
+    ///
+    /// 将同一端口下所有站点的证书注册到 SNI resolver，
+    /// 浏览器发起 TLS 握手时，Rustls 根据 SNI 自动选择匹配证书。
+    /// 若只有一个站点/证书，直接使用单证书模式。
+    pub fn build_sni_server_config(sites: &[&SiteConfig]) -> Result<(ServerConfig, Arc<SniResolver>)> {
+        // 每个站点可有多张证书（Ed25519 + ECDSA 等），SniResolver 按客户端签名方案选最优
+        let mut certs_map: Vec<(Vec<String>, Vec<rustls::sign::CertifiedKey>)> = Vec::new();
+
+        for site in sites {
+            let Some(tls) = &site.tls else { continue };
+            let certified_keys = build_certified_keys(tls)?;
+            if !certified_keys.is_empty() {
+                certs_map.push((site.server_name.clone(), certified_keys));
+            }
+        }
+
+        if certs_map.is_empty() {
+            bail!("未找到有效的 TLS 证书配置");
+        }
+
+        // 计算该端口所有站点中最严格的 TLS 版本约束
+        // 多站点共享同一端口时取并集中最保守的：min 取最高，max 取最低
+        let tls_versions = resolve_tls_versions(sites);
+
+        let resolver = Arc::new(SniResolver::new(certs_map));
+        // ALPN 顺序策略：http/1.1 在前，h2 在后
+        let mut cfg = ServerConfig::builder_with_protocol_versions(&tls_versions)
+            .with_no_client_auth()
+            .with_cert_resolver(resolver.clone());
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
+        Ok((cfg, resolver))
+    }
+
     /// 根据 TLS 配置构建 Rustls ServerConfig
     ///
     /// - `acme = false`：从 cert/key 文件加载（支持 RSA / ECDSA / Ed25519）
@@ -62,6 +98,10 @@ impl TlsManager {
             }
             // 证书尚未就绪，生成自签名证书作临时替代
             build_quinn_config_self_signed(domain)
+        } else if !tls.certs.is_empty() {
+            // 多证书模式：QUIC 只需一张，优先取列表第一张（通常是 ECDSA，兼容性最好）
+            let first = &tls.certs[0];
+            build_quinn_config_from_pem(&first.cert, &first.key)
         } else {
             let cert = tls.cert.as_ref().context("QUIC TLS 需要 cert 路径")?;
             let key  = tls.key.as_ref().context("QUIC TLS 需要 key 路径")?;
@@ -120,6 +160,44 @@ impl TlsManager {
             // 每 12 小时检查一次
             tokio::time::sleep(Duration::from_secs(12 * 3600)).await;
         }
+    }
+}
+
+// ─────────────────────────────────────────────
+// 内部实现：TLS 版本解析
+// ─────────────────────────────────────────────
+
+/// 根据站点 TLS 配置计算协议版本列表
+///
+/// 多站点共享同端口时取最严格的交集：
+/// - min_version 取所有站点中最高的（更严格）
+/// - max_version 取所有站点中最低的（更严格）
+/// 单站点或无 TLS 配置时默认 TLS 1.2 + TLS 1.3
+fn resolve_tls_versions(sites: &[&SiteConfig]) -> Vec<&'static rustls::SupportedProtocolVersion> {
+    // 枚举所有站点的版本约束，取最保守交集
+    let mut allow_12 = true;
+    let mut allow_13 = true;
+
+    for site in sites {
+        let Some(tls) = &site.tls else { continue };
+        let min = tls.min_version.as_str();
+        let max = tls.max_version.as_str();
+        // min_version = tls1.3 时排除 TLS 1.2
+        if min == "tls1.3" {
+            allow_12 = false;
+        }
+        // max_version = tls1.2 时排除 TLS 1.3
+        if max == "tls1.2" {
+            allow_13 = false;
+        }
+    }
+
+    match (allow_12, allow_13) {
+        (true, true)   => vec![&rustls::version::TLS12, &rustls::version::TLS13],
+        (false, true)  => vec![&rustls::version::TLS13],
+        (true, false)  => vec![&rustls::version::TLS12],
+        // 不合理的配置（同时禁止两者），回退到全部支持
+        (false, false) => vec![&rustls::version::TLS12, &rustls::version::TLS13],
     }
 }
 
@@ -355,4 +433,178 @@ fn acme_cert_path(domain: &str) -> std::path::PathBuf {
 
 fn acme_key_path(domain: &str) -> std::path::PathBuf {
     acme_cache_dir().join(format!("{}.key", domain))
+}
+
+// ─────────────────────────────────────────────
+// SNI 多证书 Resolver
+// ─────────────────────────────────────────────
+
+mod sni_resolver {
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+    use rustls::server::ClientHello;
+
+    /// SNI Resolver 内部数据
+    #[derive(Debug, Default)]
+    struct Inner {
+        exact:    HashMap<String, Vec<Arc<rustls::sign::CertifiedKey>>>,
+        wildcard: HashMap<String, Vec<Arc<rustls::sign::CertifiedKey>>>,
+        fallback: Vec<Arc<rustls::sign::CertifiedKey>>,
+    }
+
+    /// SNI Resolver：根据 SNI 和客户端签名方案动态选最优证书
+    ///
+    /// 内部用 RwLock 保护，支持运行时原地更新证书（热重载不断连）。
+    #[derive(Debug, Default)]
+    pub struct SniResolver {
+        inner: RwLock<Inner>,
+    }
+
+    impl SniResolver {
+        pub fn new(certs_map: Vec<(Vec<String>, Vec<rustls::sign::CertifiedKey>)>) -> Self {
+            let r = Self::default();
+            for (names, keys) in certs_map {
+                r.upsert_site(&names, keys);
+            }
+            r
+        }
+
+        /// 插入或更新单个站点的证书列表
+        pub fn upsert_site(&self, names: &[String], keys: Vec<rustls::sign::CertifiedKey>) {
+            let arcs: Vec<Arc<rustls::sign::CertifiedKey>> =
+                keys.into_iter().map(Arc::new).collect();
+            let mut inner = self.inner.write().unwrap();
+            if inner.fallback.is_empty() {
+                inner.fallback = arcs.clone();
+            }
+            for name in names {
+                if let Some(suffix) = name.strip_prefix("*.") {
+                    inner.wildcard.insert(suffix.to_lowercase(), arcs.clone());
+                } else {
+                    inner.exact.insert(name.to_lowercase(), arcs.clone());
+                }
+            }
+        }
+
+        /// 删除单个站点的证书
+        pub fn remove_site(&self, names: &[String]) {
+            let mut inner = self.inner.write().unwrap();
+            for name in names {
+                if let Some(suffix) = name.strip_prefix("*.") {
+                    inner.wildcard.remove(&suffix.to_lowercase());
+                } else {
+                    inner.exact.remove(&name.to_lowercase());
+                }
+            }
+            // 重置 fallback
+            inner.fallback = inner.exact.values()
+                .chain(inner.wildcard.values())
+                .next()
+                .cloned()
+                .unwrap_or_default();
+        }
+
+        fn lookup<'a>(inner: &'a Inner, name: &str) -> &'a Vec<Arc<rustls::sign::CertifiedKey>> {
+            let lower = name.to_lowercase();
+            if let Some(cks) = inner.exact.get(&lower) { return cks; }
+            if let Some(dot) = lower.find('.') {
+                let suffix = &lower[dot + 1..];
+                if let Some(cks) = inner.wildcard.get(suffix) { return cks; }
+            }
+            &inner.fallback
+        }
+
+        fn choose(
+            candidates: &[Arc<rustls::sign::CertifiedKey>],
+            schemes: &[rustls::SignatureScheme],
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            for ck in candidates {
+                if ck.key.choose_scheme(schemes).is_some() {
+                    return Some(ck.clone());
+                }
+            }
+            candidates.first().cloned()
+        }
+    }
+
+    impl rustls::server::ResolvesServerCert for SniResolver {
+        fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            let inner = self.inner.read().unwrap();
+            let candidates = match client_hello.server_name() {
+                Some(name) => Self::lookup(&inner, name),
+                None => &inner.fallback,
+            };
+            let schemes = client_hello.signature_schemes();
+            Self::choose(candidates, schemes)
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+// 辅助：从 TlsConfig 构建 CertifiedKey
+// ─────────────────────────────────────────────
+
+/// 公开给热重载模块调用：从 TlsConfig 加载所有证书
+impl TlsManager {
+    pub fn build_certified_keys_pub(tls: &TlsConfig) -> Result<Vec<rustls::sign::CertifiedKey>> {
+        build_certified_keys(tls)
+    }
+}
+
+fn build_certified_keys(tls: &TlsConfig) -> Result<Vec<rustls::sign::CertifiedKey>> {
+    if tls.acme {
+        // ACME 模式：只有一张证书
+        let domain = tls.acme_email.as_deref().unwrap_or("default");
+        let ck = load_certified_key_from_path(&acme_cert_path(domain), &acme_key_path(domain))?;
+        return Ok(vec![ck]);
+    }
+
+    if !tls.certs.is_empty() {
+        // 多证书模式：加载所有证书，失败的跳过并警告
+        let mut keys = Vec::new();
+        for pair in &tls.certs {
+            match load_certified_key_from_path(&pair.cert, &pair.key) {
+                Ok(ck) => keys.push(ck),
+                Err(e) => warn!("跳过证书 {}: {}", pair.cert.display(), e),
+            }
+        }
+        if keys.is_empty() {
+            bail!("certs 列表中没有可用的证书");
+        }
+        return Ok(keys);
+    }
+
+    // 单证书兼容模式
+    let cert = tls.cert.as_ref().context("TLS 需要指定 cert 路径")?;
+    let key  = tls.key.as_ref().context("TLS 需要指定 key 路径")?;
+    let ck = load_certified_key_from_path(cert, key)?;
+    Ok(vec![ck])
+}
+
+/// 从文件路径加载单张证书
+fn load_certified_key_from_path(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<rustls::sign::CertifiedKey> {
+    let cert_bytes = std::fs::read(cert_path)
+        .with_context(|| format!("读取证书失败: {}", cert_path.display()))?;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_bytes.as_slice())
+            .collect::<std::result::Result<_, _>>()
+            .with_context(|| format!("解析证书 PEM 失败: {}", cert_path.display()))?;
+    if certs.is_empty() {
+        bail!("证书文件无有效证书: {}", cert_path.display());
+    }
+
+    let key_bytes = std::fs::read(key_path)
+        .with_context(|| format!("读取私钥失败: {}", key_path.display()))?;
+    let key_der = load_private_key(&key_bytes)
+        .with_context(|| format!("解析私钥失败: {}", key_path.display()))?;
+
+    // any_supported_type 内部已处理 RSA / ECDSA / Ed25519（PKCS#8）
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der)
+        .map_err(|e| anyhow::anyhow!("私钥类型不支持（RSA/ECDSA/Ed25519）: {:?}", e))?;
+
+    info!("TLS 证书加载成功: {}", cert_path.display());
+    Ok(rustls::sign::CertifiedKey::new(certs, signing_key))
 }

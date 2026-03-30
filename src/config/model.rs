@@ -23,9 +23,41 @@ pub struct AppConfig {
 /// 全局配置项
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GlobalConfig {
-    /// Worker 线程数，0 = CPU 核心数
+    /// Worker 线程数，0 = CPU 核心数（等价 Nginx worker_processes auto）
     #[serde(default)]
     pub worker_threads: usize,
+
+    /// 每个 worker 最大并发连接数（等价 Nginx worker_connections）
+    #[serde(default = "default_worker_connections")]
+    pub worker_connections: usize,
+
+    /// Keep-Alive 超时（秒），0 = 禁用（等价 Nginx keepalive_timeout）
+    #[serde(default = "default_keepalive_timeout")]
+    pub keepalive_timeout: u64,
+
+    /// 客户端最大请求体大小（MB，等价 Nginx client_max_body_size）
+    #[serde(default = "default_client_max_body_size")]
+    pub client_max_body_size: usize,
+
+    /// 客户端请求头缓冲区大小（KB，等价 Nginx client_header_buffer_size）
+    #[serde(default = "default_client_header_buffer_size")]
+    pub client_header_buffer_size: usize,
+
+    /// 客户端请求体缓冲区大小（KB，等价 Nginx client_body_buffer_size）
+    #[serde(default = "default_client_body_buffer_size")]
+    pub client_body_buffer_size: usize,
+
+    /// 是否全局开启 gzip 压缩
+    #[serde(default)]
+    pub gzip: bool,
+
+    /// gzip 压缩最小文件大小（KB），小于此值不压缩（等价 Nginx gzip_min_length）
+    #[serde(default = "default_gzip_min_length")]
+    pub gzip_min_length: usize,
+
+    /// gzip 压缩等级 1-9（等价 Nginx gzip_comp_level）
+    #[serde(default = "default_gzip_comp_level")]
+    pub gzip_comp_level: u32,
 
     /// 管理 API 监听地址，空字符串表示禁用
     #[serde(default)]
@@ -57,6 +89,14 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             worker_threads: 0,
+            worker_connections: default_worker_connections(),
+            keepalive_timeout: default_keepalive_timeout(),
+            client_max_body_size: default_client_max_body_size(),
+            client_header_buffer_size: default_client_header_buffer_size(),
+            client_body_buffer_size: default_client_body_buffer_size(),
+            gzip: false,
+            gzip_min_length: default_gzip_min_length(),
+            gzip_comp_level: default_gzip_comp_level(),
             admin_listen: String::new(),
             admin_token: String::new(),
             error_log: None,
@@ -129,9 +169,26 @@ pub struct SiteConfig {
     pub rate_limit: Option<RateLimitConfig>,
 
     /// HSTS 配置（仅对 HTTPS 端口生效）
-    /// 设置后，Sweety 在 HTTPS 响应中注入 Strict-Transport-Security 头
     #[serde(default)]
     pub hsts: Option<HstsConfig>,
+
+    /// 是否作为 fallback 站点（未匹配到其他站点时使用此站点响应）
+    /// false（默认）= 不匹配时返回 404/421；true = 作为兜底站点
+    #[serde(default)]
+    pub fallback: bool,
+
+    /// 站点级 gzip 覆盖（不设则继承全局 global.gzip）
+    #[serde(default)]
+    pub gzip: Option<bool>,
+
+    /// 站点级 gzip 压缩等级覆盖（不设则继承全局）
+    #[serde(default)]
+    pub gzip_comp_level: Option<u32>,
+
+    /// 是否启用 WebSocket 支持（反代 ws:// 时需要）
+    /// 默认 true，设为 false 可明确禁止升级 WebSocket
+    #[serde(default = "default_true")]
+    pub websocket: bool,
 }
 
 // ─────────────────────────────────────────────
@@ -149,13 +206,33 @@ pub struct TlsConfig {
     #[serde(default)]
     pub acme_email: Option<String>,
 
-    /// 手动指定证书文件路径（与 acme 二选一）
+    /// 手动指定证书文件路径（单证书，与 acme / certs 二选一）
     #[serde(default)]
     pub cert: Option<PathBuf>,
 
-    /// 手动指定私钥文件路径
+    /// 手动指定私钥文件路径（单证书）
     #[serde(default)]
     pub key: Option<PathBuf>,
+
+    /// 多证书列表（优先级高于 cert/key）
+    /// SniResolver 按客户端 ClientHello 签名方案自动选最优证书
+    #[serde(default)]
+    pub certs: Vec<CertKeyPair>,
+
+    /// 最低 TLS 版本（"tls1.2" / "tls1.3"，默认 tls1.2）
+    #[serde(default = "default_tls_min_version")]
+    pub min_version: String,
+
+    /// 最高 TLS 版本（"tls1.2" / "tls1.3"，默认 tls1.3）
+    #[serde(default = "default_tls_max_version")]
+    pub max_version: String,
+}
+
+/// 证书/私钥文件对（用于多证书配置）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CertKeyPair {
+    pub cert: PathBuf,
+    pub key: PathBuf,
 }
 
 // ─────────────────────────────────────────────
@@ -481,6 +558,15 @@ fn default_hc_path() -> String { "/health".into() }
 fn default_prometheus_path() -> String { "/metrics".into() }
 fn default_log_level() -> String { "info".into() }
 fn default_rewrite_flag() -> RewriteFlag { RewriteFlag::Last }
+fn default_worker_connections() -> usize { 51200 }
+fn default_keepalive_timeout() -> u64 { 60 }
+fn default_client_max_body_size() -> usize { 50 }
+fn default_client_header_buffer_size() -> usize { 32 }
+fn default_client_body_buffer_size() -> usize { 512 }
+fn default_gzip_min_length() -> usize { 1 }
+fn default_gzip_comp_level() -> u32 { 5 }
+fn default_tls_min_version() -> String { "tls1.2".into() }
+fn default_tls_max_version() -> String { "tls1.3".into() }
 
 // ─────────────────────────────────────────────
 // 单元测试

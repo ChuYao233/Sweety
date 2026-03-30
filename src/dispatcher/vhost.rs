@@ -3,8 +3,9 @@
 //! 支持精确匹配、通配符匹配（*.example.com）
 
 use std::collections::HashMap;
+use std::sync::RwLock;
 
-use crate::config::model::{FastCgiConfig, LocationConfig, RewriteRule, SiteConfig, TlsConfig, UpstreamConfig};
+use crate::config::model::{FastCgiConfig, HstsConfig, LocationConfig, RewriteRule, SiteConfig, TlsConfig, UpstreamConfig};
 
 /// 运行时站点信息（从 SiteConfig 提取，去掉不需要运行时使用的字段）
 #[derive(Debug, Clone)]
@@ -25,6 +26,16 @@ pub struct SiteInfo {
     pub tls: Option<TlsConfig>,
     /// FastCGI 配置
     pub fastcgi: Option<FastCgiConfig>,
+    /// HSTS 配置
+    pub hsts: Option<HstsConfig>,
+    /// 是否作为 fallback 站点
+    pub fallback: bool,
+    /// 是否启用 WebSocket 升级
+    pub websocket: bool,
+    /// 站点级 gzip 开关覆盖（None = 继承全局）
+    pub gzip: Option<bool>,
+    /// 站点级 gzip 压缩等级覆盖
+    pub gzip_comp_level: Option<u32>,
 }
 
 impl SiteInfo {
@@ -43,81 +54,120 @@ impl SiteInfo {
             upstreams: cfg.upstreams.clone(),
             tls: cfg.tls.clone(),
             fastcgi: cfg.fastcgi.clone(),
+            hsts: cfg.hsts.clone(),
+            fallback: cfg.fallback,
+            websocket: cfg.websocket,
+            gzip: cfg.gzip,
+            gzip_comp_level: cfg.gzip_comp_level,
         }
     }
 }
 
-/// 虚拟主机注册表
-///
-/// 维护两张表：
-/// - 精确匹配表：`example.com` → SiteInfo
-/// - 通配符表：`*.example.com` → SiteInfo（按通配符后缀存储）
+/// 虚拟主机注册表内部数据（由 RwLock 保护）
 #[derive(Debug, Default)]
-pub struct VHostRegistry {
+struct VHostInner {
     /// 精确 Host 匹配表
     exact: HashMap<String, SiteInfo>,
-    /// 通配符后缀匹配表（存储去掉 `*.` 的部分，如 `example.com`）
+    /// 通配符后缀匹配表
     wildcard: HashMap<String, SiteInfo>,
-    /// 默认站点（当没有任何 Host 匹配时使用第一个站点）
-    default: Option<SiteInfo>,
+    /// 显式指定的 fallback 站点（fallback = true）
+    fallback: Option<SiteInfo>,
+}
+
+/// 虚拟主机注册表
+///
+/// 内部用 RwLock 保护，支持运行时原地增删改站点（热重载不断连）。
+#[derive(Debug, Default)]
+pub struct VHostRegistry {
+    inner: RwLock<VHostInner>,
 }
 
 impl VHostRegistry {
     /// 从配置列表构建注册表
     pub fn from_config(sites: &[SiteConfig]) -> Self {
-        let mut registry = Self::default();
-
+        let registry = Self::default();
         for site_cfg in sites {
-            let site_info = SiteInfo::from_config(site_cfg);
-
-            // 注册第一个站点为默认站点
-            if registry.default.is_none() {
-                registry.default = Some(site_info.clone());
-            }
-
-            for server_name in &site_cfg.server_name {
-                if server_name.starts_with("*.") {
-                    // 通配符：去掉 `*.` 存储后缀
-                    let suffix = server_name[2..].to_lowercase();
-                    registry.wildcard.insert(suffix, site_info.clone());
-                } else {
-                    // 精确匹配
-                    registry.exact.insert(server_name.to_lowercase(), site_info.clone());
-                }
-            }
+            registry.upsert_site(site_cfg);
         }
-
         registry
     }
 
-    /// 根据 Host 字符串查找站点（包含端口时自动去掉端口部分）
-    pub fn lookup(&self, host: &str) -> Option<&SiteInfo> {
-        // 去掉端口部分（host:port → host）
-        let host = strip_port(host);
-        let host_lower = host.to_lowercase();
-
-        // 1. 精确匹配
-        if let Some(site) = self.exact.get(&host_lower) {
-            return Some(site);
-        }
-
-        // 2. 通配符匹配（找第一个匹配的后缀）
-        if let Some(dot_pos) = host_lower.find('.') {
-            let suffix = &host_lower[dot_pos + 1..];
-            if let Some(site) = self.wildcard.get(suffix) {
-                return Some(site);
+    /// 插入或更新单个站点（热重载时只更新变化的站点）
+    pub fn upsert_site(&self, site_cfg: &SiteConfig) {
+        let site_info = SiteInfo::from_config(site_cfg);
+        let mut inner = self.inner.write().unwrap();
+        // 先清除该站点所有旧条目（防止 server_name 变化时残留）
+        inner.exact.retain(|_, v| v.name != site_cfg.name);
+        inner.wildcard.retain(|_, v| v.name != site_cfg.name);
+        for server_name in &site_cfg.server_name {
+            if server_name.starts_with("*.") {
+                let suffix = server_name[2..].to_lowercase();
+                inner.wildcard.insert(suffix, site_info.clone());
+            } else {
+                inner.exact.insert(server_name.to_lowercase(), site_info.clone());
             }
         }
+        // fallback = true 的站点单独存储，不参与正常匹配
+        if site_cfg.fallback {
+            inner.fallback = Some(site_info);
+        }
+    }
 
-        // 3. 返回默认站点
-        self.default.as_ref()
+    /// 删除单个站点
+    pub fn remove_site(&self, site_name: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner.exact.retain(|_, v| v.name != site_name);
+        inner.wildcard.retain(|_, v| v.name != site_name);
+        if inner.fallback.as_ref().map(|d| d.name == site_name).unwrap_or(false) {
+            inner.fallback = None;
+        }
+    }
+
+    /// 根据 Host 字符串查找站点（HTTP：不匹配时返回显式指定的 fallback 站点）
+    pub fn lookup(&self, host: &str) -> Option<SiteInfo> {
+        let host = strip_port(host);
+        let host_lower = host.to_lowercase();
+        let inner = self.inner.read().unwrap();
+        if let Some(site) = inner.exact.get(&host_lower) {
+            return Some(site.clone());
+        }
+        if let Some(dot_pos) = host_lower.find('.') {
+            let suffix = &host_lower[dot_pos + 1..];
+            if let Some(site) = inner.wildcard.get(suffix) {
+                return Some(site.clone());
+            }
+        }
+        // 只返回显式标记为 fallback 的站点
+        inner.fallback.clone()
+    }
+
+    /// 严格匹配：HTTPS 请求防跨站用
+    ///
+    /// - 精确/通配符匹配：返回匹配站点
+    /// - 不匹配：返回显式标记 fallback=true 的站点（存在的话）
+    /// - 无 fallback 站点时：返回 None（调用方返回 421）
+    pub fn lookup_strict(&self, host: &str) -> Option<SiteInfo> {
+        let host = strip_port(host);
+        let host_lower = host.to_lowercase();
+        let inner = self.inner.read().unwrap();
+        if let Some(site) = inner.exact.get(&host_lower) {
+            return Some(site.clone());
+        }
+        if let Some(dot_pos) = host_lower.find('.') {
+            let suffix = &host_lower[dot_pos + 1..];
+            if let Some(site) = inner.wildcard.get(suffix) {
+                return Some(site.clone());
+            }
+        }
+        // 返回 fallback 站点（若配置了）
+        inner.fallback.clone()
     }
 
     /// 返回注册的站点总数
     pub fn site_count(&self) -> usize {
-        // 精确表中的 name 去重
+        let inner = self.inner.read().unwrap();
         let names: std::collections::HashSet<&str> =
-            self.exact.values().map(|s| s.name.as_str()).collect();
+            inner.exact.values().map(|s| s.name.as_str()).collect();
         names.len()
     }
 }
@@ -187,10 +237,25 @@ mod tests {
                 cache_control: None,
                 return_code: None,
                 max_connections: None,
+                strip_cookie_secure: false,
+                proxy_cookie_domain: None,
+                proxy_redirect_from: None,
+                proxy_redirect_to: None,
             }],
             rewrites: vec![],
             rate_limit: None,
+            hsts: None,
+            fallback: false,
+            gzip: None,
+            gzip_comp_level: None,
+            websocket: true,
         }
+    }
+
+    fn make_fallback_site(name: &str) -> SiteConfig {
+        let mut s = make_site(name, &["fallback.internal"]);
+        s.fallback = true;
+        s
     }
 
     #[test]
@@ -205,7 +270,8 @@ mod tests {
         let sites = vec![make_site("demo", &["*.example.com"])];
         let reg = VHostRegistry::from_config(&sites);
         assert_eq!(reg.lookup("sub.example.com").map(|s| s.name.as_str()), Some("demo"));
-        assert!(reg.lookup("example.com").is_some()); // 回退到默认站点
+        // 无 fallback 站点时不匹配返回 None
+        assert!(reg.lookup("example.com").is_none());
     }
 
     #[test]
@@ -216,11 +282,18 @@ mod tests {
     }
 
     #[test]
-    fn test_default_site_fallback() {
-        let sites = vec![make_site("first", &["first.com"])];
+    fn test_fallback_site() {
+        let sites = vec![
+            make_site("first", &["first.com"]),
+            make_fallback_site("default"),
+        ];
         let reg = VHostRegistry::from_config(&sites);
-        // 未配置的 host 回退到第一个站点
-        assert_eq!(reg.lookup("unknown.com").map(|s| s.name.as_str()), Some("first"));
+        // 显式 fallback 站点才会被返回
+        assert_eq!(reg.lookup("unknown.com").map(|s| s.name.as_str()), Some("default"));
+        // 无 fallback 站点时不匹配返回 None
+        let sites2 = vec![make_site("only", &["only.com"])];
+        let reg2 = VHostRegistry::from_config(&sites2);
+        assert!(reg2.lookup("unknown.com").is_none());
     }
 
     #[test]

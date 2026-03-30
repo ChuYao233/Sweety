@@ -56,7 +56,7 @@ fn main() {
     );
 
     // 启动服务器（xitca-web 内部管理 tokio 运行时）
-    if let Err(e) = SweetyServer::new(cfg).run() {
+    if let Err(e) = SweetyServer::new(cfg).with_config_path(cli.config).run() {
         error!("服务器启动失败: {:#}", e);
         std::process::exit(1);
     }

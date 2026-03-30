@@ -1,72 +1,63 @@
-# Sweety 配置 —— 反向代理 HTTPS 上游示例
+# Sweety 配置 —— 静态站点测试
 #
-# 客户端访问：http://172.19.0.1:80
-# 流量转发至：https://172.19.0.254:443
-# tls_insecure = true：跳过上游 TLS 证书验证（适用于内网自签名证书）
+# HTTP:  http://127.0.0.1:80
+# HTTPS: https://127.0.0.1:443
+# 双证书：ECDSA P-256（全平台）+ Ed25519（新版客户端）
 
 [global]
+# Worker 线程数，0 = CPU 核心数（等价 Nginx worker_processes auto）
 worker_threads = 0
-
-# 日志级别配置
-# 科学分级原则：
-#   error — 需要立即处理的故障（上游不可达、TLS 握手失败等）
-#   warn  — 可自愈的异常（节点标记不健康、配置缺失降级等）
-#   info  — 启动/关闭/TLS 证书加载（低频事件，生产推荐）
-#   debug — 每请求详情（上游状态码、转发路径），排查问题时开启
-#   trace — 内部状态（缓冲区读写字节数），性能分析时开启
-#
-# 支持细粒度过滤（等号左侧为 crate/module 名）：
-#   "sweety_lib=info,xitca_server=warn"        — Sweety info，xitca 框架仅 warn
-#   "sweety_lib::handler=debug,sweety_lib=info" — handler 模块 debug，其余 info
-#   "info"                                      — 全局 info（生产推荐）
-#
-# 也可通过环境变量覆盖（优先级高于此配置）：
-#   RUST_LOG=sweety_lib=debug cargo run
-log_level = "sweety_lib=info,xitca_server=warn,xitca_web=warn"
+# 最大并发连接数（等价 Nginx worker_connections）
+worker_connections = 51200
+# Keep-Alive 超时（秒，等价 Nginx keepalive_timeout）
+keepalive_timeout = 60
+# 客户端最大请求体（MB，等价 Nginx client_max_body_size）
+client_max_body_size = 50
+# 请求头缓冲区（KB，等价 Nginx client_header_buffer_size）
+client_header_buffer_size = 32
+# 请求体缓冲区（KB，等价 Nginx client_body_buffer_size）
+client_body_buffer_size = 512
+# 全局 gzip 压缩
+gzip = true
+# 最小压缩文件大小（KB，等价 Nginx gzip_min_length 1k）
+gzip_min_length = 1
+# 压缩等级 1-9（等价 Nginx gzip_comp_level）
+gzip_comp_level = 5
+log_level = "sweety_lib=info,xitca_server=warn,xitca_web=warn,xitca_http=warn"
 
 [[sites]]
-name = "proxy-to-254"
-# 所有可能被浏览器/客户端用到的 Host 都要列出
-# 包括直接 IP 访问、127.0.0.1 本地访问等
-server_name = ["172.19.0.1", "127.0.0.1", "localhost"]
+name        = "static-test"
+server_name = ["127.0.0.1", "localhost", "172.19.0.1"]
 listen      = [80]
+listen_tls  = [443]
+root        = 'E:\杂项\网站源码\阿付自用超好看个人主页源码'
+index       = ["index.html", "index.htm"]
+# 是否作为 fallback 站点（未匹配其他站点时使用，相当于 Nginx default_server）
+# fallback = true
+# 站点级 gzip 覆盖（不设则继承全局 global.gzip）
+# gzip = true
+# gzip_comp_level = 6
+# 是否允许 WebSocket 升级（默认 true）
+# websocket = true
 
-# 上游：目标 HTTPS 服务器
-[[sites.upstreams]]
-name     = "backend-254"
-strategy = "round_robin"
+# 双证书：SniResolver 按客户端 ClientHello 签名方案自动选最优
+# Windows/Android/iOS 不支持 Ed25519 时自动降级到 ECDSA
+[sites.tls]
+# TLS 版本控制（默认 tls1.2 ~ tls1.3）
+# 仅允许 TLS 1.3（最高安全性，不兼容老客户端）：
+# min_version = "tls1.3"
+# 兼容模式（允许 TLS 1.2 + 1.3，默认值，无需显式配置）：
+min_version = "tls1.2"
+max_version = "tls1.3"
 
-[[sites.upstreams.nodes]]
-addr         = "172.19.0.254:443"
-weight       = 1
-# 开启 TLS 上游连接（HTTPS）
-tls          = true
-# SNI 主机名（TLS 握手时发送）
-tls_sni      = "172.19.0.254"
-# 跳过证书验证（内网自签名证书）
-tls_insecure = true
-# 发给上游的 Host 头
-# 设为上游实际的 Host，避免上游根据 Host 生成错误的资源 URL
-# 如果上游页面资源路径用的是 172.19.0.254，则填 172.19.0.254
-# 如果上游用域名，则填域名
-upstream_host = "172.19.0.254"
+[[sites.tls.certs]]
+cert = "test_cert/ecdsa/cert.pem"
+key  = "test_cert/ecdsa/key.pem"
 
-# 健康检查（也走 HTTPS）
-[sites.upstreams.health_check]
-enabled  = true
-interval = 10
-timeout  = 3
-path     = "/"
+[[sites.tls.certs]]
+cert = "test_cert/ed22519/cert.pem"
+key  = "test_cert/ed22519/key.pem"
 
-# Location：所有请求转发至上游
 [[sites.locations]]
-path     = "/"
-handler  = "reverse_proxy"
-upstream = "backend-254"
-# HTTP 代理 HTTPS 上游时必须开启：去掉 Set-Cookie 的 Secure 标志
-# 否则浏览器因访问 HTTP 而拒绝存储带 Secure 的 Cookie，导致 session 失效
-strip_cookie_secure  = true
-# 将上游 302 重定向中的 https://172.19.0.254 替换为 http://172.19.0.1
-# 等价于 Nginx: proxy_redirect https://172.19.0.254 http://172.19.0.1;
-proxy_redirect_from = "https://172.19.0.254"
-proxy_redirect_to   = "http://172.19.0.1"
+path    = "/"
+handler = "static"

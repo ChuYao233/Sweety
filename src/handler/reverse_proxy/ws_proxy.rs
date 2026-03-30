@@ -20,12 +20,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use xitca_web::{
     body::ResponseBody,
-    http::{
-        StatusCode, WebResponse,
-        header::{
-            CONNECTION, UPGRADE, SEC_WEBSOCKET_ACCEPT, HeaderValue,
-        },
-    },
+    http::{StatusCode, WebResponse},
     WebContext,
 };
 
@@ -34,6 +29,9 @@ use super::tls_client::tls_connect;
 use crate::server::http::AppState;
 
 /// 处理 WS/WSS 反向代理请求的公开入口
+///
+/// H2 extended CONNECT（RFC 8441）：返回 501，浏览器自动降级 HTTP/1.1 重试
+/// H1 Upgrade：正常代理，返回 101 Switching Protocols
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_ws_proxy(
     ctx: &WebContext<'_, AppState>,
@@ -49,7 +47,16 @@ pub async fn handle_ws_proxy(
     proxy_cookie_domain: Option<&str>,
     proxy_redirect_from: Option<&str>,
     proxy_redirect_to: Option<&str>,
+    is_h2_ws: bool,
 ) -> WebResponse {
+    // H2 extended CONNECT：xitca-web 不支持 RFC 8441 双向流，
+    // 返回 501 让浏览器降级到 HTTP/1.1 重连，与 Nginx 行为一致
+    if is_h2_ws {
+        let mut resp = WebResponse::new(ResponseBody::empty());
+        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+        return resp;
+    }
+
     match do_ws_proxy(
         ctx, upstream_addr, use_tls, tls_sni, tls_insecure,
         extra_headers, client_ip, upstream_host, path,
@@ -145,44 +152,36 @@ where
 
     debug!("WS 上游握手成功（101），建立双向管道");
 
-    // ── Step 3：构建客户端 101 响应 ───────────────────────────────────────
-    // 用 http_ws::handshake 验证客户端请求并生成 Sec-WebSocket-Accept
-    let resp_builder = http_ws::handshake(ctx.req().method(), ctx.req().headers())
-        .map_err(|e| anyhow::anyhow!("客户端 WS 握手验证失败: {:?}", e))?;
-
     // ── Step 4：建立双向管道 ──────────────────────────────────────────────
-    // 上游→客户端：mpsc channel，Receiver 包装为 ResponseBody stream
     let (up_tx, up_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(256);
-
-    // 客户端→上游：从 RequestBody stream 读取后写入上游
-    // 先把 RequestBody 消费到 Vec，因为无法跨线程安全地持有 RefMut
-    let client_bytes = collect_request_body(ctx).await;
-
-    // 启动后台 task：上游→客户端方向（读上游字节 → channel）
+    // 上游→客户端：持续读上游字节 → channel
     let (upstream_read, upstream_write) = tokio::io::split(upstream);
     tokio::spawn(relay_upstream_to_channel(upstream_read, up_tx));
-
-    // 如果客户端有请求体，在另一个 task 写入上游
-    if !client_bytes.is_empty() {
-        tokio::spawn(relay_bytes_to_upstream(client_bytes, upstream_write));
-    }
-
-    // 把 Receiver 转为 Stream 作为响应 body
+    // 客户端→上游：持续从 RequestBody stream 读取帧并写入上游
+    // 必须先把 body borrow 释放，再 spawn
+    let body_chunks: Vec<Bytes> = {
+        let mut body = ctx.body_borrow_mut();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = body.next().await {
+            if let Ok(b) = chunk { chunks.push(b); }
+        }
+        chunks
+    };
+    tokio::spawn(relay_chunks_to_upstream(body_chunks, upstream_write));
     let body_stream = tokio_stream::wrappers::ReceiverStream::new(up_rx);
 
-    // 构建 101 响应
+    // H1 WebSocket Upgrade：用 http_ws 生成标准 101 + Sec-WebSocket-Accept
+    let resp_builder = http_ws::handshake(ctx.req().method(), ctx.req().headers())
+        .map_err(|e| anyhow::anyhow!("客户端 WS 握手验证失败: {:?}", e))?;
     let http_resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("构建 101 响应失败: {}", e))?;
-
-    let mut final_resp = WebResponse::new(
-        ResponseBody::box_stream(body_stream)
-    );
+    let mut final_resp = WebResponse::new(ResponseBody::box_stream(body_stream));
     *final_resp.status_mut() = http_resp.status();
-    // 透传上游响应头（Sec-WebSocket-Accept 等）
     for (name, value) in http_resp.headers() {
         final_resp.headers_mut().insert(name.clone(), value.clone());
     }
+
     apply_response_headers(
         &mut final_resp, &response_headers,
         strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
@@ -227,16 +226,6 @@ where IO: AsyncReadExt + Unpin {
     Ok((status_code, headers))
 }
 
-/// 收集客户端请求体（用于转发给上游）
-async fn collect_request_body(ctx: &WebContext<'_, AppState>) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let mut body = ctx.body_borrow_mut();
-    while let Some(chunk) = body.next().await {
-        if let Ok(b) = chunk { bytes.extend_from_slice(b.as_ref()); }
-    }
-    bytes
-}
-
 /// 从上游读取字节，发送到 mpsc channel（上游→客户端方向）
 async fn relay_upstream_to_channel<R>(
     mut reader: R,
@@ -260,9 +249,11 @@ where R: AsyncReadExt + Unpin + Send {
     }
 }
 
-/// 把客户端请求体字节写入上游（客户端→上游方向，一次性）
-async fn relay_bytes_to_upstream<W>(bytes: Vec<u8>, mut writer: W)
+/// 把客户端 chunks 持续写入上游（客户端→上游方向）
+async fn relay_chunks_to_upstream<W>(chunks: Vec<Bytes>, mut writer: W)
 where W: AsyncWriteExt + Unpin + Send {
-    let _ = writer.write_all(&bytes).await;
+    for chunk in chunks {
+        if writer.write_all(chunk.as_ref()).await.is_err() { break; }
+    }
     let _ = writer.flush().await;
 }

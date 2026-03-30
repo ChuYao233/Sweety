@@ -8,6 +8,7 @@
 
 pub mod conn;
 pub mod lb;
+pub mod pool;
 pub mod response;
 pub mod tls_client;
 pub mod ws_proxy;
@@ -75,22 +76,30 @@ pub async fn handle_xitca(
         })
         .collect();
 
-    // ── 检测 WebSocket 升级请求 ───────────────────────────────────────────
-    let is_ws = ctx.req().headers()
+    // ── 检测 WebSocket 升级请求（H1 + H2 extended CONNECT 两种方式）──────
+    // H1：Upgrade: websocket
+    // H2：method=CONNECT + h2::ext::Protocol="websocket"（RFC 8441）
+    let is_ws_h1 = ctx.req().headers()
         .get(xitca_web::http::header::UPGRADE)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_lowercase().contains("websocket"))
         .unwrap_or(false);
+    let is_ws_h2 = method == "CONNECT"
+        && ctx.req().extensions()
+            .get::<h2::ext::Protocol>()
+            .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+    let is_ws = is_ws_h1 || is_ws_h2;
 
-    // ── 读取请求体（POST/PUT 等） ─────────────────────────────────────────
-    let content_length = ctx.req().headers()
-        .get(xitca_web::http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-
-    let request_body: Vec<u8> = if content_length > 0 {
-        let mut bytes = Vec::with_capacity(content_length);
+    // ── 读取请求体（POST/PUT/PATCH 等）──────────────────────────────────
+    // 不能只依赖 Content-Length（H2 下无此头，chunked 也无），直接读 body stream
+    let request_body: Vec<u8> = if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        let cap = ctx.req().headers()
+            .get(xitca_web::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut bytes = Vec::with_capacity(cap);
         let mut body = ctx.body_borrow_mut();
         while let Some(chunk) = body.next().await {
             match chunk {
@@ -119,13 +128,15 @@ pub async fn handle_xitca(
             &client_headers, &client_ip_str, &upstream_host, &path,
             strip_cookie_secure, proxy_cookie_domain.as_deref(),
             proxy_redirect_from.as_deref(), proxy_redirect_to.as_deref(),
+            is_ws_h2,
         ).await
     } else {
         let result = conn::forward_request(
+            &ctx.state().conn_pool,
             &node.addr, &method, &path, &upstream_host,
             node.tls, &node.tls_sni, node.tls_insecure,
             &client_headers, &client_ip_str,
-            &request_body, is_ws,
+            &request_body,
             strip_cookie_secure, proxy_cookie_domain.as_deref(),
             proxy_redirect_from.as_deref(), proxy_redirect_to.as_deref(),
         ).await;

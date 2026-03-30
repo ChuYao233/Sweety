@@ -12,12 +12,14 @@ use xitca_web::{
     http::{StatusCode, WebResponse, header::{CONTENT_LENGTH, HeaderValue}},
 };
 
+use super::pool::{ConnPool, PooledConn};
 use super::response::{apply_response_headers, parse_status_code};
 use super::tls_client::tls_connect;
 
-/// 向上游转发请求，自动选择 HTTP/HTTPS（gzip/chunked 全支持）
+/// 向上游转发请求，优先复用连接池里的 idle 连接
 #[allow(clippy::too_many_arguments)]
 pub async fn forward_request(
+    pool: &ConnPool,
     upstream_addr: &str,
     method: &str,
     path: &str,
@@ -28,15 +30,61 @@ pub async fn forward_request(
     extra_headers: &[(String, String)],
     client_ip: &str,
     body: &[u8],
-    is_ws: bool,
     strip_cookie_secure: bool,
     proxy_cookie_domain: Option<&str>,
     proxy_redirect_from: Option<&str>,
     proxy_redirect_to: Option<&str>,
 ) -> Result<WebResponse> {
-    debug!("转发 {} {} → {} (tls={}, body={}B, ws={})",
-        method, path, upstream_addr, use_tls, body.len(), is_ws);
+    debug!("转发 {} {} → {} (tls={}, body={}B)",
+        method, path, upstream_addr, use_tls, body.len());
 
+    let key = PooledConn::key(upstream_addr, use_tls);
+
+    // 尝试从池取 idle 连接，最多重试一次（防止服务端关闭了 idle 连接）
+    for attempt in 0..2u8 {
+        let conn = if attempt == 0 {
+            // 先尝试池里的 idle 连接
+            match pool.acquire(&key) {
+                Some(c) => { debug!("复用 idle 连接: {}", upstream_addr); c }
+                None => {
+                    // 池为空，新建连接
+                    new_conn(upstream_addr, use_tls, tls_sni, tls_insecure).await?
+                }
+            }
+        } else {
+            // 第二次： idle 连接失效，强制新建
+            debug!("重试新建连接: {}", upstream_addr);
+            new_conn(upstream_addr, use_tls, tls_sni, tls_insecure).await?
+        };
+
+        match send_recv_pooled(conn, method, path, host, extra_headers, client_ip, body,
+            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to).await
+        {
+            Ok((resp, maybe_conn)) => {
+                // 如果连接可复用，归还到池
+                if let Some(c) = maybe_conn {
+                    pool.release(key, c);
+                }
+                return Ok(resp);
+            }
+            Err(e) if attempt == 0 => {
+                // 可能是 idle 连接已失效，重试一次
+                debug!("连接失效，重试: {}", e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+/// 新建一个上游连接
+async fn new_conn(
+    upstream_addr: &str,
+    use_tls: bool,
+    tls_sni: &str,
+    tls_insecure: bool,
+) -> Result<PooledConn> {
     let tcp = tokio::time::timeout(
         Duration::from_secs(10),
         TcpStream::connect(upstream_addr),
@@ -45,58 +93,54 @@ pub async fn forward_request(
 
     if use_tls {
         let tls = tls_connect(tcp, tls_sni, tls_insecure).await?;
-        let (r, w) = tokio::io::split(tls);
-        send_recv(r, w, method, path, host, extra_headers, client_ip, body, is_ws,
-            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to).await
+        Ok(PooledConn::Tls(Box::new(tls)))
     } else {
-        let (r, w) = tokio::io::split(tcp);
-        send_recv(r, w, method, path, host, extra_headers, client_ip, body, is_ws,
-            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to).await
+        Ok(PooledConn::Tcp(tcp))
     }
 }
 
 /// HTTP/1.1 请求发送 + 响应读取（支持 chunked、Content-Length、gzip 透传）
+/// 返回：(响应, Option<连接>)，连接为 Some 表示可归还到池（上游保持 keep-alive）
 #[allow(clippy::too_many_arguments)]
-async fn send_recv<R, W>(
-    reader: R,
-    mut writer: W,
+async fn send_recv_pooled(
+    conn: PooledConn,
     method: &str,
     path: &str,
     host: &str,
     extra_headers: &[(String, String)],
     client_ip: &str,
     req_body: &[u8],
-    is_ws: bool,
     strip_cookie_secure: bool,
     proxy_cookie_domain: Option<&str>,
     proxy_redirect_from: Option<&str>,
     proxy_redirect_to: Option<&str>,
-) -> Result<WebResponse>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    // ── 构造请求头 ──────────────────────────────────────────────────────────
+) -> Result<(WebResponse, Option<PooledConn>)> {
+    // ── 构造请求头（keep-alive）────────────────────────────────────────────
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
     for (k, v) in extra_headers {
+        // content-length 由下方统一设置，避免与 extra_headers 里的重复
+        if k.to_lowercase() == "content-length" { continue; }
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str(&format!("X-Real-IP: {client_ip}\r\n"));
     req.push_str(&format!("X-Forwarded-For: {client_ip}\r\n"));
     req.push_str("X-Forwarded-Proto: https\r\n");
-    req.push_str(if is_ws { "Connection: upgrade\r\n" } else { "Connection: close\r\n" });
+    req.push_str("Connection: keep-alive\r\n");
+    req.push_str(&format!("Content-Length: {}\r\n", req_body.len()));
     req.push_str("\r\n");
 
     debug!("→ {} {} Host:{} body={}B", method, path, host, req_body.len());
 
-    writer.write_all(req.as_bytes()).await?;
+    // HTTP/1.1 串行：先写请求，再读响应，不需要 split
+    let mut conn = conn;
+    conn.write_all(req.as_bytes()).await?;
     if !req_body.is_empty() {
-        writer.write_all(req_body).await?;
+        conn.write_all(req_body).await?;
     }
-    writer.flush().await?;
+    conn.flush().await?;
 
     // ── 读取响应头 ──────────────────────────────────────────────────────────
-    let mut buf = BufReader::new(reader);
+    let mut buf = BufReader::new(&mut conn);
 
     let mut status_line = String::new();
     match tokio::time::timeout(Duration::from_secs(60), buf.read_line(&mut status_line)).await {
@@ -111,6 +155,7 @@ where
 
     let mut resp_content_length: Option<usize> = None;
     let mut resp_is_chunked = false;
+    let mut resp_conn_close = false;
     let mut response_headers: Vec<(String, String)> = Vec::new();
 
     loop {
@@ -126,35 +171,36 @@ where
             let k = trimmed[..colon].trim().to_string();
             let v = trimmed[colon + 1..].trim().to_string();
             let kl = k.to_lowercase();
-            if kl == "content-length"   { resp_content_length = v.parse().ok(); }
+            if kl == "content-length" { resp_content_length = v.parse().ok(); }
             if kl == "transfer-encoding" && v.to_lowercase().contains("chunked") {
                 resp_is_chunked = true;
+            }
+            // 上游要求关闭连接时不归还
+            if kl == "connection" && v.to_lowercase().contains("close") {
+                resp_conn_close = true;
             }
             response_headers.push((k, v));
         }
     }
 
-    // 101 WebSocket 升级
-    if status_code == 101 {
-        let mut resp = WebResponse::new(ResponseBody::empty());
-        *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-        apply_response_headers(&mut resp, &response_headers,
-            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
-        return Ok(resp);
-    }
-
     // ── 读取响应体（支持 chunked / Content-Length / EOF）───────────────────
     let body_bytes = if resp_is_chunked {
+        // chunked 读完后连接可复用（HTTP/1.1 标准行为）
         read_chunked_body(&mut buf).await?
     } else if let Some(len) = resp_content_length {
         read_exact_body(&mut buf, len).await?
     } else {
+        resp_conn_close = true; // EOF 模式：读完即关
         let mut b = Vec::new();
-        let _ = buf.read_to_end(&mut b).await; // UnexpectedEof = 正常结束
+        let _ = buf.read_to_end(&mut b).await;
         b
     };
 
-    // ── URL 替换（仅文本类型，处理上游硬编码 URL 的情况）────────────────────
+    // BufReader 归还底层连接
+    drop(buf);
+    let maybe_conn = if !resp_conn_close { Some(conn) } else { None };
+
+    // ── URL 替换（仅文本类型）────────────────────────────────────────────
     let final_body = rewrite_body_urls(body_bytes, &response_headers, proxy_redirect_from, proxy_redirect_to);
 
     let body_len = final_body.len();
@@ -163,13 +209,11 @@ where
     *resp.status_mut() = http_status;
     apply_response_headers(&mut resp, &response_headers,
         strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
-
-    // 根据实际 body 长度重新设置 Content-Length
     if let Ok(v) = HeaderValue::from_str(&body_len.to_string()) {
         resp.headers_mut().insert(CONTENT_LENGTH, v);
     }
 
-    Ok(resp)
+    Ok((resp, maybe_conn))
 }
 
 // ─────────────────────────────────────────────

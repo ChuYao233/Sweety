@@ -252,7 +252,6 @@ main thread
 | 指标 | `prometheus` 或自研轻量计数器 |
 | 并发数据结构 | `dashmap` |
 | FastCGI | 自实现（参照 RFC 3875 + FastCGI 1.0 规范） |
-| 国密（可选） | `libsm` 或 `openssl`（feature = "gm"） |
 | CLI 参数 | `clap` |
 
 ---
@@ -272,8 +271,7 @@ main thread
 
 1. **自定义 Handler**：实现 `Handler` trait 即可挂入路由树
 2. **自定义中间件**：实现 `Middleware` trait，在配置中声明顺序
-3. **国密 TLS**：通过 `feature = "gm"` 启用 SM2/SM4 替换 RSA/AES
-4. **插件目录**（规划中）：动态加载 `.so` 插件，无需重编译
+3. **插件目录**（规划中）：动态加载 `.so` 插件，无需重编译
 
 ---
 
@@ -286,5 +284,4 @@ main thread
 | v0.3 | 反向代理 + 负载均衡完整实现 |
 | v0.4 | ACME 自动证书、HTTP/3(QUIC) |
 | v0.5 | Prometheus、管理 API 完整实现 |
-| v0.6 | 国密（SM2/SM3/SM4）集成 |
 | v1.0 | 生产可用，性能基准测试通过 |

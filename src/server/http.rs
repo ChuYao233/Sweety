@@ -11,7 +11,6 @@ use xitca_web::{
     body::ResponseBody,
     handler::handler_service,
     http::{StatusCode, WebResponse, header::{CONTENT_TYPE, LOCATION, HeaderValue}},
-    middleware::Logger,
     route::get,
     WebContext,
 };
@@ -49,8 +48,7 @@ impl SweetyServer {
         let app = App::new()
             .with_state(state.clone())
             .at("/*path", get(handler_service(multi_site_handler)).post(handler_service(multi_site_handler)))
-            .at("/", get(handler_service(multi_site_handler)).post(handler_service(multi_site_handler)))
-            .enclosed(Logger::new());
+            .at("/", get(handler_service(multi_site_handler)).post(handler_service(multi_site_handler)));
 
         let mut server = xitca_web::HttpServer::serve(app.finish());
 

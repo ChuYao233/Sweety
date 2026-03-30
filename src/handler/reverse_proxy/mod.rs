@@ -10,6 +10,7 @@ pub mod conn;
 pub mod lb;
 pub mod response;
 pub mod tls_client;
+pub mod ws_proxy;
 
 use futures_util::StreamExt;
 use tracing::error;
@@ -108,35 +109,40 @@ pub async fn handle_xitca(
     let proxy_redirect_from  = location.proxy_redirect_from.clone();
     let proxy_redirect_to    = location.proxy_redirect_to.clone();
 
-    // ── 转发请求 ──────────────────────────────────────────────────────────
+    // ── 转发请求 ───────────────────────────────
     node.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let result = conn::forward_request(
-        &node.addr, &method, &path, &upstream_host,
-        node.tls, &node.tls_sni, node.tls_insecure,
-        &client_headers, &client_ip_str,
-        &request_body, is_ws,
-        strip_cookie_secure, proxy_cookie_domain.as_deref(),
-        proxy_redirect_from.as_deref(), proxy_redirect_to.as_deref(),
-    ).await;
-    node.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
-    match result {
-        Ok(resp) => {
-            node.fail_count.store(0, std::sync::atomic::Ordering::Relaxed);
-            resp
-        }
-        Err(e) => {
-            node.fail_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if node.fail_count.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
-                node.mark_unhealthy();
-            }
-            // WebSocket 连接错误降为 warn（上游 TLS close_notify 缺失属于预期行为）
-            if e.to_string().contains("TLS close_notify") || e.to_string().contains("UnexpectedEof") {
-                tracing::warn!("反向代理 TLS 正常关闭 → {}: {}", node.addr, e);
-            } else {
+    // WS/WSS 请求走专用的零拷贝反代路径
+    let resp = if is_ws {
+        ws_proxy::handle_ws_proxy(
+            ctx, &node.addr, node.tls, &node.tls_sni, node.tls_insecure,
+            &client_headers, &client_ip_str, &upstream_host, &path,
+            strip_cookie_secure, proxy_cookie_domain.as_deref(),
+            proxy_redirect_from.as_deref(), proxy_redirect_to.as_deref(),
+        ).await
+    } else {
+        let result = conn::forward_request(
+            &node.addr, &method, &path, &upstream_host,
+            node.tls, &node.tls_sni, node.tls_insecure,
+            &client_headers, &client_ip_str,
+            &request_body, is_ws,
+            strip_cookie_secure, proxy_cookie_domain.as_deref(),
+            proxy_redirect_from.as_deref(), proxy_redirect_to.as_deref(),
+        ).await;
+
+        match result {
+            Ok(r) => { node.fail_count.store(0, std::sync::atomic::Ordering::Relaxed); r }
+            Err(e) => {
+                node.fail_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if node.fail_count.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
+                    node.mark_unhealthy();
+                }
                 error!("反向代理转发失败 → {}: {}", node.addr, e);
+                response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败", node.addr))
             }
-            response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败", node.addr))
         }
-    }
+    };
+
+    node.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    resp
 }

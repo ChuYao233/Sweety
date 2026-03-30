@@ -127,6 +127,11 @@ pub struct SiteConfig {
     /// 限流配置
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+
+    /// HSTS 配置（仅对 HTTPS 端口生效）
+    /// 设置后，Sweety 在 HTTPS 响应中注入 Strict-Transport-Security 头
+    #[serde(default)]
+    pub hsts: Option<HstsConfig>,
 }
 
 // ─────────────────────────────────────────────
@@ -151,6 +156,39 @@ pub struct TlsConfig {
     /// 手动指定私钥文件路径
     #[serde(default)]
     pub key: Option<PathBuf>,
+}
+
+// ─────────────────────────────────────────────
+// HSTS 配置
+// ─────────────────────────────────────────────
+
+/// HSTS（HTTP Strict Transport Security）配置
+///
+/// 浏览器收到此响应头后，在 max_age 秒内强制使用 HTTPS 访问该域名
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HstsConfig {
+    /// HSTS max-age（秒），0 = 禁用 HSTS（删除浏览器记录）
+    /// 推荐生产值：31536000（1年）
+    #[serde(default = "default_hsts_max_age")]
+    pub max_age: u64,
+
+    /// 是否包含 includeSubDomains 指令
+    #[serde(default)]
+    pub include_sub_domains: bool,
+
+    /// 是否包含 preload 指令（提交到浏览器预加载列表前请确认已满足条件）
+    #[serde(default)]
+    pub preload: bool,
+}
+
+impl Default for HstsConfig {
+    fn default() -> Self {
+        Self {
+            max_age: 31_536_000,
+            include_sub_domains: false,
+            preload: false,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -430,6 +468,7 @@ pub enum RateLimitDimension {
 // ─────────────────────────────────────────────
 
 fn default_true() -> bool { true }
+fn default_hsts_max_age() -> u64 { 31_536_000 }
 fn default_http_ports() -> Vec<u16> { vec![80] }
 fn default_index() -> Vec<String> { vec!["index.html".into(), "index.htm".into()] }
 fn default_pool_size() -> usize { 32 }

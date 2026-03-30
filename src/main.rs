@@ -21,24 +21,27 @@ struct Cli {
 }
 
 fn main() {
-    // 初始化 tracing 日志（RUST_LOG 环境变量控制级别，默认 info）
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
 
-    // 加载并校验配置文件
+    // 先加载配置文件（用于获取日志级别）
     let cfg = match load_config(&cli.config) {
         Ok(c) => c,
         Err(e) => {
-            error!("配置文件加载失败: {:#}", e);
+            // 配置加载失败时用临时 stderr 输出错误，再退出
+            eprintln!("[ERROR] 配置文件加载失败: {:#}", e);
             std::process::exit(1);
         }
     };
+
+    // 初始化日志
+    // 优先级：RUST_LOG 环境变量 > 配置文件 log_level > 默认 info
+    // 支持细粒度过滤，如：sweety=debug,xitca_server=warn
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.global.log_level));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(log_filter)
+        .init();
 
     if cli.test {
         info!("配置文件语法正确，共 {} 个站点", cfg.sites.len());
@@ -46,9 +49,10 @@ fn main() {
     }
 
     info!(
-        "Sweety {} 正在启动，共 {} 个站点",
+        "Sweety {} 正在启动，共 {} 个站点（日志级别: {}）",
         env!("CARGO_PKG_VERSION"),
-        cfg.sites.len()
+        cfg.sites.len(),
+        cfg.global.log_level,
     );
 
     // 启动服务器（xitca-web 内部管理 tokio 运行时）

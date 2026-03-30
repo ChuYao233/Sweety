@@ -7,6 +7,23 @@
 [global]
 worker_threads = 0
 
+# 日志级别配置
+# 科学分级原则：
+#   error — 需要立即处理的故障（上游不可达、TLS 握手失败等）
+#   warn  — 可自愈的异常（节点标记不健康、配置缺失降级等）
+#   info  — 启动/关闭/TLS 证书加载（低频事件，生产推荐）
+#   debug — 每请求详情（上游状态码、转发路径），排查问题时开启
+#   trace — 内部状态（缓冲区读写字节数），性能分析时开启
+#
+# 支持细粒度过滤（等号左侧为 crate/module 名）：
+#   "sweety_lib=info,xitca_server=warn"        — Sweety info，xitca 框架仅 warn
+#   "sweety_lib::handler=debug,sweety_lib=info" — handler 模块 debug，其余 info
+#   "info"                                      — 全局 info（生产推荐）
+#
+# 也可通过环境变量覆盖（优先级高于此配置）：
+#   RUST_LOG=sweety_lib=debug cargo run
+log_level = "sweety_lib=info,xitca_server=warn,xitca_web=warn"
+
 [[sites]]
 name = "proxy-to-254"
 # 所有可能被浏览器/客户端用到的 Host 都要列出

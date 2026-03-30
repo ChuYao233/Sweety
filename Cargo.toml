@@ -85,7 +85,8 @@ clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # ── 通用工具 ────────────────────────────────
-futures-util = "0.3"
+futures-util  = "0.3"
+tokio-stream  = "0.1"
 bytes        = "1"
 anyhow       = "1"
 thiserror    = "1"

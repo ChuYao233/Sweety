@@ -107,7 +107,7 @@ where
     }
 
     let status_code = parse_status_code(&status_line);
-    tracing::info!("上游 {} ← {} {}", status_code, method, path);
+    tracing::debug!("上游 {} ← {} {}", status_code, method, path);
 
     let mut resp_content_length: Option<usize> = None;
     let mut resp_is_chunked = false;

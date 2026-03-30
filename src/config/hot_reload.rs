@@ -50,12 +50,22 @@ async fn watch_loop(
 ) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
+    // 把配置文件路径 canonicalize，用于事件过滤
+    let watch_target = config_path.canonicalize().unwrap_or_else(|_| config_path.clone());
     let mut watcher: RecommendedWatcher = match notify::recommended_watcher(
         move |res: notify::Result<Event>| {
             if let Ok(event) = res {
-                if matches!(event.kind,
+                if !matches!(event.kind,
                     EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
                 ) {
+                    return;
+                }
+                // 只有事件路径包含配置文件本身时才触发
+                let is_config = event.paths.iter().any(|p| {
+                    p.canonicalize().ok().as_deref() == Some(&watch_target)
+                    || p == &watch_target
+                });
+                if is_config {
                     let _ = event_tx.send(());
                 }
             }
@@ -65,21 +75,19 @@ async fn watch_loop(
         Err(e) => { error!("热重载监听器创建失败: {}", e); return; }
     };
 
-    // 监听配置目录
-    let watch_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-    if let Err(e) = watcher.watch(watch_dir, RecursiveMode::NonRecursive) {
-        error!("无法监听配置目录: {}", e);
-        return;
-    }
-
-    // 同时监听证书文件所在目录
-    for dir in collect_cert_dirs(&current_config) {
-        if dir.exists() {
-            let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+    // 只监听配置文件本身，不监听整个目录
+    // 监听目录会导致同目录下其他文件（日志、证书 atime 更新等）触发不必要的热重载
+    if let Err(e) = watcher.watch(&config_path, RecursiveMode::NonRecursive) {
+        // 部分平台不支持直接监听单文件，fallback 到监听父目录
+        let watch_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+        if let Err(e2) = watcher.watch(watch_dir, RecursiveMode::NonRecursive) {
+            error!("无法监听配置文件: {} / {}", e, e2);
+            return;
         }
+        info!("配置热重载已启动（目录模式），监听: {}", watch_dir.display());
+    } else {
+        info!("配置热重载已启动，监听: {}", config_path.display());
     }
-
-    info!("配置热重载已启动，监听: {}", config_path.display());
 
     loop {
         if event_rx.recv().await.is_none() { break; }

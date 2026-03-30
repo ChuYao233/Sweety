@@ -48,7 +48,9 @@ impl TlsManager {
 
         let resolver = Arc::new(SniResolver::new(certs_map));
         // ALPN 顺序策略：http/1.1 在前，h2 在后
-        let mut cfg = ServerConfig::builder_with_protocol_versions(&tls_versions)
+        let mut cfg = ServerConfig::builder_with_provider(make_crypto_provider())
+            .with_protocol_versions(&tls_versions)
+            .context("TLS 版本配置失败")?
             .with_no_client_auth()
             .with_cert_resolver(resolver.clone());
         cfg.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
@@ -215,6 +217,30 @@ fn resolve_tls_versions(sites: &[&SiteConfig]) -> Vec<&'static rustls::Supported
 // 内部实现：PEM 证书加载
 // ─────────────────────────────────────────────
 
+/// 构建优先 AES-128-GCM 的 CryptoProvider
+///
+/// rustls 默认顺序：AES-256-GCM > AES-128-GCM > ChaCha20
+/// 调整为：AES-128-GCM > AES-256-GCM > ChaCha20
+/// AES-128 吞吐量比 AES-256 高约 20-30%，安全性对 Web 场景完全足够
+/// Nginx/OpenSSL 默认也优先 AES-128-GCM
+fn make_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    use rustls::crypto::ring as ring_crypto;
+    use rustls::CipherSuite::*;
+    let default = ring_crypto::default_provider();
+    // 将 AES-128-GCM 套件提前，其余保持原顺序
+    let mut suites = default.cipher_suites.clone();
+    suites.sort_by_key(|s| match s.suite() {
+        TLS13_AES_128_GCM_SHA256     => 0,
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        | TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => 1,
+        TLS13_AES_256_GCM_SHA384     => 2,
+        TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        | TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => 3,
+        _ => 4,
+    });
+    std::sync::Arc::new(rustls::crypto::CryptoProvider { cipher_suites: suites, ..default })
+}
+
 /// 从 PEM 文件加载证书链和私钥，构建 Rustls ServerConfig
 ///
 /// 支持私钥类型：RSA PKCS#1、RSA PKCS#8、ECDSA（P-256/P-384）、Ed25519
@@ -237,8 +263,10 @@ fn load_pem_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig> {
     let key = load_private_key(&key_bytes)
         .with_context(|| format!("解析私钥失败: {}", key_path.display()))?;
 
-    // 构建 ServerConfig（ALPN 由 xitca-web bind_rustls 自动设置）
-    let config = ServerConfig::builder()
+    // 构建 ServerConfig，使用优先 AES-128-GCM 的 provider
+    let config = ServerConfig::builder_with_provider(make_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .context("TLS 版本配置失败")?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("构建 Rustls ServerConfig 失败")?;

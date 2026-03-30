@@ -104,8 +104,6 @@ impl AccessLogger {
             }
         }
 
-        // 同时通过 tracing 输出（便于开发调试）
-        tracing::info!(target: "access_log", "{}", line);
     }
 
     /// 将日志记录格式化为字符串

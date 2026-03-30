@@ -88,7 +88,46 @@ pub async fn handle_xitca(
     location: &LocationConfig,
     resolved_script: Option<&std::path::Path>,
 ) -> WebResponse {
-    // ── FastCGI 后端地址 ──────────────────────────────────────────────────
+    use crate::middleware::proxy_cache::CacheKey;
+
+    // ── FastCGI 缓存查询 ────────────────────────────────────────────────
+    let fcgi_cache = ctx.state().fcgi_caches.get(&site.name).cloned();
+    let method_str = ctx.req().method().as_str();
+    let req_path   = ctx.req().uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let host_str   = ctx.req().headers().get("host")
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+
+    if let Some(cache) = &fcgi_cache {
+        let req_hdrs: Vec<(String, String)> = ctx.req().headers().iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
+            .collect();
+        if cache.should_lookup(method_str, &req_hdrs) {
+            let key = CacheKey::new(method_str, host_str, req_path);
+            if let Some(entry) = cache.get(&key) {
+                // 命中：直接返回缓存响应
+                use xitca_web::http::header::HeaderName;
+                let mut resp = WebResponse::new(
+                    xitca_web::body::ResponseBody::from(entry.body.to_vec())
+                );
+                *resp.status_mut() = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK);
+                for (k, v) in &entry.headers {
+                    if let (Ok(name), Ok(val)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_str(v),
+                    ) {
+                        resp.headers_mut().append(name, val);
+                    }
+                }
+                resp.headers_mut().insert(
+                    xitca_web::http::header::HeaderName::from_static("x-fastcgi-cache"),
+                    HeaderValue::from_static("HIT"),
+                );
+                return resp;
+            }
+        }
+    }
+
+    // ── FastCGI 后端地址 ─────────────────────────────────────────────────────
     let fcgi_cfg = site.fastcgi.as_ref();
 
     // Unix socket 路径（优先）或 TCP host:port
@@ -271,6 +310,11 @@ pub async fn handle_xitca(
         FcgiAddr::Tcp(p)  => (p.clone(), false),
     };
 
+    // 缓存键：与删除查询时一致
+    let cache_key = fcgi_cache.as_ref().map(|_| {
+        crate::middleware::proxy_cache::CacheKey::new(method_str, host_str, req_path)
+    });
+
     // 最多重试一次：第一次用 idle 连接，失败后清空 idle 并强制新建
     for attempt in 0u8..2 {
         if attempt == 1 {
@@ -281,7 +325,7 @@ pub async fn handle_xitca(
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("FastCGI 连接失败 {}: {}", addr_str, e);
-                return fcgi_error(StatusCode::BAD_GATEWAY, &format!("PHP-FPM 连接失败: {}", e));
+                return fcgi_error(StatusCode::BAD_GATEWAY, "PHP-FPM 连接失败");
             }
         };
 
@@ -294,7 +338,7 @@ pub async fn handle_xitca(
             Ok(Ok(parsed)) => {
                 match tokio::time::timeout(
                     read_tmo,
-                    build_streaming_response(parsed, pool.clone(), addr_str),
+                    build_streaming_response(parsed, pool.clone(), addr_str, fcgi_cache.clone(), cache_key.clone()),
                 ).await {
                     Ok(resp) => return resp,
                     Err(_) => return fcgi_error(StatusCode::GATEWAY_TIMEOUT, "PHP-FPM body 读取超时"),
@@ -486,51 +530,77 @@ where
 }
 
 /// FastCGI 响应处理：流式转发，首字节延迟最低
-/// - body 已读完（body_done=true）或 prefix < 16KB：直接返回，不建 task
-/// - 其他：spawn task 流式读剩余 STDOUT，正确处理 FCGI_END_REQUEST
+/// - body 已读完或 body < 4MB：全量收集再返回，并写入缓存
+/// - body >= 4MB：流式转发（过大不缓存）
 async fn build_streaming_response(
     parsed: FcgiParsedHeaders,
     pool: std::sync::Arc<crate::handler::fastcgi_pool::FcgiPool>,
     addr: String,
+    fcgi_cache: Option<std::sync::Arc<crate::middleware::proxy_cache::ProxyCache>>,
+    cache_key: Option<crate::middleware::proxy_cache::CacheKey>,
 ) -> WebResponse {
-    // body 已全部读完，直接返回
+    // body 已全部读完，写缓存并直接返回
     if parsed.body_done {
         pool.release(&addr, parsed.conn);
+        write_fcgi_cache(&fcgi_cache, &cache_key, parsed.status, &parsed.headers, &parsed.body_prefix);
         return make_complete_response(parsed.status, parsed.headers, parsed.body_prefix);
     }
 
-    // prefix 很小（< 16KB）时，先全量收集再返回，避免为小资源 spawn task
+    // 全量收集 body（< 4MB），写缓存再返回
     let mut conn = parsed.conn;
-    if parsed.body_prefix.len() < 16 * 1024 {
-        let mut body = parsed.body_prefix;
-        loop {
-            let rec = match read_fcgi_conn(&mut conn).await {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-            match rec.rec_type {
-                t if t == FCGI_STDOUT => {
-                    if rec.data.is_empty() { break; }
-                    body.extend_from_slice(&rec.data);
-                    // 超过 4MB，就改用流式，防止内存溢出
-                    if body.len() > 4 * 1024 * 1024 {
-                        return stream_remaining(body, conn, pool, addr, parsed.status, parsed.headers).await;
-                    }
+    let mut body = parsed.body_prefix;
+    let mut use_stream = false;
+    loop {
+        let rec = match read_fcgi_conn(&mut conn).await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        match rec.rec_type {
+            t if t == FCGI_STDOUT => {
+                if rec.data.is_empty() { break; }
+                body.extend_from_slice(&rec.data);
+                if body.len() > 4 * 1024 * 1024 {
+                    use_stream = true;
+                    break;
                 }
-                t if t == FCGI_STDERR => {
-                    if let Ok(s) = std::str::from_utf8(&rec.data) {
-                        if !s.trim().is_empty() { tracing::warn!("PHP-FPM stderr: {}", s.trim()); }
-                    }
-                }
-                _ => break, // FCGI_END_REQUEST
             }
+            t if t == FCGI_STDERR => {
+                if let Ok(s) = std::str::from_utf8(&rec.data) {
+                    if !s.trim().is_empty() { tracing::warn!("PHP-FPM stderr: {}", s.trim()); }
+                }
+            }
+            _ => break, // FCGI_END_REQUEST
         }
-        pool.release(&addr, conn);
-        return make_complete_response(parsed.status, parsed.headers, body);
     }
 
-    // prefix >= 16KB：直接进入流式路径
-    stream_remaining(parsed.body_prefix, conn, pool, addr, parsed.status, parsed.headers).await
+    if use_stream {
+        // body 过大，转流式路径（不缓存）
+        return stream_remaining(body, conn, pool, addr, parsed.status, parsed.headers).await;
+    }
+
+    pool.release(&addr, conn);
+    write_fcgi_cache(&fcgi_cache, &cache_key, parsed.status, &parsed.headers, &body);
+    make_complete_response(parsed.status, parsed.headers, body)
+}
+
+/// 尝试将 FastCGI 响应写入缓存
+fn write_fcgi_cache(
+    cache: &Option<std::sync::Arc<crate::middleware::proxy_cache::ProxyCache>>,
+    key: &Option<crate::middleware::proxy_cache::CacheKey>,
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+) {
+    if let (Some(cache), Some(key)) = (cache, key) {
+        if cache.is_cacheable(status, headers) {
+            cache.set(
+                key.clone(),
+                status,
+                headers.to_vec(),
+                bytes::Bytes::copy_from_slice(body),
+            );
+        }
+    }
 }
 
 /// 流式转发剩余 FCGI STDOUT——已有部分 body 缓冲，用 spawn task 继续读取

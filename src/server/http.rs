@@ -100,6 +100,31 @@ impl SweetyServer {
             Arc::new(map)
         };
 
+        // 按站点配置创建 FastCGI 缓存实例
+        let fcgi_caches = {
+            let mut map: HashMap<String, Arc<ProxyCache>> = HashMap::new();
+            for site in &cfg.sites {
+                if let Some(fcgi) = &site.fastcgi {
+                    if let Some(cache_cfg) = &fcgi.cache {
+                        // 复用 ProxyCacheConfig 结构构建，字段对应
+                        let proxy_cfg = crate::config::model::ProxyCacheConfig {
+                            path: cache_cfg.path.clone(),
+                            max_entries: cache_cfg.max_entries,
+                            ttl: cache_cfg.ttl,
+                            cacheable_statuses: cache_cfg.cacheable_statuses.clone(),
+                            cacheable_methods: cache_cfg.cacheable_methods.clone(),
+                            bypass_headers: cache_cfg.bypass_headers.clone(),
+                        };
+                        let cache = ProxyCache::from_config(&proxy_cfg);
+                        map.insert(site.name.clone(), cache);
+                        info!("站点 '{}' FastCGI 缓存已开启（max_entries={}, ttl={}s)",
+                            site.name, cache_cfg.max_entries, cache_cfg.ttl);
+                    }
+                }
+            }
+            Arc::new(map)
+        };
+
         // 按站点配置创建反代缓存实例
         let proxy_caches = {
             let mut map: HashMap<String, Arc<ProxyCache>> = HashMap::new();
@@ -132,6 +157,7 @@ impl SweetyServer {
                 cfg.global.fastcgi_connect_timeout,
                 cfg.global.fastcgi_read_timeout,
             )),
+            fcgi_caches,
         };
 
         // 第三步：构建 xitca-web App
@@ -248,6 +274,8 @@ pub struct AppState {
     pub max_connections: usize,
     /// FastCGI 连接池（复用 PHP-FPM 连接）
     pub fcgi_pool: Arc<FcgiPool>,
+    /// FastCGI 响应缓存（按站点名索引，复用 ProxyCache 实现）
+    pub fcgi_caches: Arc<HashMap<String, Arc<ProxyCache>>>,
 }
 
 /// 多站点请求分发处理器

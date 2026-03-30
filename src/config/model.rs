@@ -357,6 +357,39 @@ pub struct FastCgiConfig {
     /// 读取超时（秒）
     #[serde(default = "default_read_timeout")]
     pub read_timeout: u64,
+
+    /// FastCGI 响应缓存（等价 Nginx fastcgi_cache）
+    #[serde(default)]
+    pub cache: Option<FastCgiCacheConfig>,
+}
+
+/// FastCGI 响应缓存配置（对标 Nginx fastcgi_cache）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FastCgiCacheConfig {
+    /// 磁盘缓存目录（不设则只用内存缓存）
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+
+    /// 内存缓存最大条数（默认 1000）
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+
+    /// 缓存有效期（秒，默认 60）
+    #[serde(default = "default_cache_ttl")]
+    pub ttl: u64,
+
+    /// 可缓存的 HTTP 状态码（默认 [200, 301, 302]）
+    #[serde(default = "default_cache_statuses")]
+    pub cacheable_statuses: Vec<u16>,
+
+    /// 可缓存的 HTTP 方法（默认 ["GET", "HEAD"]）
+    #[serde(default = "default_cache_methods")]
+    pub cacheable_methods: Vec<String>,
+
+    /// 跳过缓存的请求头（如 Cookie 存在时不缓存）
+    /// 默认不设置（WordPress 缓存如需跳过已登录用户，可设为 ["cookie"]）
+    #[serde(default)]
+    pub bypass_headers: Vec<String>,
 }
 
 // ─────────────────────────────────────────────

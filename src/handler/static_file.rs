@@ -11,7 +11,6 @@ use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tracing::debug;
@@ -20,8 +19,8 @@ use xitca_web::{
     http::{
         StatusCode, WebResponse,
         header::{
-            CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
-            ETAG, LAST_MODIFIED, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+            ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
+            CONTENT_TYPE, ETAG, LAST_MODIFIED, IF_MODIFIED_SINCE, IF_NONE_MATCH,
             HeaderMap, HeaderValue,
         },
     },
@@ -125,9 +124,9 @@ pub async fn handle_xitca(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| parse_range(s, file_size));
 
-    debug!("提供静态文件: {} range={:?}", file_path.display(), range);
+    debug!("提供静态文件: {} size={} range={:?}", file_path.display(), file_size, range);
 
-    // 打开文件（流式读取，不全量载入内存）
+    // 打开文件
     let mut file = match tokio::fs::File::open(&file_path).await {
         Ok(f) => f,
         Err(e) => {
@@ -136,116 +135,101 @@ pub async fn handle_xitca(
         }
     };
 
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
     if let Some((range_start, range_end)) = range {
-        // Range 请求：seek 到 start，只读取指定范围
+        // ── Range 请求：seek + Take 限制范围，流式传输 ──────────────────
         let range_len = range_end - range_start + 1;
         if file.seek(SeekFrom::Start(range_start)).await.is_err() {
             return make_error(StatusCode::RANGE_NOT_SATISFIABLE, "");
         }
-        let content = read_exact_bytes(&mut file, range_len as usize).await;
-        match content {
-            Ok(bytes) => {
-                let mut resp = WebResponse::new(ResponseBody::from(bytes));
-                *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
-                set_file_headers(resp.headers_mut(), &file_path, range_len, &etag_val, modified_secs, location);
-                // Content-Range: bytes start-end/total
-                let cr = format!("bytes {}-{}/{}", range_start, range_end, file_size);
-                if let Ok(v) = HeaderValue::from_str(&cr) {
-                    resp.headers_mut().insert(CONTENT_RANGE, v);
-                }
-                resp
-            }
-            Err(e) => {
-                tracing::error!("读取文件范围失败 {}: {}", file_path.display(), e);
-                make_error(StatusCode::INTERNAL_SERVER_ERROR, "")
-            }
+        // io::Take 限制最多读取 range_len 字节，不会读超
+        let limited = file.take(range_len);
+        let stream = ReaderStream::with_capacity(limited, STREAM_CHUNK);
+        let body = ResponseBody::box_stream(stream);
+        let mut resp = WebResponse::new(body);
+        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+        set_file_headers(resp.headers_mut(), &file_path, range_len, &etag_val, modified_secs, location);
+        let cr = format!("bytes {}-{}/{}", range_start, range_end, file_size);
+        if let Ok(v) = HeaderValue::from_str(&cr) {
+            resp.headers_mut().insert(CONTENT_RANGE, v);
         }
+        resp
     } else {
-        // 普通请求：流式读取整个文件
-        match read_all_chunked(&mut file, file_size as usize).await {
-            Ok(bytes) => {
-                // 判断是否启用 gzip（站点级优先，否则全局）
-                let global = &ctx.state().cfg.global;
-                let gzip_enabled = site.gzip.unwrap_or(global.gzip);
-                let gzip_level = site.gzip_comp_level.unwrap_or(global.gzip_comp_level);
-                let min_bytes = (global.gzip_min_length as u64) * 1024;
+        // ── 普通请求 ────────────────────────────────────────────────────
+        let global = &ctx.state().cfg.global;
+        let gzip_enabled = site.gzip.unwrap_or(global.gzip);
+        let gzip_level = site.gzip_comp_level.unwrap_or(global.gzip_comp_level);
+        let min_bytes = (global.gzip_min_length as u64) * 1024;
+        let accept_gz = req_headers
+            .get(ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("gzip"))
+            .unwrap_or(false);
+        let already_compressed = matches!(ext,
+            "gz" | "br" | "zst" | "zip" | "png" | "jpg" | "jpeg"
+            | "gif" | "webp" | "avif" | "mp4" | "webm" | "woff" | "woff2"
+        );
 
-                // gzip 条件：开关开启 + 文件足够大 + 客户端支持 + 非已压缩格式
-                let accept_gz = req_headers
-                    .get(xitca_web::http::header::ACCEPT_ENCODING)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v.contains("gzip"))
-                    .unwrap_or(false);
-                let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let already_compressed = matches!(ext,
-                    "gz" | "br" | "zst" | "zip" | "png" | "jpg" | "jpeg"
-                    | "gif" | "webp" | "avif" | "mp4" | "webm" | "woff" | "woff2"
-                );
-
-                if gzip_enabled && accept_gz && file_size >= min_bytes && !already_compressed {
-                    match gzip_compress(&bytes, gzip_level) {
-                        Ok(compressed) => {
-                            let compressed_len = compressed.len() as u64;
-                            let mut resp = WebResponse::new(ResponseBody::from(compressed));
-                            set_file_headers(resp.headers_mut(), &file_path, compressed_len, &etag_val, modified_secs, location);
-                            resp.headers_mut().insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-                            // gzip 时 Content-Length 已在 set_file_headers 设为压缩后大小
-                            resp
-                        }
-                        Err(_) => {
-                            // 压缩失败降级为原始内容
-                            let mut resp = WebResponse::new(ResponseBody::from(bytes));
-                            set_file_headers(resp.headers_mut(), &file_path, file_size, &etag_val, modified_secs, location);
-                            resp
-                        }
-                    }
-                } else {
-                    let mut resp = WebResponse::new(ResponseBody::from(bytes));
-                    set_file_headers(resp.headers_mut(), &file_path, file_size, &etag_val, modified_secs, location);
+        // gzip：仅对 ≤ GZIP_MAX_INLINE 的小文件做内存压缩，大文件直接流式
+        if gzip_enabled && accept_gz && !already_compressed
+            && file_size >= min_bytes && file_size <= GZIP_MAX_INLINE
+        {
+            // 小文件：一次读入内存压缩
+            let mut raw = Vec::with_capacity(file_size as usize);
+            if let Err(e) = file.read_to_end(&mut raw).await {
+                tracing::error!("读取文件失败 {}: {}", file_path.display(), e);
+                return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
+            }
+            match gzip_compress(&raw, gzip_level) {
+                Ok(compressed) => {
+                    let clen = compressed.len() as u64;
+                    let mut resp = WebResponse::new(ResponseBody::from(compressed));
+                    set_file_headers(resp.headers_mut(), &file_path, clen, &etag_val, modified_secs, location);
+                    resp.headers_mut().insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
                     resp
                 }
+                Err(_) => {
+                    // 压缩失败，重新打开文件流式传输（file 已被消耗）
+                    match tokio::fs::File::open(&file_path).await {
+                        Ok(f2) => stream_file_response(f2, &file_path, file_size, &etag_val, modified_secs, location),
+                        Err(_) => make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
+                    }
+                }
             }
-            Err(e) => {
-                tracing::error!("读取文件失败 {}: {}", file_path.display(), e);
-                make_error(StatusCode::INTERNAL_SERVER_ERROR, "")
-            }
+        } else {
+            // 大文件 / 不压缩：ReaderStream 流式传输，0 内存 copy
+            stream_file_response(file, &file_path, file_size, &etag_val, modified_secs, location)
         }
     }
 }
 
-/// 分块读取整个文件到 Bytes（避免大文件单次 alloc 失败，块大小 CHUNK_SIZE）
-async fn read_all_chunked(
-    file: &mut tokio::fs::File,
-    size_hint: usize,
-) -> std::io::Result<bytes::Bytes> {
-    let mut buf = bytes::BytesMut::with_capacity(size_hint.min(CHUNK_SIZE * 4));
-    let mut tmp = vec![0u8; CHUNK_SIZE];
-    loop {
-        let n = file.read(&mut tmp).await?;
-        if n == 0 { break; }
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    Ok(buf.freeze())
+/// 把打开的文件包装为流式 ResponseBody，不在用户空间做整块 copy
+fn stream_file_response(
+    file: tokio::fs::File,
+    file_path: &Path,
+    file_size: u64,
+    etag_val: &str,
+    modified_secs: u64,
+    location: &LocationConfig,
+) -> WebResponse {
+    let stream = ReaderStream::with_capacity(file, STREAM_CHUNK);
+    let body = ResponseBody::box_stream(stream);
+    let mut resp = WebResponse::new(body);
+    set_file_headers(resp.headers_mut(), file_path, file_size, etag_val, modified_secs, location);
+    resp
 }
 
-/// 读取精确字节数（Range 请求用）
-async fn read_exact_bytes(
-    file: &mut tokio::fs::File,
-    len: usize,
-) -> std::io::Result<bytes::Bytes> {
-    let mut buf = vec![0u8; len];
-    file.read_exact(&mut buf).await?;
-    Ok(bytes::Bytes::from(buf))
-}
-
-/// gzip 压缩（flate2，同步）
+/// gzip 压缩（flate2，仅用于小文件）
 fn gzip_compress(data: &[u8], level: u32) -> std::io::Result<bytes::Bytes> {
     use flate2::{Compression, write::GzEncoder};
-    let level = Compression::new(level.min(9));
-    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 2), level);
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(
+        Vec::with_capacity(data.len() / 2),
+        Compression::new(level.min(9)),
+    );
     encoder.write_all(data)?;
-    let compressed = encoder.finish()?;
-    Ok(bytes::Bytes::from(compressed))
+    Ok(bytes::Bytes::from(encoder.finish()?))
 }
 
 /// 解析 Range 头，返回 (start, end) 字节偏移（闭区间），失败或超出范围返回 None

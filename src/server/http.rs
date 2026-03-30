@@ -263,6 +263,21 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         }
     };
 
+    // 请求体大小限制（Content-Length 超过 client_max_body_size 时拒绝）
+    let max_body_bytes = (state.cfg.global.client_max_body_size as u64) * 1024 * 1024;
+    if max_body_bytes > 0 {
+        if let Some(content_length) = ctx.req().headers()
+            .get(xitca_web::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            if content_length > max_body_bytes {
+                state.metrics.record_status(413);
+                return make_error_resp(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+        }
+    }
+
     // 直接返回状态码（健康检查）
     if let Some(code) = location.return_code {
         let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);

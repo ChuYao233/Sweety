@@ -16,21 +16,23 @@ Sweety 是一款以 Rust 编写、基于 [Xitca-Web](https://github.com/HFQR/xit
 | 功能分类 | 支持内容 |
 |---|---|
 | **协议** | HTTP/1.1、HTTP/2、HTTP/3（QUIC） |
-| **TLS** | Rustls + ACME 自动证书（Let's Encrypt） |
-| **多站点** | 虚拟主机（Host 匹配）、单站点多域名、站点隔离 |
-| **静态文件** | 零拷贝 sendfile、默认文档（index.html）、目录浏览可选 |
+| **TLS** | Rustls 纯 Rust TLS、多证书（ECDSA + Ed25519 等）、ACME 自动证书、TLS 版本控制 |
+| **多站点** | 虚拟主机 SNI 隔离、HTTPS 跨站防护（421）、`fallback` 兜底站点 |
+| **静态文件** | 流式 0-copy（ReaderStream）、Range 分块、gzip 压缩、ETag/Last-Modified 缓存 |
 | **PHP/FastCGI** | 高并发连接池、沙箱隔离，与 Nginx 相同实现方式 |
-| **WebSocket** | 高并发、多站点独立连接管理 |
-| **反向代理** | 负载均衡（轮询/加权/最小连接）、健康检查、请求镜像 |
+| **WebSocket** | 高并发 WS/WSS 反向代理、站点级 websocket 开关 |
+| **反向代理** | 负载均衡（轮询/加权/最小连接/IP哈希）、健康检查、连接池复用 |
 | **Rewrite/伪静态** | 前缀匹配、正则重写、301/302 跳转 |
 | **限流** | 按 IP / 路径 / Header / User-Agent 多维度令牌桶限流 |
-| **安全** | 敏感文件拦截、自动安全响应头 |
-| **缓存** | 静态文件 ETag/Last-Modified、PHP 页面可选缓存 |
-| **日志** | 访问日志（JSON/文本双模式）、错误日志、日志轮转 |
-| **监控** | 实时统计（QPS、带宽、WebSocket 连接数）、Prometheus 导出 |
-| **管理 API** | HTTP + WebSocket 双协议，动态增删站点、调整限流等 |
-| **热重载** | 配置文件修改后无需重启，实时生效 |
-| **部署** | 单文件可执行，轻量可移植 |
+| **安全** | 敏感文件拦截、HTTPS 跨站隔离、请求体大小限制（413）、HSTS |
+| **缓存** | 静态文件 ETag/Last-Modified、Cache-Control 按扩展名默认 |
+| **压缩** | 全局/站点级 gzip，可配置等级和最小文件大小 |
+| **日志** | 访问日志（JSON/文本双模式）、错误日志 |
+| **监控** | 实时统计（QPS、带宽）、Prometheus 导出 |
+| **管理 API** | HTTP + WebSocket 双协议，动态增删站点 |
+| **热重载** | 配置/证书文件变更后自动 diff 更新，不断开现有连接 |
+| **连接配置** | `worker_connections`、`keepalive_timeout`、`client_max_body_size` 等 Nginx 同名配置 |
+| **部署** | 单文件可执行，无 C 依赖（纯 Rust），轻量可移植 |
 
 ---
 
@@ -128,15 +130,27 @@ sweety/
 ## 路线图
 
 - [x] 项目骨架与基础模块
-- [ ] HTTP/1.1 完整静态文件服务
-- [ ] TLS（Rustls）集成
-- [ ] FastCGI 连接池完整实现
-- [ ] WebSocket 高并发完整实现
-- [ ] 反向代理负载均衡完整实现
-- [ ] ACME 自动证书
-- [ ] HTTP/3（QUIC）集成
-- [ ] Prometheus 导出完整实现
-- [ ] 管理 WebSocket API 完整实现
+- [x] HTTP/1.1 + HTTP/2 静态文件服务（流式 0-copy、Range、gzip、ETag）
+- [x] TLS（Rustls）集成——多证书 ECDSA/Ed25519/RSA、SNI Resolver、TLS 版本控制
+- [x] ACME 自动证书（Let's Encrypt TLS-ALPN-01）
+- [x] HTTP/3（QUIC）集成
+- [x] FastCGI 连接池完整实现
+- [x] WebSocket 高并发 WS/WSS 反向代理
+- [x] 反向代理负载均衡（轮询/加权/最小连接/IP哈希）+ 连接池复用
+- [x] Rewrite/伪静态规则（正则、301/302）
+- [x] 限流（IP/路径/Header/UA 多维度令牌桶）
+- [x] HTTPS 跨站防护（421 Misdirected Request）
+- [x] Fallback 兜底站点（显式 `fallback = true`）
+- [x] 配置/证书热重载（diff 更新，不断连）
+- [x] gzip 压缩（全局 + 站点级覆盖，可配置等级和最小文件大小）
+- [x] HSTS 响应头注入
+- [x] 请求体大小限制（`client_max_body_size`，超限返回 413）
+- [x] Nginx 同名连接配置（`worker_connections`、`keepalive_timeout` 等）
+- [x] Prometheus 指标导出
+- [x] 管理 API（HTTP + WebSocket）
+- [ ] 流式 gzip（大文件在线压缩，当前 > 4MB 跳过）
+- [ ] HTTP/2 Server Push
+- [ ] 证书透明度日志（CT Log）上报
 
 ---
 

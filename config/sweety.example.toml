@@ -1,0 +1,199 @@
+# Sweety 完整示例配置文件
+# 格式：TOML（同样支持 JSON / YAML，通过文件扩展名自动识别）
+
+# ─────────────────────────────────────────────
+# 全局配置
+# ─────────────────────────────────────────────
+[global]
+# Worker 线程数，0 = CPU 核心数
+worker_threads = 0
+# 管理 API 监听地址（留空则禁用）
+admin_listen = "127.0.0.1:9000"
+# 管理 API Bearer Token（生产环境请换成随机强密码）
+admin_token = "change-me-in-production"
+# 全局默认错误日志路径
+error_log = "/var/log/sweety/error.log"
+# 是否启用 Prometheus 指标接口
+prometheus_enabled = true
+# Prometheus 指标路径（在 admin_listen 上暴露）
+prometheus_path = "/metrics"
+
+# ─────────────────────────────────────────────
+# 站点 1：静态网站 + HTTPS + 自动 ACME 证书
+# ─────────────────────────────────────────────
+[[sites]]
+# 站点唯一标识
+name = "example-static"
+# 匹配的域名列表（支持通配符 *.example.com）
+server_name = ["example.com", "www.example.com"]
+# 监听端口（HTTP）
+listen = [80]
+# 监听端口（HTTPS）
+listen_tls = [443]
+# 网站根目录
+root = "/var/www/example"
+# 默认文档（按顺序查找）
+index = ["index.html", "index.htm"]
+# 访问日志路径
+access_log = "/var/log/sweety/example_access.log"
+# 错误日志路径（不设则使用全局）
+error_log = "/var/log/sweety/example_error.log"
+
+# TLS 配置
+[sites.tls]
+# 使用 ACME 自动申请证书
+acme = true
+acme_email = "admin@example.com"
+# 或手动指定证书（与 acme = true 二选一）
+# cert = "/etc/ssl/example.com.crt"
+# key  = "/etc/ssl/example.com.key"
+
+# Location 配置（按优先级从高到低排列）
+[[sites.locations]]
+# 路径精确匹配 /health
+path = "= /health"
+handler = "static"
+# 直接返回 200 OK（健康检查用）
+return_code = 200
+
+[[sites.locations]]
+# 前缀优先匹配 /static/
+path = "^~ /static/"
+handler = "static"
+# 强制缓存 7 天
+cache_control = "public, max-age=604800, immutable"
+
+[[sites.locations]]
+# 默认 location
+path = "/"
+handler = "static"
+
+# ─────────────────────────────────────────────
+# 站点 2：PHP + FastCGI 站点
+# ─────────────────────────────────────────────
+[[sites]]
+name = "example-php"
+server_name = ["php.example.com"]
+listen = [80]
+listen_tls = [443]
+root = "/var/www/php-site"
+index = ["index.php", "index.html"]
+access_log = "/var/log/sweety/php_access.log"
+
+[sites.tls]
+acme = true
+acme_email = "admin@example.com"
+
+# FastCGI（PHP）全局配置
+[sites.fastcgi]
+# PHP-FPM socket 路径（优先于 host:port）
+socket = "/var/run/php/php8.2-fpm.sock"
+# 或 TCP 地址
+# host = "127.0.0.1"
+# port = 9000
+# 连接池大小
+pool_size = 32
+# 连接超时（秒）
+connect_timeout = 5
+# 读取超时（秒）
+read_timeout = 30
+
+# Rewrite 规则（伪静态，WordPress 风格）
+[[sites.rewrites]]
+pattern = "^/(.*)$"
+target  = "/index.php?$1"
+flag    = "last"
+# 仅当文件不存在时触发
+condition = "!-f"
+
+[[sites.locations]]
+# PHP 文件处理
+path = "~ \\.php$"
+handler = "fastcgi"
+
+[[sites.locations]]
+path = "/"
+handler = "static"
+
+# 限流配置（站点级）
+[sites.rate_limit]
+# 按 IP 限流：每秒 100 请求，突发 200
+[[sites.rate_limit.rules]]
+dimension = "ip"
+rate = 100
+burst = 200
+[[sites.rate_limit.rules]]
+dimension = "path"
+path_pattern = "^/api/"
+rate = 50
+burst = 100
+
+# ─────────────────────────────────────────────
+# 站点 3：反向代理站点（负载均衡）
+# ─────────────────────────────────────────────
+[[sites]]
+name = "example-proxy"
+server_name = ["api.example.com"]
+listen = [80]
+listen_tls = [443]
+access_log = "/var/log/sweety/api_access.log"
+
+[sites.tls]
+acme = true
+acme_email = "admin@example.com"
+
+# 上游服务器组
+[[sites.upstreams]]
+name = "backend"
+# 负载均衡策略：round_robin / weighted / least_conn / ip_hash
+strategy = "least_conn"
+# 健康检查
+[sites.upstreams.health_check]
+enabled = true
+interval = 10       # 检查间隔（秒）
+timeout  = 3        # 超时（秒）
+path     = "/health"
+# 上游节点列表
+[[sites.upstreams.nodes]]
+addr   = "127.0.0.1:8001"
+weight = 1
+[[sites.upstreams.nodes]]
+addr   = "127.0.0.1:8002"
+weight = 2
+[[sites.upstreams.nodes]]
+addr   = "127.0.0.1:8003"
+weight = 1
+
+[[sites.locations]]
+path = "/"
+handler = "reverse_proxy"
+upstream = "backend"
+# 请求镜像（可选，调试用）
+# mirror = "http://127.0.0.1:9999"
+
+# ─────────────────────────────────────────────
+# 站点 4：WebSocket 站点
+# ─────────────────────────────────────────────
+[[sites]]
+name = "example-ws"
+server_name = ["ws.example.com"]
+listen = [80]
+listen_tls = [443]
+access_log = "/var/log/sweety/ws_access.log"
+
+[sites.tls]
+acme = true
+acme_email = "admin@example.com"
+
+[[sites.locations]]
+path = "/ws"
+handler = "websocket"
+# 最大并发连接数
+max_connections = 10000
+# 上游 WebSocket 后端（若需要转发）
+# upstream_ws = "ws://127.0.0.1:8080/ws"
+
+[[sites.locations]]
+path = "/"
+handler = "static"
+root = "/var/www/ws-site"

@@ -1,0 +1,115 @@
+[package]
+name        = "sweety"
+version     = "0.1.0"
+edition     = "2021"
+description = "高性能、单文件部署、多站点 Web 服务器"
+license     = "MIT"
+authors     = ["Sweety Contributors"]
+
+[[bin]]
+name = "sweety"
+path = "src/main.rs"
+
+[lib]
+name = "sweety_lib"
+path = "src/lib.rs"
+
+# ─────────────────────────────────────────────
+# 依赖库
+# ─────────────────────────────────────────────
+[dependencies]
+# 异步运行时
+tokio          = { version = "1",  features = ["full"] }
+
+# Web 框架（Xitca-Web）
+xitca-web      = { version = "0.6", features = ["io-uring"] }
+xitca-http     = { version = "0.6" }
+
+# HTTP 客户端（反向代理使用）
+hyper          = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util     = { version = "0.1", features = ["tokio", "client", "client-legacy"] }
+http-body-util = "0.1"
+
+# TLS
+rustls              = { version = "0.23", features = ["ring"] }
+tokio-rustls        = "0.26"
+rustls-pemfile      = "2"
+
+# ACME 自动证书（可选，默认开启）
+instant-acme        = { version = "0.7", optional = true }
+
+# QUIC / HTTP3（可选）
+quinn              = { version = "0.11", optional = true }
+h3                 = { version = "0.0.6", optional = true }
+h3-quinn           = { version = "0.0.7", optional = true }
+
+# 序列化 / 配置解析
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+toml         = "0.8"
+serde_yaml   = "0.9"
+
+# 正则表达式（Rewrite 规则）
+regex        = "1"
+
+# 文件监听（热重载）
+notify       = { version = "6", features = ["serde"] }
+
+# 日志框架
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# 并发数据结构（限流计数器等）
+dashmap      = "6"
+
+# CLI 参数解析
+clap         = { version = "4", features = ["derive"] }
+
+# 时间处理
+chrono       = { version = "0.4", features = ["serde"] }
+
+# 异步工具
+futures      = "0.3"
+bytes        = "1"
+pin-project  = "1"
+
+# 错误处理
+thiserror    = "1"
+anyhow       = "1"
+
+# URL 解析
+url          = "2"
+
+# 随机数（连接池 ID 等）
+rand         = "0.8"
+
+# 国密（可选 feature）
+[dependencies.libsm]
+version  = "0.6"
+optional = true
+
+# ─────────────────────────────────────────────
+# 可选 Features
+# ─────────────────────────────────────────────
+[features]
+default = ["acme"]
+acme    = ["dep:instant-acme"]
+quic    = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
+gm      = ["dep:libsm"]
+full    = ["acme", "quic", "gm"]
+
+# ─────────────────────────────────────────────
+# 测试依赖
+# ─────────────────────────────────────────────
+[dev-dependencies]
+tokio       = { version = "1", features = ["full", "test-util"] }
+tempfile    = "3"
+
+# ─────────────────────────────────────────────
+# 编译优化
+# ─────────────────────────────────────────────
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = true

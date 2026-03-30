@@ -46,6 +46,11 @@ pub struct GlobalConfig {
     /// Prometheus 指标路径（挂载在 admin_listen 上）
     #[serde(default = "default_prometheus_path")]
     pub prometheus_path: String,
+
+    /// 日志级别（error / warn / info / debug / trace）
+    /// 也可通过环境变量 RUST_LOG 覆盖（环境变量优先级更高）
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
 }
 
 impl Default for GlobalConfig {
@@ -57,6 +62,7 @@ impl Default for GlobalConfig {
             error_log: None,
             prometheus_enabled: true,
             prometheus_path: "/metrics".into(),
+            log_level: "info".into(),
         }
     }
 }
@@ -211,6 +217,29 @@ pub struct LocationConfig {
     /// WebSocket 最大并发连接数
     #[serde(default)]
     pub max_connections: Option<usize>,
+
+    /// 去掉上游 Set-Cookie 里的 Secure 标志
+    /// 适用场景：HTTP 代理 HTTPS 上游时，防止浏览器拒绝存储 Secure Cookie
+    /// 等价于 Nginx proxy_cookie_flags ~ Secure drop;
+    #[serde(default)]
+    pub strip_cookie_secure: bool,
+
+    /// 替换 Set-Cookie 里的 Domain 属性
+    /// 限制小数点前的字符串为客户端访问地址
+    /// 等价于 Nginx proxy_cookie_domain upstream_host client_host
+    #[serde(default)]
+    pub proxy_cookie_domain: Option<String>,
+
+    /// Location 响应头中上游 URL 替换为客户端 URL
+    /// 格式："https://upstream_host" → "http://client_host"
+    /// 等价于 Nginx proxy_redirect https://172.19.0.254 http://172.19.0.1;
+    /// 不设则不替换
+    #[serde(default)]
+    pub proxy_redirect_from: Option<String>,
+
+    /// proxy_redirect 的目标地址（客户端访问的 URL 前缀）
+    #[serde(default)]
+    pub proxy_redirect_to: Option<String>,
 }
 
 /// 请求处理器类型
@@ -321,6 +350,11 @@ pub struct UpstreamNode {
     /// 是否跳过上游证书验证（仅用于内网自签名证书，生产慎用）
     #[serde(default)]
     pub tls_insecure: bool,
+
+    /// 发送给上游的 Host 头（不设则使用 addr 的 host 部分）
+    /// 用于防止上游因 Host 不匹配而重定向
+    #[serde(default)]
+    pub upstream_host: Option<String>,
 }
 
 /// 健康检查配置
@@ -406,6 +440,7 @@ fn default_hc_interval() -> u64 { 10 }
 fn default_hc_timeout() -> u64 { 3 }
 fn default_hc_path() -> String { "/health".into() }
 fn default_prometheus_path() -> String { "/metrics".into() }
+fn default_log_level() -> String { "info".into() }
 fn default_rewrite_flag() -> RewriteFlag { RewriteFlag::Last }
 
 // ─────────────────────────────────────────────

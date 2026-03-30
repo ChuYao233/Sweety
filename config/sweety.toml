@@ -1,0 +1,55 @@
+# Sweety 配置 —— 反向代理 HTTPS 上游示例
+#
+# 客户端访问：http://172.19.0.1:80
+# 流量转发至：https://172.19.0.254:443
+# tls_insecure = true：跳过上游 TLS 证书验证（适用于内网自签名证书）
+
+[global]
+worker_threads = 0
+
+[[sites]]
+name = "proxy-to-254"
+# 所有可能被浏览器/客户端用到的 Host 都要列出
+# 包括直接 IP 访问、127.0.0.1 本地访问等
+server_name = ["172.19.0.1", "127.0.0.1", "localhost"]
+listen      = [80]
+
+# 上游：目标 HTTPS 服务器
+[[sites.upstreams]]
+name     = "backend-254"
+strategy = "round_robin"
+
+[[sites.upstreams.nodes]]
+addr         = "172.19.0.254:443"
+weight       = 1
+# 开启 TLS 上游连接（HTTPS）
+tls          = true
+# SNI 主机名（TLS 握手时发送）
+tls_sni      = "172.19.0.254"
+# 跳过证书验证（内网自签名证书）
+tls_insecure = true
+# 发给上游的 Host 头
+# 设为上游实际的 Host，避免上游根据 Host 生成错误的资源 URL
+# 如果上游页面资源路径用的是 172.19.0.254，则填 172.19.0.254
+# 如果上游用域名，则填域名
+upstream_host = "172.19.0.254"
+
+# 健康检查（也走 HTTPS）
+[sites.upstreams.health_check]
+enabled  = true
+interval = 10
+timeout  = 3
+path     = "/"
+
+# Location：所有请求转发至上游
+[[sites.locations]]
+path     = "/"
+handler  = "reverse_proxy"
+upstream = "backend-254"
+# HTTP 代理 HTTPS 上游时必须开启：去掉 Set-Cookie 的 Secure 标志
+# 否则浏览器因访问 HTTP 而拒绝存储带 Secure 的 Cookie，导致 session 失效
+strip_cookie_secure  = true
+# 将上游 302 重定向中的 https://172.19.0.254 替换为 http://172.19.0.1
+# 等价于 Nginx: proxy_redirect https://172.19.0.254 http://172.19.0.1;
+proxy_redirect_from = "https://172.19.0.254"
+proxy_redirect_to   = "http://172.19.0.1"

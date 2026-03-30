@@ -40,6 +40,14 @@ pub struct GlobalConfig {
     #[serde(default = "default_keepalive_timeout")]
     pub keepalive_timeout: u64,
 
+    /// FastCGI 连接超时（秒，等价 Nginx fastcgi_connect_timeout）
+    #[serde(default = "default_fastcgi_connect_timeout")]
+    pub fastcgi_connect_timeout: u64,
+
+    /// FastCGI 读取超时（秒，等价 Nginx fastcgi_read_timeout）
+    #[serde(default = "default_fastcgi_read_timeout")]
+    pub fastcgi_read_timeout: u64,
+
     /// 客户端最大请求体大小（MB，等价 Nginx client_max_body_size）
     #[serde(default = "default_client_max_body_size")]
     pub client_max_body_size: usize,
@@ -97,6 +105,8 @@ impl Default for GlobalConfig {
             worker_connections: default_worker_connections(),
             max_connections: 0,
             keepalive_timeout: default_keepalive_timeout(),
+            fastcgi_connect_timeout: default_fastcgi_connect_timeout(),
+            fastcgi_read_timeout: default_fastcgi_read_timeout(),
             client_max_body_size: default_client_max_body_size(),
             client_header_buffer_size: default_client_header_buffer_size(),
             client_body_buffer_size: default_client_body_buffer_size(),
@@ -678,6 +688,8 @@ fn default_log_level() -> String { "info".into() }
 fn default_rewrite_flag() -> RewriteFlag { RewriteFlag::Last }
 fn default_worker_connections() -> usize { 51200 }
 fn default_keepalive_timeout() -> u64 { 60 }
+fn default_fastcgi_connect_timeout() -> u64 { 5 }
+fn default_fastcgi_read_timeout() -> u64 { 60 }
 fn default_client_max_body_size() -> usize { 50 }
 fn default_client_header_buffer_size() -> usize { 32 }
 fn default_client_body_buffer_size() -> usize { 512 }

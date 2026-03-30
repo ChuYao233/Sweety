@@ -22,6 +22,7 @@ use crate::config::model::{AppConfig, HandlerType};
 use crate::config::hot_reload::{HotReloadContext, start_hot_reload};
 use crate::dispatcher::vhost::VHostRegistry;
 use crate::handler::reverse_proxy::pool::ConnPool;
+use crate::handler::fastcgi_pool::FcgiPool;
 use crate::middleware::access_log::{AccessLogEntry, AccessLogger, LogFormat};
 use crate::middleware::metrics::GlobalMetrics;
 use crate::middleware::proxy_cache::ProxyCache;
@@ -126,6 +127,11 @@ impl SweetyServer {
             proxy_caches,
             active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_connections: cfg.global.max_connections,
+            fcgi_pool: Arc::new(FcgiPool::new(
+                32,   // 每地址最多 32 个 idle 连接
+                cfg.global.fastcgi_connect_timeout,
+                cfg.global.fastcgi_read_timeout,
+            )),
         };
 
         // 第三步：构建 xitca-web App
@@ -240,6 +246,8 @@ pub struct AppState {
     pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
     /// 最大并发连接数（0 = 不限制）
     pub max_connections: usize,
+    /// FastCGI 连接池（复用 PHP-FPM 连接）
+    pub fcgi_pool: Arc<FcgiPool>,
 }
 
 /// 多站点请求分发处理器

@@ -1,6 +1,13 @@
 //! FastCGI / PHP 处理器
-//! 负责：FastCGI 协议实现、PHP-FPM 连接池管理、沙箱隔离
-//! 参照 RFC 3875 (CGI) 和 FastCGI 1.0 规范
+//!
+//! # 修复内容（对比旧版本）
+//! - **POST/PUT 请求体**：正确通过 STDIN 传递给 PHP-FPM
+//! - **全量请求头转发**：所有 HTTP_* 变量（Cookie、Accept、Authorization 等）
+//! - **SCRIPT_FILENAME 正确解析**：支持 rewrite 后的 PATH_INFO 分离
+//! - **全量响应头转发**：Set-Cookie、Location、X-Powered-By 等全部透传
+//! - **CONTENT_TYPE / CONTENT_LENGTH**：POST 请求必须参数
+//! - **SERVER_PORT / HTTPS 变量**
+//! - 参照 RFC 3875 (CGI) 和 FastCGI 1.0 规范
 
 use xitca_web::{
     body::ResponseBody,
@@ -13,308 +20,461 @@ use crate::dispatcher::vhost::SiteInfo;
 use crate::server::http::AppState;
 
 // ─────────────────────────────────────────────
-// FastCGI 协议常量
+// FastCGI 协议常量（RFC 3875 + FastCGI 1.0）
 // ─────────────────────────────────────────────
 
-const FCGI_VERSION: u8 = 1;
-const FCGI_BEGIN_REQUEST: u8 = 1;
-const FCGI_PARAMS: u8 = 4;
-const FCGI_STDIN: u8 = 5;
-const FCGI_STDOUT: u8 = 6;
-const FCGI_RESPONDER: u16 = 1;
+const FCGI_VERSION:       u8  = 1;
+const FCGI_BEGIN_REQUEST: u8  = 1;
+const FCGI_PARAMS:        u8  = 4;
+const FCGI_STDIN:         u8  = 5;
+const FCGI_STDOUT:        u8  = 6;
+const FCGI_STDERR:        u8  = 7;
+const FCGI_RESPONDER:     u16 = 1;
+/// FastCGI 单条记录最大内容长度（65535 字节）
+const FCGI_MAX_CONTENT:   usize = 65535;
 
 // ─────────────────────────────────────────────
 // FastCGI 数据包结构
 // ─────────────────────────────────────────────
 
 /// FastCGI 请求头（8 字节固定长度）
-#[derive(Debug)]
-#[allow(dead_code)]
-struct FcgiHeader {
-    version: u8,
-    record_type: u8,
-    request_id: u16,
-    content_length: u16,
-    padding_length: u8,
-    reserved: u8,
+fn write_fcgi_header(buf: &mut Vec<u8>, record_type: u8, request_id: u16, content_len: usize, padding: u8) {
+    let id = request_id.to_be_bytes();
+    let len = (content_len as u16).to_be_bytes();
+    buf.extend_from_slice(&[FCGI_VERSION, record_type, id[0], id[1], len[0], len[1], padding, 0]);
 }
 
-impl FcgiHeader {
-    /// 序列化为字节数组
-    fn to_bytes(&self) -> [u8; 8] {
-        let id_bytes = self.request_id.to_be_bytes();
-        let len_bytes = self.content_length.to_be_bytes();
-        [
-            self.version,
-            self.record_type,
-            id_bytes[0],
-            id_bytes[1],
-            len_bytes[0],
-            len_bytes[1],
-            self.padding_length,
-            self.reserved,
-        ]
+/// 写入一条完整的 FCGI 记录（自动分片，支持超过 65535 字节的内容）
+fn write_fcgi_record(buf: &mut Vec<u8>, record_type: u8, request_id: u16, data: &[u8]) {
+    if data.is_empty() {
+        write_fcgi_header(buf, record_type, request_id, 0, 0);
+        return;
+    }
+    for chunk in data.chunks(FCGI_MAX_CONTENT) {
+        // 对齐到 8 字节边界
+        let padding = (8 - (chunk.len() % 8)) % 8;
+        write_fcgi_header(buf, record_type, request_id, chunk.len(), padding as u8);
+        buf.extend_from_slice(chunk);
+        buf.extend_from_slice(&[0u8; 8][..padding]);
     }
 }
 
-/// 构建 FastCGI BEGIN_REQUEST 记录
-fn build_begin_request(request_id: u16) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(16);
-    // 请求头
-    let header = FcgiHeader {
-        version: FCGI_VERSION,
-        record_type: FCGI_BEGIN_REQUEST,
-        request_id,
-        content_length: 8,
-        padding_length: 0,
-        reserved: 0,
+/// FastCGI name-value 对编码（RFC 3875 §11.1）
+fn encode_nv_pair(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    let enc_len = |b: &mut Vec<u8>, n: usize| {
+        if n < 128 {
+            b.push(n as u8);
+        } else {
+            b.extend_from_slice(&((n as u32) | 0x80000000u32).to_be_bytes());
+        }
     };
-    buf.extend_from_slice(&header.to_bytes());
-    // BEGIN_REQUEST body：role(2) + flags(1) + reserved(5)
-    let role_bytes = FCGI_RESPONDER.to_be_bytes();
-    buf.extend_from_slice(&role_bytes); // role = FCGI_RESPONDER
-    buf.push(0); // flags = 0（不保持连接）
-    buf.extend_from_slice(&[0u8; 5]); // reserved
-    buf
-}
-
-/// 将 FastCGI 参数（name-value 对）编码为 PARAMS 记录
-fn encode_params(params: &[(&str, &str)]) -> Vec<u8> {
-    let mut body = Vec::new();
-    for (name, value) in params {
-        encode_name_value_pair(&mut body, name.as_bytes(), value.as_bytes());
-    }
-    body
-}
-
-/// FastCGI name-value 对编码（支持长度 > 127 的名称/值）
-fn encode_name_value_pair(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
-    encode_length(buf, name.len());
-    encode_length(buf, value.len());
+    enc_len(buf, name.len());
+    enc_len(buf, value.len());
     buf.extend_from_slice(name);
     buf.extend_from_slice(value);
-}
-
-/// FastCGI 长度编码（1 字节或 4 字节）
-fn encode_length(buf: &mut Vec<u8>, len: usize) {
-    if len < 128 {
-        buf.push(len as u8);
-    } else {
-        let b = (len as u32) | 0x80000000;
-        buf.extend_from_slice(&b.to_be_bytes());
-    }
 }
 
 // ─────────────────────────────────────────────
 // 主处理函数
 // ─────────────────────────────────────────────
 
-/// 处理 FastCGI / PHP 请求（xitca-web WebContext 版本）
+/// 处理 FastCGI / PHP 请求
 pub async fn handle_xitca(
     ctx: &WebContext<'_, AppState>,
     site: &SiteInfo,
-    _location: &LocationConfig,
+    location: &LocationConfig,
 ) -> WebResponse {
-    // 从站点配置读取 FastCGI socket 路径（默认尝试 Unix Socket）
-    let socket_path: String = site.fastcgi
-        .as_ref()
-        .and_then(|f| f.socket.as_ref())
-        .map(|p: &std::path::PathBuf| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/var/run/php/php8.2-fpm.sock".to_string());
+    // ── FastCGI 后端地址 ──────────────────────────────────────────────────
+    let fcgi_cfg = site.fastcgi.as_ref();
 
-    let method = ctx.req().method().as_str().to_string();
-    let full_path = ctx.req().uri().path_and_query()
-        .map(|p| p.as_str()).unwrap_or("/").to_string();
-    let path_only = full_path.split('?').next().unwrap_or(&full_path).to_string();
-    let query = full_path.split('?').nth(1).unwrap_or("").to_string();
-    let peer_ip = ctx.req().body().socket_addr().ip().to_string();
-    let peer_port = ctx.req().body().socket_addr().port().to_string();
-
-    // 构建 SCRIPT_FILENAME
-    let script_filename = match &site.root {
-        Some(root) => format!("{}{}", root.display(), path_only),
-        None => {
-            return fcgi_error(StatusCode::INTERNAL_SERVER_ERROR, "FastCGI: 站点未配置 root 目录");
-        }
+    // Unix socket 路径（优先）或 TCP host:port
+    let addr_mode = if let Some(sock) = fcgi_cfg.and_then(|f| f.socket.as_ref()) {
+        FcgiAddr::Unix(sock.to_string_lossy().into_owned())
+    } else {
+        let host = fcgi_cfg.and_then(|f| f.host.as_deref()).unwrap_or("127.0.0.1");
+        let port = fcgi_cfg.and_then(|f| f.port).unwrap_or(9000);
+        FcgiAddr::Tcp(format!("{}:{}", host, port))
     };
 
-    // 构建 CGI 参数列表（所有字符串都是拥有的，避免生命周期问题）
-    let params: Vec<(String, String)> = vec![
+    // ── 提取请求信息 ──────────────────────────────────────────────────────
+    let method   = ctx.req().method().as_str().to_string();
+    let uri      = ctx.req().uri();
+    let path_qs  = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let req_uri  = path_qs.to_string();
+    let path_raw = uri.path();
+    let query    = uri.query().unwrap_or("").to_string();
+    let peer     = ctx.req().body().socket_addr();
+    let peer_ip  = peer.ip().to_string();
+    let peer_port= peer.port().to_string();
+
+    let host_hdr = ctx.req().headers()
+        .get("host").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let host_name = host_hdr.split(':').next().unwrap_or(&host_hdr).to_string();
+    let host_port_str = host_hdr.split(':').nth(1).unwrap_or("80").to_string();
+
+    // ── 站点 root ─────────────────────────────────────────────────────────
+    let root = match location.root.as_ref().or(site.root.as_ref()) {
+        Some(r) => r.to_string_lossy().into_owned(),
+        None => return fcgi_error(StatusCode::INTERNAL_SERVER_ERROR, "FastCGI: 未配置 root 目录"),
+    };
+
+    // ── SCRIPT_FILENAME / SCRIPT_NAME / PATH_INFO 解析 ───────────────────
+    // 规则（与 Nginx 一致）：
+    //   1. 若 path 以 .php 结尾 → SCRIPT_FILENAME = root + path, PATH_INFO = ""
+    //   2. 若 path 包含 .php/ → 分割出 script 和 path_info
+    //   3. 否则（rewrite 到 index.php）→ SCRIPT_FILENAME = root/index.php
+    let (script_name, path_info) = split_script_path(path_raw);
+    let script_filename = format!("{}{}", root.trim_end_matches('/'), script_name);
+
+    // ── 读取请求体 ────────────────────────────────────────────────────────
+    // 使用 Content-Length 上限（等价 Nginx fastcgi_read_timeout）
+    let max_body = {
+        let mb = ctx.state().cfg.global.client_max_body_size;
+        (mb as u64) * 1024 * 1024
+    };
+    let content_length = ctx.req().headers()
+        .get(xitca_web::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let content_type = ctx.req().headers()
+        .get(xitca_web::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // 读取请求体（与 reverse_proxy 相同方式：ctx.body_borrow_mut() + StreamExt）
+    let req_body: Vec<u8> = if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE")
+        && content_length <= max_body
+    {
+        use futures_util::StreamExt;
+        let mut collected = Vec::with_capacity(content_length as usize);
+        let mut body = ctx.body_borrow_mut();
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(b) => collected.extend_from_slice(b.as_ref()),
+                Err(_) => break,
+            }
+        }
+        collected
+    } else {
+        Vec::new()
+    };
+
+    // ── 构建 CGI 参数（RFC 3875）────────────────────────────────────────
+    let mut params: Vec<(String, String)> = vec![
         ("SCRIPT_FILENAME".into(), script_filename),
-        ("SCRIPT_NAME".into(), path_only.clone()),
-        ("REQUEST_METHOD".into(), method),
-        ("REQUEST_URI".into(), full_path),
-        ("QUERY_STRING".into(), query),
+        ("SCRIPT_NAME".into(),     script_name.to_string()),
+        ("PATH_INFO".into(),       path_info.to_string()),
+        ("PATH_TRANSLATED".into(), format!("{}{}", root.trim_end_matches('/'), path_info)),
+        ("REQUEST_METHOD".into(),  method),
+        ("REQUEST_URI".into(),     req_uri),
+        ("QUERY_STRING".into(),    query),
         ("SERVER_SOFTWARE".into(), "Sweety/0.1".into()),
         ("SERVER_PROTOCOL".into(), "HTTP/1.1".into()),
-        ("GATEWAY_INTERFACE".into(), "CGI/1.1".into()),
-        ("REMOTE_ADDR".into(), peer_ip),
-        ("REMOTE_PORT".into(), peer_port),
-        ("SERVER_NAME".into(), ctx.req().headers()
-            .get("host").and_then(|v| v.to_str().ok()).unwrap_or("").to_string()),
+        ("GATEWAY_INTERFACE".into(),"CGI/1.1".into()),
+        ("SERVER_NAME".into(),     host_name),
+        ("SERVER_PORT".into(),     host_port_str),
+        ("REMOTE_ADDR".into(),     peer_ip),
+        ("REMOTE_HOST".into(),     peer.ip().to_string()),
+        ("REMOTE_PORT".into(),     peer_port),
+        ("DOCUMENT_ROOT".into(),   root.clone()),
+        // CONTENT_TYPE / CONTENT_LENGTH 是 POST 必须参数
+        ("CONTENT_TYPE".into(),    content_type),
+        ("CONTENT_LENGTH".into(),  req_body.len().to_string()),
     ];
 
-    // 将 (String, String) 转成 (&str, &str) 引用
+    // 判断是否 HTTPS（注入 HTTPS=on，WordPress 依赖此变量判断 is_ssl()）
+    let is_https = {
+        let port: u16 = host_hdr.split(':').nth(1)
+            .and_then(|s| s.parse().ok()).unwrap_or(80);
+        ctx.state().tls_ports.contains(&port)
+    };
+    if is_https {
+        params.push(("HTTPS".into(), "on".into()));
+    }
+
+    // 将所有 HTTP 请求头转换为 HTTP_* 变量（等价 Nginx fastcgi_param HTTP_* ...）
+    // Cookie、Authorization、Accept、Referer、User-Agent 等全部透传
+    for (name, value) in ctx.req().headers().iter() {
+        let key_str = name.as_str();
+        // 跳过已经单独处理的头
+        if matches!(key_str, "content-type" | "content-length") { continue; }
+        if let Ok(val_str) = value.to_str() {
+            let http_key = format!("HTTP_{}", key_str.replace('-', "_").to_uppercase());
+            params.push((http_key, val_str.to_string()));
+        }
+    }
+
+    // ── 发送 FastCGI 请求（连接池 + 超时控制）─────────────────────────────
     let params_ref: Vec<(&str, &str)> = params.iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    // 连接 FastCGI 后端并发送请求
-    match connect_and_send(&socket_path, &params_ref).await {
-        Ok(response_body) => parse_fcgi_response(response_body),
-        Err(e) => {
-            tracing::error!("FastCGI 连接失败 {}: {}", socket_path, e);
-            fcgi_error(StatusCode::BAD_GATEWAY, &format!("FastCGI 后端不可用: {}", e))
+    let pool      = ctx.state().fcgi_pool.clone();
+    let read_tmo  = std::time::Duration::from_secs(pool.read_timeout_secs);
+    let (addr_str, is_unix) = match &addr_mode {
+        FcgiAddr::Unix(p) => (p.clone(), true),
+        FcgiAddr::Tcp(p)  => (p.clone(), false),
+    };
+
+    // 最多重试一次（idle 连接可能已被 PHP-FPM 关闭）
+    for attempt in 0u8..2 {
+        let conn = match pool.acquire(&addr_str, is_unix).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("FastCGI 连接失败 {}: {}", addr_str, e);
+                return fcgi_error(StatusCode::BAD_GATEWAY, &format!("PHP-FPM 连接失败: {}", e));
+            }
+        };
+
+        // 带读超时发送请求
+        let result = tokio::time::timeout(
+            read_tmo,
+            send_on_conn(conn, &params_ref, &req_body),
+        ).await;
+
+        match result {
+            Ok(Ok((stdout, maybe_conn))) => {
+                // 归还连接到池
+                if let Some(c) = maybe_conn {
+                    pool.release(&addr_str, c);
+                }
+                return parse_fcgi_response(stdout);
+            }
+            Ok(Err(e)) if attempt == 0 => {
+                // idle 连接可能已断开，重试新建
+                tracing::debug!("FastCGI idle 连接失效，重试: {}", e);
+                continue;
+            }
+            Ok(Err(e)) => {
+                tracing::error!("FastCGI 请求失败 {}: {}", addr_str, e);
+                return fcgi_error(StatusCode::BAD_GATEWAY, &format!("PHP-FPM 响应失败: {}", e));
+            }
+            Err(_) => {
+                tracing::error!("FastCGI 读超时 {}s {}", pool.read_timeout_secs, addr_str);
+                return fcgi_error(StatusCode::GATEWAY_TIMEOUT, "PHP-FPM 响应超时");
+            }
+        }
+    }
+
+    fcgi_error(StatusCode::BAD_GATEWAY, "PHP-FPM 不可用")
+}
+
+/// FastCGI 后端地址枚举（Unix socket 或 TCP）
+#[derive(Debug)]
+enum FcgiAddr {
+    Unix(String),
+    Tcp(String),
+}
+
+/// 分离 SCRIPT_NAME 和 PATH_INFO
+///
+/// 示例：
+/// - `/index.php`        → (`/index.php`, ``)
+/// - `/index.php/foo`    → (`/index.php`, `/foo`)
+/// - `/wp-admin/`        → (`/index.php`, `/wp-admin/`)（fallback，WordPress rewrite）
+/// - `/foo.php/bar/baz`  → (`/foo.php`, `/bar/baz`)
+fn split_script_path(path: &str) -> (&str, &str) {
+    // 查找 .php 后面紧跟 / 或结束的位置
+    if let Some(pos) = path.find(".php") {
+        let end = pos + 4; // ".php" 长度
+        if end == path.len() || path.as_bytes()[end] == b'/' {
+            return (&path[..end], &path[end..]);
+        }
+    }
+    // 没有找到 .php，fallback 到 index.php（WordPress/Laravel 伪静态）
+    ("/index.php", path)
+}
+
+/// 构造 FastCGI 错误响应
+fn fcgi_error(status: StatusCode, msg: &str) -> WebResponse {
+    tracing::warn!("FastCGI 错误 {}: {}", status.as_u16(), msg);
+    let body = crate::handler::error_page::build_default_html(status.as_u16());
+    let mut resp = WebResponse::new(ResponseBody::from(body));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    resp
+}
+
+/// 在给定连接上发送 FastCGI 请求，返回 (stdout, Option<conn>)
+/// Option<conn> 为 Some 表示连接可归还到池（PHP-FPM 保持了 keep-alive）
+async fn send_on_conn(
+    conn: crate::handler::fastcgi_pool::FcgiConn,
+    params: &[(&str, &str)],
+    stdin_body: &[u8],
+) -> anyhow::Result<(Vec<u8>, Option<crate::handler::fastcgi_pool::FcgiConn>)> {
+    use crate::handler::fastcgi_pool::FcgiConn;
+    match conn {
+        FcgiConn::Tcp(stream) => {
+            let (r, w) = tokio::io::split(stream);
+            let stdout = fcgi_send_recv(r, w, params, stdin_body).await?;
+            // TCP 连接不复用（PHP-FPM flags=0 表示关闭连接）
+            Ok((stdout, None))
+        }
+        #[cfg(unix)]
+        FcgiConn::Unix(stream) => {
+            let (r, w) = tokio::io::split(stream);
+            let stdout = fcgi_send_recv(r, w, params, stdin_body).await?;
+            Ok((stdout, None))
         }
     }
 }
 
-/// 构造 FastCGI 错误响应
-fn fcgi_error(status: StatusCode, _msg: &str) -> WebResponse {
-    let body = crate::handler::error_page::build_default_html(status.as_u16());
-    let mut resp = WebResponse::new(ResponseBody::from(body));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    resp
-}
-
-/// 连接 FastCGI socket 并发送请求（跨平台实现）
-///
-/// - Unix/Linux/macOS：优先尝试 Unix Domain Socket
-/// - Windows：使用 TCP 连接（socket_path 格式为 "host:port"）
-async fn connect_and_send(socket_path: &str, params: &[(&str, &str)]) -> anyhow::Result<Vec<u8>> {
-    // 根据平台选择连接方式，统一通过 fcgi_send_recv 发送/接收数据
-    #[cfg(unix)]
-    {
-        // Unix 平台：尝试 Unix Domain Socket
-        let stream = tokio::net::UnixStream::connect(socket_path).await?;
-        let (read_half, write_half) = tokio::io::split(stream);
-        fcgi_send_recv(read_half, write_half, params).await
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows 等平台：使用 TCP 连接
-        // socket_path 应为 "host:port" 格式，如 "127.0.0.1:9000"
-        let stream = tokio::net::TcpStream::connect(socket_path).await?;
-        let (read_half, write_half) = tokio::io::split(stream);
-        fcgi_send_recv(read_half, write_half, params).await
-    }
-}
-
-/// FastCGI 协议数据发送与响应接收（通用实现，与 stream 类型无关）
+/// FastCGI 协议发送/接收（通用，与传输类型无关）
 async fn fcgi_send_recv<R, W>(
     mut reader: R,
     mut writer: W,
     params: &[(&str, &str)],
+    stdin_body: &[u8],
 ) -> anyhow::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let rid: u16 = 1;
+    let mut pkt = Vec::with_capacity(4096);
 
-    let request_id: u16 = 1;
+    // 1. BEGIN_REQUEST
+    write_fcgi_header(&mut pkt, FCGI_BEGIN_REQUEST, rid, 8, 0);
+    pkt.extend_from_slice(&FCGI_RESPONDER.to_be_bytes());
+    pkt.push(0); // flags = 0（不复用连接）
+    pkt.extend_from_slice(&[0u8; 5]);
 
-    // 1. 发送 BEGIN_REQUEST
-    writer.write_all(&build_begin_request(request_id)).await?;
-
-    // 2. 发送 PARAMS
-    let params_body = encode_params(params);
-    if !params_body.is_empty() {
-        let header = FcgiHeader {
-            version: FCGI_VERSION,
-            record_type: FCGI_PARAMS,
-            request_id,
-            content_length: params_body.len() as u16,
-            padding_length: 0,
-            reserved: 0,
-        };
-        writer.write_all(&header.to_bytes()).await?;
-        writer.write_all(&params_body).await?;
+    // 2. PARAMS（name-value 编码后分片写入）
+    {
+        let mut body = Vec::new();
+        for (k, v) in params {
+            encode_nv_pair(&mut body, k.as_bytes(), v.as_bytes());
+        }
+        write_fcgi_record(&mut pkt, FCGI_PARAMS, rid, &body);
+        write_fcgi_record(&mut pkt, FCGI_PARAMS, rid, &[]); // 空记录表示 PARAMS 结束
     }
-    // PARAMS 结束记录（content_length = 0）
-    let end_params = FcgiHeader {
-        version: FCGI_VERSION,
-        record_type: FCGI_PARAMS,
-        request_id,
-        content_length: 0,
-        padding_length: 0,
-        reserved: 0,
-    };
-    writer.write_all(&end_params.to_bytes()).await?;
 
-    // 3. 发送空 STDIN（无请求体）
-    let empty_stdin = FcgiHeader {
-        version: FCGI_VERSION,
-        record_type: FCGI_STDIN,
-        request_id,
-        content_length: 0,
-        padding_length: 0,
-        reserved: 0,
-    };
-    writer.write_all(&empty_stdin.to_bytes()).await?;
+    // 3. STDIN（请求体，POST/PUT 时非空；分片发送，单片最大 65535 字节）
+    write_fcgi_record(&mut pkt, FCGI_STDIN, rid, stdin_body);
+    write_fcgi_record(&mut pkt, FCGI_STDIN, rid, &[]); // 空记录表示 STDIN 结束
+
+    writer.write_all(&pkt).await?;
     writer.flush().await?;
 
-    // 4. 读取响应
-    let mut response = Vec::new();
-    reader.read_to_end(&mut response).await?;
-
-    Ok(response)
-}
-
-/// 解析 FastCGI STDOUT 内容为 HTTP 响应
-fn parse_fcgi_response(raw: Vec<u8>) -> WebResponse {
-    // 遍历 FastCGI 记录，提取 STDOUT 数据
+    // 4. 读取所有 STDOUT 记录（直到 EOF）
     let mut stdout = Vec::new();
-    let mut offset = 0;
+    let mut header = [0u8; 8];
 
-    while offset + 8 <= raw.len() {
-        let record_type = raw[offset + 1];
-        let content_len = u16::from_be_bytes([raw[offset + 4], raw[offset + 5]]) as usize;
-        let padding_len = raw[offset + 6] as usize;
-        let data_start = offset + 8;
-        let data_end = data_start + content_len;
+    loop {
+        if reader.read_exact(&mut header).await.is_err() {
+            break; // EOF 或连接关闭
+        }
+        let rec_type    = header[1];
+        let content_len = u16::from_be_bytes([header[4], header[5]]) as usize;
+        let padding_len = header[6] as usize;
 
-        if data_end > raw.len() {
+        let total = content_len + padding_len;
+        let mut data = vec![0u8; total];
+        if total > 0 {
+            reader.read_exact(&mut data).await?;
+        }
+
+        match rec_type {
+            t if t == FCGI_STDOUT => stdout.extend_from_slice(&data[..content_len]),
+            t if t == FCGI_STDERR => {
+                if let Ok(s) = std::str::from_utf8(&data[..content_len]) {
+                    tracing::warn!("PHP-FPM stderr: {}", s.trim());
+                }
+            }
+            _ => {}
+        }
+
+        // STDOUT 空记录 = PHP 输出结束
+        if rec_type == FCGI_STDOUT && content_len == 0 {
             break;
         }
-
-        if record_type == FCGI_STDOUT {
-            stdout.extend_from_slice(&raw[data_start..data_end]);
-        }
-
-        offset = data_end + padding_len;
     }
 
-    // PHP 输出格式：HTTP 响应头 + 空行 + body
-    let (status_code, body_bytes) = if let Ok(text) = std::str::from_utf8(&stdout) {
-        if let Some(header_end) = text.find("\r\n\r\n") {
-            let body = text[header_end + 4..].as_bytes().to_vec();
-            // 提取 Status 头
-            let code = text
-                .lines()
-                .find(|l| l.to_lowercase().starts_with("status:"))
-                .and_then(|l| l.split(':').nth(1))
-                .and_then(|s| s.trim().split_whitespace().next())
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(200);
-            (code, body)
-        } else {
-            (200, stdout)
+    Ok(stdout)
+}
+
+/// 解析 PHP-FPM 输出为 HTTP 响应
+///
+/// PHP 输出格式：`响应头\r\n\r\n响应体` 或 `响应头\n\n响应体`
+/// 所有响应头全量透传给客户端（Set-Cookie、Location、Content-Type 等）
+fn parse_fcgi_response(stdout: Vec<u8>) -> WebResponse {
+    // 分割头部和 body：支持 \r\n\r\n 和 \n\n
+    let (header_part, body_part) = 'split: {
+        // 先找 \r\n\r\n
+        for i in 0..stdout.len().saturating_sub(3) {
+            if stdout[i] == b'\r' && stdout[i+1] == b'\n'
+                && stdout[i+2] == b'\r' && stdout[i+3] == b'\n' {
+                break 'split (
+                    std::str::from_utf8(&stdout[..i]).unwrap_or(""),
+                    stdout[i+4..].to_vec(),
+                );
+            }
         }
-    } else {
-        (200, stdout)
+        // 再找 \n\n
+        for i in 0..stdout.len().saturating_sub(1) {
+            if stdout[i] == b'\n' && stdout[i+1] == b'\n' {
+                break 'split (
+                    std::str::from_utf8(&stdout[..i]).unwrap_or(""),
+                    stdout[i+2..].to_vec(),
+                );
+            }
+        }
+        // 没有找到头尾分隔，全部当作 body
+        ("", stdout.clone())
     };
 
+    // 解析状态码（Status: 200 OK 或 Status: 302 Found）
+    let mut status_code: u16 = 200;
+    let mut response_headers: Vec<(String, String)> = Vec::new();
+
+    for line in header_part.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if let Some(rest) = line.strip_prefix("Status:").or_else(|| line.strip_prefix("status:")) {
+            if let Some(code_str) = rest.trim().split_whitespace().next() {
+                status_code = code_str.parse().unwrap_or(200);
+            }
+            continue; // Status 不转发给客户端
+        }
+        // 所有其他头（Content-Type、Set-Cookie、Location、X-Powered-By 等）全量转发
+        if let Some(colon) = line.find(':') {
+            let name  = line[..colon].trim().to_string();
+            let value = line[colon+1..].trim().to_string();
+            response_headers.push((name, value));
+        }
+    }
+
     let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
-    let mut resp = WebResponse::new(ResponseBody::from(body_bytes));
+    let body_len    = body_part.len();
+    let mut resp    = WebResponse::new(ResponseBody::from(body_part));
     *resp.status_mut() = http_status;
-    resp.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
+
+    // 写入所有响应头
+    use xitca_web::http::header::HeaderName;
+    for (k, v) in &response_headers {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            resp.headers_mut().append(name, val);
+        }
+    }
+
+    // 若 PHP 没有输出 Content-Type，默认 text/html
+    if !response_headers.iter().any(|(k, _)| k.to_lowercase() == "content-type") {
+        resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    }
+
+    // 设置 Content-Length（PHP 已知输出长度时有利于 keep-alive 复用）
+    if let Ok(v) = HeaderValue::from_str(&body_len.to_string()) {
+        resp.headers_mut().insert(
+            xitca_web::http::header::CONTENT_LENGTH,
+            v,
+        );
+    }
+
     resp
 }

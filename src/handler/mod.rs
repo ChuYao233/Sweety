@@ -3,6 +3,7 @@
 
 pub mod error_page;
 pub mod fastcgi;
+pub mod fastcgi_pool;
 pub mod reverse_proxy;
 pub mod static_file;
 pub mod websocket;

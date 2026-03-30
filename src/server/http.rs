@@ -522,37 +522,31 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         }
     }
 
-    // 访问日志：异步写文件（spawn 避免阻塞响应返回）
+    // 访问日志：非阻塞投递到 channel，后台 task 批量写文件
     if let Some(logger) = state.access_loggers.get(&site.name) {
-        let logger = logger.clone();
-        let client_ip = ctx.req().body().socket_addr().ip().to_string();
-        let method = ctx.req().method().as_str().to_string();
-        let uri = request_uri.clone();
-        let http_version = format!("{:?}", ctx.req().version());
-        let status = resp.status().as_u16();
-        let bytes_sent = resp.headers()
-            .get(xitca_web::http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0u64);
-        let referer = ctx.req().headers()
-            .get(xitca_web::http::header::REFERER)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-")
-            .to_string();
-        let user_agent = ctx.req().headers()
-            .get(xitca_web::http::header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-")
-            .to_string();
-        let site_name = site.name.clone();
-        tokio::spawn(async move {
-            logger.write(&AccessLogEntry {
-                client_ip, method, uri, http_version,
-                status, bytes_sent, referer, user_agent,
-                duration_ms: req_start.elapsed().as_millis() as u64,
-                site: site_name,
-            }).await;
+        logger.send(AccessLogEntry {
+            client_ip: ctx.req().body().socket_addr().ip().to_string(),
+            method:    ctx.req().method().as_str().to_string(),
+            uri:       request_uri.clone(),
+            http_version: format!("{:?}", ctx.req().version()),
+            status:    resp.status().as_u16(),
+            bytes_sent: resp.headers()
+                .get(xitca_web::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0u64),
+            referer: ctx.req().headers()
+                .get(xitca_web::http::header::REFERER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string(),
+            user_agent: ctx.req().headers()
+                .get(xitca_web::http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string(),
+            duration_ms: req_start.elapsed().as_millis() as u64,
+            site: site.name.clone(),
         });
     }
 

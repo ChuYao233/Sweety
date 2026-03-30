@@ -5,42 +5,67 @@ use regex::Regex;
 
 use crate::config::model::{RewriteFlag, RewriteRule};
 
-/// 对请求路径应用 Rewrite 规则列表
+/// 预编译后的 Rewrite 规则
+pub struct CompiledRewrite {
+    /// 原始配置
+    pub rule: RewriteRule,
+    /// 预编译的正则对象
+    pub regex: Regex,
+}
+
+impl CompiledRewrite {
+    /// 从 RewriteRule 构建，编译失败返回 None
+    pub fn new(rule: RewriteRule) -> Option<Self> {
+        match Regex::new(&rule.pattern) {
+            Ok(regex) => Some(Self { rule, regex }),
+            Err(e) => {
+                tracing::warn!("Rewrite 规则正则编译失败 '{}': {}", rule.pattern, e);
+                None
+            }
+        }
+    }
+}
+
+impl Clone for CompiledRewrite {
+    fn clone(&self) -> Self {
+        Self { rule: self.rule.clone(), regex: self.regex.clone() }
+    }
+}
+
+impl std::fmt::Debug for CompiledRewrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledRewrite").field("pattern", &self.rule.pattern).finish()
+    }
+}
+
+/// 对请求路径应用预编译 Rewrite 规则列表
 ///
 /// 返回值：
 /// - `Some(new_path)` 表示路径被重写
-/// - `None` 表示没有规则匹配，保持原路径
-pub fn apply_rewrites(rules: &[RewriteRule], path: &str) -> Option<String> {
+/// - `None` 表示没有规则匹配
+pub fn apply_rewrites(rules: &[CompiledRewrite], path: &str) -> Option<String> {
     let mut current = path.to_string();
     let mut changed = false;
 
-    for rule in rules {
+    for cr in rules {
         // 检查触发条件（如 !-f 文件不存在）
-        if let Some(cond) = &rule.condition {
+        if let Some(cond) = &cr.rule.condition {
             if !evaluate_condition(cond, &current) {
                 continue;
             }
         }
 
-        // 编译正则（生产版本应缓存编译结果，此处简单实现）
-        let re = match Regex::new(&rule.pattern) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("Rewrite 规则正则编译失败 '{}': {}", rule.pattern, e);
-                continue;
-            }
-        };
-
+        let re = &cr.regex;
         if !re.is_match(&current) {
             continue;
         }
 
         // 执行捕获组替换（$1 → 第1组，$2 → 第2组 …）
-        let new_path = regex_replace(&re, &current, &rule.target);
+        let new_path = regex_replace(re, &current, &cr.rule.target);
         current = new_path;
         changed = true;
 
-        match rule.flag {
+        match cr.rule.flag {
             RewriteFlag::Last | RewriteFlag::Break => {
                 // last/break 都停止继续处理后续 rewrite
                 break;
@@ -49,7 +74,7 @@ pub fn apply_rewrites(rules: &[RewriteRule], path: &str) -> Option<String> {
                 // 重定向标志：停止处理，上层需要发送重定向响应
                 // 此处在路径前加标记前缀供 dispatcher 识别
                 // 格式：`REDIRECT:302:<new_path>` 或 `REDIRECT:301:<new_path>`
-                let code = if rule.flag == RewriteFlag::Permanent {
+                let code = if cr.rule.flag == RewriteFlag::Permanent {
                     301
                 } else {
                     302
@@ -124,60 +149,55 @@ mod tests {
     use super::*;
     use crate::config::model::{RewriteFlag, RewriteRule};
 
-    fn rule(pattern: &str, target: &str, flag: RewriteFlag) -> RewriteRule {
-        RewriteRule {
+    fn crule(pattern: &str, target: &str, flag: RewriteFlag) -> CompiledRewrite {
+        CompiledRewrite::new(RewriteRule {
             pattern: pattern.to_string(),
             target: target.to_string(),
             flag,
             condition: None,
-        }
+        }).unwrap()
     }
 
-    fn rule_with_cond(
-        pattern: &str,
-        target: &str,
-        flag: RewriteFlag,
-        cond: &str,
-    ) -> RewriteRule {
-        RewriteRule {
+    fn crule_cond(pattern: &str, target: &str, flag: RewriteFlag, cond: &str) -> CompiledRewrite {
+        CompiledRewrite::new(RewriteRule {
             pattern: pattern.to_string(),
             target: target.to_string(),
             flag,
             condition: Some(cond.to_string()),
-        }
+        }).unwrap()
     }
 
     #[test]
     fn test_basic_rewrite() {
-        let rules = vec![rule("^/old/(.*)$", "/new/$1", RewriteFlag::Last)];
+        let rules = vec![crule("^/old/(.*)$", "/new/$1", RewriteFlag::Last)];
         let result = apply_rewrites(&rules, "/old/page");
         assert_eq!(result, Some("/new/page".to_string()));
     }
 
     #[test]
     fn test_no_match_returns_none() {
-        let rules = vec![rule("^/api/", "/backend/", RewriteFlag::Last)];
+        let rules = vec![crule("^/api/", "/backend/", RewriteFlag::Last)];
         let result = apply_rewrites(&rules, "/other/path");
         assert!(result.is_none());
     }
 
     #[test]
     fn test_wordpress_style_rewrite() {
-        let rules = vec![rule("^/(.+)$", "/index.php?$1", RewriteFlag::Last)];
+        let rules = vec![crule("^/(.+)$", "/index.php?$1", RewriteFlag::Last)];
         let result = apply_rewrites(&rules, "/hello-world");
         assert_eq!(result, Some("/index.php?hello-world".to_string()));
     }
 
     #[test]
     fn test_redirect_flag() {
-        let rules = vec![rule("^/old$", "/new", RewriteFlag::Redirect)];
+        let rules = vec![crule("^/old$", "/new", RewriteFlag::Redirect)];
         let result = apply_rewrites(&rules, "/old");
         assert_eq!(result, Some("REDIRECT:302:/new".to_string()));
     }
 
     #[test]
     fn test_permanent_redirect_flag() {
-        let rules = vec![rule("^/old$", "/new", RewriteFlag::Permanent)];
+        let rules = vec![crule("^/old$", "/new", RewriteFlag::Permanent)];
         let result = apply_rewrites(&rules, "/old");
         assert_eq!(result, Some("REDIRECT:301:/new".to_string()));
     }
@@ -185,23 +205,16 @@ mod tests {
     #[test]
     fn test_break_stops_chain() {
         let rules = vec![
-            rule("^/(.*)$", "/first/$1", RewriteFlag::Break),
-            rule("^/first/(.*)$", "/second/$1", RewriteFlag::Last),
+            crule("^/(.*)$", "/first/$1", RewriteFlag::Break),
+            crule("^/first/(.*)$", "/second/$1", RewriteFlag::Last),
         ];
         let result = apply_rewrites(&rules, "/page");
-        // break 后不应继续处理第二条规则
         assert_eq!(result, Some("/first/page".to_string()));
     }
 
     #[test]
     fn test_condition_not_file() {
-        // !-f 条件：当前简化实现始终为 true，规则应触发
-        let rules = vec![rule_with_cond(
-            "^/(.*)$",
-            "/index.php?$1",
-            RewriteFlag::Last,
-            "!-f",
-        )];
+        let rules = vec![crule_cond("^/(.*)$", "/index.php?$1", RewriteFlag::Last, "!-f")];
         let result = apply_rewrites(&rules, "/hello");
         assert_eq!(result, Some("/index.php?hello".to_string()));
     }

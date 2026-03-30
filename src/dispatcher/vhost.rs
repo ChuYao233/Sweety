@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::config::model::{FastCgiConfig, HstsConfig, LocationConfig, RewriteRule, SiteConfig, TlsConfig, UpstreamConfig};
+use crate::config::model::{FastCgiConfig, HstsConfig, SiteConfig, TlsConfig, UpstreamConfig};
+use crate::dispatcher::location::CompiledLocation;
+use crate::dispatcher::rewrite::CompiledRewrite;
 
 /// 运行时站点信息（从 SiteConfig 提取，去掉不需要运行时使用的字段）
 #[derive(Debug, Clone)]
@@ -16,10 +18,10 @@ pub struct SiteInfo {
     pub root: Option<std::path::PathBuf>,
     /// 默认文档列表
     pub index: Vec<String>,
-    /// Location 列表（已按优先级排序）
-    pub locations: Vec<LocationConfig>,
-    /// Rewrite 规则列表
-    pub rewrites: Vec<RewriteRule>,
+    /// Location 列表（已按优先级排序，正则已预编译）
+    pub locations: Vec<CompiledLocation>,
+    /// Rewrite 规则列表（正则已预编译）
+    pub rewrites: Vec<CompiledRewrite>,
     /// 上游服务器组列表
     pub upstreams: Vec<UpstreamConfig>,
     /// TLS 配置
@@ -49,16 +51,22 @@ pub struct SiteInfo {
 impl SiteInfo {
     /// 从 SiteConfig 转换为运行时 SiteInfo
     pub fn from_config(cfg: &SiteConfig) -> Self {
-        let mut locations = cfg.locations.clone();
-        // 按匹配优先级排序（精确 > 前缀优先 > 正则 > 普通前缀）
-        locations.sort_by_key(|loc| location_priority(&loc.path));
+        // 按匹配优先级排序，同时预编译所有正则 location
+        let mut locations: Vec<CompiledLocation> = cfg.locations.iter()
+            .map(|loc| CompiledLocation::new(loc.clone()))
+            .collect();
+        locations.sort_by_key(|cl| location_priority(&cl.config.path));
+
+        let rewrites: Vec<CompiledRewrite> = cfg.rewrites.iter()
+            .filter_map(|r| CompiledRewrite::new(r.clone()))
+            .collect();
 
         Self {
             name: cfg.name.clone(),
             root: cfg.root.clone(),
             index: cfg.index.clone(),
             locations,
-            rewrites: cfg.rewrites.clone(),
+            rewrites,
             upstreams: cfg.upstreams.clone(),
             tls: cfg.tls.clone(),
             fastcgi: cfg.fastcgi.clone(),

@@ -278,35 +278,19 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
 
     state.metrics.inc_requests();
 
-    // 提取 Host（去掉端口）
-    let host = ctx
-        .req()
-        .headers()
+    // 一次解析 Host 头，后续复用（避免多次 get）
+    let host_raw = ctx.req().headers()
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
+    // host 只包含主机名（去掉端口），用于 vhost 匹配
+    let host = host_raw.split(':').next().unwrap_or(host_raw);
+    let host_port: Option<u16> = host_raw.split(':').nth(1).and_then(|p| p.parse().ok());
 
-    let path = ctx.req().uri().path().to_string();
-    // $request_uri 包含路径和查询字符串（等价 Nginx $request_uri）
+    let path = ctx.req().uri().path();
     let request_uri = ctx.req().uri().path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| path.clone());
-
-    // 判断是否 HTTPS 请求
-    // 策略：解析 Host 头中的端口号，查 http_ports 和 tls_ports。
-    // Host 带端口：在 http_ports 里 = HTTP，在 tls_ports 里 = HTTPS。
-    // Host 无端口：默认 80 属于 HTTP，443 属于 HTTPS；
-    //   若两者都没配置，默认 HTTPS（居多数不带端口访问的即 443 HTTPS）。
-    // O(1) HashSet 查找，高并发无开销。
-    let host_port: Option<u16> = ctx.req().headers()
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.split(':').nth(1))
-        .and_then(|p| p.parse().ok());
+        .map(|pq| pq.as_str())
+        .unwrap_or(path);
     // URI scheme（H2/H3 有效，H1 通常为 None）
     let uri_scheme = ctx.req().uri().scheme_str();
     let is_https = match uri_scheme {
@@ -362,7 +346,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         if should_redirect {
             let tls_port = if site.listen_tls.contains(&443) { 443 }
                            else { site.listen_tls.first().copied().unwrap_or(443) };
-            let host_for_redirect = if tls_port == 443 { host.clone() }
+            let host_for_redirect = if tls_port == 443 { host.to_string() }
                                     else { format!("{}:{}", host, tls_port) };
             let redirect_url = format!("https://{}{}",
                 host_for_redirect,
@@ -527,7 +511,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         logger.send(AccessLogEntry {
             client_ip: ctx.req().body().socket_addr().ip().to_string(),
             method:    ctx.req().method().as_str().to_string(),
-            uri:       request_uri.clone(),
+            uri:       request_uri.to_string(),
             http_version: format!("{:?}", ctx.req().version()),
             status:    resp.status().as_u16(),
             bytes_sent: resp.headers()

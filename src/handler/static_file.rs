@@ -46,7 +46,7 @@ pub async fn handle_xitca(
 ) -> WebResponse {
     let path = ctx.req().uri().path().to_string();
     let method = ctx.req().method().as_str();
-    let req_headers = ctx.req().headers().clone();
+    let req_headers = ctx.req().headers();
 
     // 确定文件系统根目录（location 级 root 优先于 site 级 root）
     let root = match location.root.as_ref().or(site.root.as_ref()) {

@@ -201,24 +201,6 @@ fn tls_changed(old: &SiteConfig, new: &SiteConfig) -> bool {
     toml::to_string(&old.tls).ok() != toml::to_string(&new.tls).ok()
 }
 
-/// 收集配置中所有证书文件所在的目录（用于监听证书变更）
-fn collect_cert_dirs(cfg: &AppConfig) -> HashSet<std::path::PathBuf> {
-    let mut dirs = HashSet::new();
-    for site in &cfg.sites {
-        let Some(tls) = &site.tls else { continue };
-        let paths: Vec<&std::path::Path> = tls.certs.iter()
-            .flat_map(|p| [p.cert.as_path(), p.key.as_path()])
-            .chain(tls.cert.as_deref())
-            .chain(tls.key.as_deref())
-            .collect();
-        for path in paths {
-            if let Some(dir) = path.parent() {
-                dirs.insert(dir.to_path_buf());
-            }
-        }
-    }
-    dirs
-}
 
 // ─────────────────────────────────────────────
 // 单元测试

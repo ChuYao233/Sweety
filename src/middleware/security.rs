@@ -1,43 +1,42 @@
 //! 安全策略中间件
 //! 负责：敏感文件路径拦截、自动注入安全响应头（HSTS/CSP/X-Frame-Options 等）
 
-/// 默认敏感路径规则列表（精确前缀或精确文件名）
-const SENSITIVE_PATTERNS: &[&str] = &[
-    "/.git",
-    "/.env",
-    "/.htaccess",
-    "/.htpasswd",
-    "/.DS_Store",
-    "/composer.json",
-    "/composer.lock",
-    "/package.json",
-    "/package-lock.json",
-    "/yarn.lock",
-    "/Makefile",
-    "/Dockerfile",
-    "/.dockerignore",
-    "/wp-config.php",
-    "/config.php",
-    "/.ssh",
-    "/.aws",
+/// 敏感路径规则：(pattern, pattern_with_slash)
+/// 开机时预构建，避免每请求 format! 堆分配
+static SENSITIVE_PATTERNS: &[(&str, &str)] = &[
+    ("/.git",             "/.git/"),
+    ("/.env",             "/.env/"),
+    ("/.htaccess",        "/.htaccess/"),
+    ("/.htpasswd",        "/.htpasswd/"),
+    ("/.DS_Store",        "/.DS_Store/"),
+    ("/composer.json",    "/composer.json/"),
+    ("/composer.lock",    "/composer.lock/"),
+    ("/package.json",     "/package.json/"),
+    ("/package-lock.json","/package-lock.json/"),
+    ("/yarn.lock",        "/yarn.lock/"),
+    ("/Makefile",         "/Makefile/"),
+    ("/Dockerfile",       "/Dockerfile/"),
+    ("/.dockerignore",    "/.dockerignore/"),
+    ("/wp-config.php",    "/wp-config.php/"),
+    ("/config.php",       "/config.php/"),
+    ("/.ssh",             "/.ssh/"),
+    ("/.aws",             "/.aws/"),
 ];
 
-/// 检查请求路径是否命中敏感文件拦截规则
-///
-/// 返回 `true` 表示应拒绝该请求（返回 403 Forbidden）
+/// 检查请求路径是否命中敏感文件拦截规则。返回 `true` 表示应返回 403。
 pub fn is_sensitive_path(path: &str) -> bool {
-    // 仅检查路径部分（忽略查询串）
     let path_only = path.split('?').next().unwrap_or(path);
+    let last_slash = path_only.rfind('/');
 
-    for pattern in SENSITIVE_PATTERNS {
-        // 前缀匹配或精确匹配
-        if path_only == *pattern || path_only.starts_with(&format!("{}/", pattern)) {
+    for (pat, pat_slash) in SENSITIVE_PATTERNS {
+        // 精确匹配或前缀匹配（/pattern/...）
+        if path_only == *pat || path_only.starts_with(pat_slash) {
             return true;
         }
         // 文件名匹配（如 /any/dir/.git/config）
-        if let Some(slash_pos) = path_only.rfind('/') {
-            let filename = &path_only[slash_pos..];
-            if filename == *pattern || filename.starts_with(&format!("{}/", pattern)) {
+        if let Some(pos) = last_slash {
+            let filename = &path_only[pos..];
+            if filename == *pat || filename.starts_with(pat_slash) {
                 return true;
             }
         }

@@ -51,7 +51,6 @@ pub struct AccessLogEntry {
 /// 单一后台 task 负责格式化 + BufWriter 批量写文件。
 pub struct AccessLogger {
     tx: Option<mpsc::Sender<AccessLogEntry>>,
-    format: LogFormat,
 }
 
 impl AccessLogger {
@@ -66,14 +65,13 @@ impl AccessLogger {
             .open(path)?;
 
         let (tx, rx) = mpsc::channel::<AccessLogEntry>(4096);
-        let fmt = format.clone();
 
         // 单一后台 task：从 channel 接收日志行，BufWriter 批量写文件
         tokio::spawn(async move {
-            writer_task(rx, std_file, fmt).await;
+            writer_task(rx, std_file, format).await;
         });
 
-        Ok(Self { tx: Some(tx), format })
+        Ok(Self { tx: Some(tx) })
     }
 
     /// 投递一条日志（非阻塞，channel 满则丢弃，不影响请求延迟）

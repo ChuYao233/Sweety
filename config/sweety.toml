@@ -29,9 +29,11 @@ log_level = "sweety_lib=info,xitca_server=warn,xitca_web=warn,xitca_http=warn"
 name        = "static-test"
 server_name = ["127.0.0.1", "localhost", "172.19.0.1"]
 listen      = [80]
-listen_tls  = [443]
+listen_tls  = [443,4430,4431]
 root        = 'E:\杂项\网站源码\阿付自用超好看个人主页源码'
 index       = ["index.html", "index.htm"]
+# HTTP 访问自动 301 跳转到 HTTPS（需配置 listen_tls 才生效）
+force_https = true
 # 是否作为 fallback 站点（未匹配其他站点时使用，相当于 Nginx default_server）
 # fallback = true
 # 站点级 gzip 覆盖（不设则继承全局 global.gzip）
@@ -57,6 +59,13 @@ key  = "test_cert/ecdsa/key.pem"
 [[sites.tls.certs]]
 cert = "test_cert/ed22519/cert.pem"
 key  = "test_cert/ed22519/key.pem"
+
+# HSTS：浏览器在 max_age 秒内强制 HTTPS（仅对 HTTPS 响应生效）
+# 生产推荐：31536000（1年），测试用小值方便撤销
+[sites.hsts]
+max_age            = 300
+include_sub_domains = false
+preload            = false
 
 [[sites.locations]]
 path    = "/"

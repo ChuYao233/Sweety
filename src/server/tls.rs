@@ -111,11 +111,14 @@ impl TlsManager {
 
     /// ACME 证书自动申请与续期后台循环
     ///
-    /// 使用 rustls-acme（TLS-ALPN-01 challenge）：
-    /// - 不需要开放 80 端口
-    /// - 证书签发后写入本地缓存目录
-    /// - 每 12 小时检查一次，到期前 30 天自动续期
-    pub async fn acme_renewal_loop(cfg: Arc<AppConfig>) {
+    /// - TLS-ALPN-01 challenge，无需 80 端口
+    /// - 每 12 小时检查一次
+    /// - 到期前 `acme_renew_days_before` 天自动续期（解析真实证书到期日）
+    /// - 续期成功后通知 `sni_resolvers` 热重载证书，不重启服务器
+    pub async fn acme_renewal_loop(
+        cfg: Arc<AppConfig>,
+        sni_resolvers: std::collections::HashMap<u16, Arc<SniResolver>>,
+    ) {
         loop {
             for site in &cfg.sites {
                 let Some(tls) = &site.tls else { continue };
@@ -128,26 +131,33 @@ impl TlsManager {
                         continue;
                     }
                 };
+                let renew_days = tls.acme_renew_days_before;
 
                 for domain in &site.server_name {
-                    // 跳过通配符域名（ACME TLS-ALPN-01 不支持通配符）
                     if domain.starts_with("*.") { continue; }
 
                     let cert_path = acme_cert_path(domain);
                     let key_path  = acme_key_path(domain);
 
-                    // 检查证书是否需要续期
-                    if cert_path.exists() && !cert_needs_renewal(&cert_path) {
+                    // 解析证书真实到期日，判断是否需续期
+                    if cert_path.exists() && !cert_needs_renewal(&cert_path, renew_days) {
                         continue;
                     }
 
-                    info!("开始为域名 '{}' 申请/续期 ACME 证书，邮箱: {}", domain, email);
-                    match request_acme_cert(domain, &email).await {
+                    info!("开始为域名 '{}' 申请/续期 ACME 证书，邮筱: {}，到期前 {}d 续期",
+                        domain, email, renew_days);
+                    match request_acme_cert(domain, &email, &tls.acme_provider).await {
                         Ok((cert_pem, key_pem)) => {
                             if let Err(e) = save_cert_files(&cert_path, &key_path, &cert_pem, &key_pem) {
                                 error!("ACME 证书保存失败 ({}): {}", domain, e);
                             } else {
                                 info!("ACME 证书申请成功: {}", domain);
+                                // 续期成功后热重载所有 TLS 端口的证书，不重启服务器
+                                reload_acme_cert_in_resolvers(
+                                    &cert_path, &key_path,
+                                    &site.server_name,
+                                    &sni_resolvers,
+                                );
                             }
                         }
                         Err(e) => {
@@ -330,19 +340,34 @@ fn build_quinn_config_self_signed(domain: &str) -> Result<xitca_io::net::QuicCon
 // 内部实现：ACME 证书申请
 // ─────────────────────────────────────────────
 
+/// ACME 提供商目录 URL
+const LETS_ENCRYPT_PROD:    &str = "https://acme-v02.api.letsencrypt.org/directory";
+const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
+const ZEROSSL:              &str = "https://acme.zerossl.com/v2/DV90";
+const BUYPASS:              &str = "https://api.buypass.com/acme/directory";
+
 /// 通过 rustls-acme（TLS-ALPN-01）申请证书
 ///
-/// 返回 (cert_pem, key_pem) 字节对
-async fn request_acme_cert(domain: &str, email: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+/// `acme_provider` 支持: letsencrypt / letsencrypt_staging / zerossl / buypass / 自定义 URL
+async fn request_acme_cert(domain: &str, email: &str, acme_provider: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     use rustls_acme::{AcmeConfig, caches::DirCache};
 
-    // 使用磁盘缓存存储账号 key 和证书
+    // 根据 provider 选择 ACME 目录 URL
+    let directory_url = match acme_provider {
+        "letsencrypt"         => LETS_ENCRYPT_PROD,
+        "letsencrypt_staging" => LETS_ENCRYPT_STAGING,
+        "zerossl"             => ZEROSSL,
+        "buypass" | "litessl" => BUYPASS,
+        custom                => custom,  // 自定义 URL 直接使用
+    };
+    info!("ACME 使用提供商: {} ({})", acme_provider, directory_url);
+
     let cache_dir = acme_cache_dir();
     std::fs::create_dir_all(&cache_dir)
         .with_context(|| format!("创建 ACME 缓存目录失败: {}", cache_dir.display()))?;
 
-    // 构建 ACME 配置（Let's Encrypt 生产环境）
     let mut acme_state = AcmeConfig::new([domain])
+        .directory(directory_url)
         .contact_push(format!("mailto:{}", email))
         .cache(DirCache::new(cache_dir.clone()))
         .state();
@@ -381,24 +406,54 @@ async fn request_acme_cert(domain: &str, email: &str) -> Result<(Vec<u8>, Vec<u8
     bail!("ACME 证书申请完成但未找到证书文件")
 }
 
-/// 检查证书是否需要续期（距到期 < 30 天则续期）
-fn cert_needs_renewal(cert_path: &Path) -> bool {
+/// 检查证书是否需要续期
+///
+/// 解析 X.509 证书的真实到期日，距到期 < `renew_days_before` 天则返回 true
+fn cert_needs_renewal(cert_path: &Path, renew_days_before: u64) -> bool {
     let Ok(bytes) = std::fs::read(cert_path) else { return true };
-    let Ok(Some(_cert)) = rustls_pemfile::certs(&mut bytes.as_slice()).next().transpose() else {
-        return true
+
+    // 提取第一个 PEM 证书的 DER 字节
+    let Ok(Some(der)) = rustls_pemfile::certs(&mut bytes.as_slice()).next().transpose() else {
+        return true;
     };
 
-    // 解析 DER 证书获取有效期
-    // 使用简单的字节长度启发式（若证书 < 30 天内到期则续期）
-    // 完整实现需要 x509-parser，此处通过文件修改时间估算
-    let Ok(meta) = std::fs::metadata(cert_path) else { return true };
-    let Ok(modified) = meta.modified() else { return true };
-    let age = std::time::SystemTime::now()
-        .duration_since(modified)
-        .unwrap_or(Duration::from_secs(0));
+    // 用 x509-parser 解析 DER，获取 not_after 到期时间
+    use x509_parser::prelude::*;
+    let Ok((_, cert)) = X509Certificate::from_der(der.as_ref()) else {
+        return true;
+    };
 
-    // Let's Encrypt 证书有效期 90 天，60 天后续期
-    age > Duration::from_secs(60 * 24 * 3600)
+    // not_after 是 ASN.1 GeneralizedTime，转成 Unix 时间戳
+    let not_after_ts = cert.validity().not_after.timestamp();
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days_left = (not_after_ts - now_ts) / 86400;
+
+    info!("证书 {} 还有 {} 天到期（续期阈值: {} 天）",
+        cert_path.display(), days_left, renew_days_before);
+
+    days_left < renew_days_before as i64
+}
+
+/// ACME 续期成功后将新证书热重载到所有 SniResolver，不重启服务器
+fn reload_acme_cert_in_resolvers(
+    cert_path: &Path,
+    key_path: &Path,
+    server_names: &[String],
+    resolvers: &std::collections::HashMap<u16, Arc<SniResolver>>,
+) {
+    match load_certified_key_from_path(cert_path, key_path) {
+        Ok(ck) => {
+            let keys = vec![ck];
+            for resolver in resolvers.values() {
+                resolver.upsert_site(server_names, keys.clone());
+            }
+            info!("ACME 证书已热重载到 {} 个 TLS 端口", resolvers.len());
+        }
+        Err(e) => error!("ACME 证书热重载失败: {}", e),
+    }
 }
 
 /// 保存证书文件到磁盘

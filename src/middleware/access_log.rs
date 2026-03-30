@@ -57,9 +57,8 @@ impl AccessLogger {
         Self { writer: None, format }
     }
 
-    /// 创建写入文件的日志器
+    /// 创建写入文件的日志器（async 版本）
     pub async fn file(path: &PathBuf, format: LogFormat) -> anyhow::Result<Self> {
-        // 创建目录（如果不存在）
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -70,6 +69,24 @@ impl AccessLogger {
             .await?;
         Ok(Self {
             writer: Some(Arc::new(Mutex::new(file))),
+            format,
+        })
+    }
+
+    /// 创建写入文件的日志器（同步版本，用于服务器启动时初始化）
+    ///
+    /// 用 `std::fs` 打开文件后转为 `tokio::fs::File`，避免在 tokio 运行时内 `block_on`。
+    pub fn file_sync(path: &PathBuf, format: LogFormat) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let std_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let tokio_file = tokio::fs::File::from_std(std_file);
+        Ok(Self {
+            writer: Some(Arc::new(Mutex::new(tokio_file))),
             format,
         })
     }

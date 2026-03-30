@@ -9,6 +9,45 @@ use xitca_web::{
     },
 };
 
+/// 对响应体内容做 sub_filter 替换（等价 Nginx sub_filter）
+///
+/// - pattern 以 `~` 开头：按正则替换（支持 $1 $2 捕获组）
+/// - 否则：纯字符串替换
+/// - 仅对文本类 Content-Type（html/json/js/text）生效
+pub fn apply_sub_filter(
+    body: Vec<u8>,
+    headers: &[(String, String)],
+    filters: &[crate::config::model::SubFilter],
+) -> Vec<u8> {
+    if filters.is_empty() { return body; }
+
+    // 只处理文本类响应
+    let is_text = headers.iter().any(|(k, v)| {
+        k.to_lowercase() == "content-type" && (
+            v.contains("html") || v.contains("json") ||
+            v.contains("javascript") || v.contains("text")
+        )
+    });
+    if !is_text { return body; }
+
+    let Ok(text) = std::str::from_utf8(&body) else { return body; };
+    let mut result = text.to_string();
+
+    for f in filters {
+        if let Some(pattern) = f.pattern.strip_prefix('~') {
+            // 正则替换
+            if let Ok(re) = regex::Regex::new(pattern.trim()) {
+                result = re.replace_all(&result, f.replacement.as_str()).into_owned();
+            }
+        } else {
+            // 字符串替换（全量）
+            result = result.replace(f.pattern.as_str(), &f.replacement);
+        }
+    }
+
+    result.into_bytes()
+}
+
 /// 将上游响应头全量透传给客户端（Nginx proxy_pass 默认行为）
 ///
 /// - 跳过 hop-by-hop 头（Connection / Transfer-Encoding 等）

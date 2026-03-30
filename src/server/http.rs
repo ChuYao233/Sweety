@@ -22,7 +22,9 @@ use crate::config::model::{AppConfig, HandlerType};
 use crate::config::hot_reload::{HotReloadContext, start_hot_reload};
 use crate::dispatcher::vhost::VHostRegistry;
 use crate::handler::reverse_proxy::pool::ConnPool;
+use crate::middleware::access_log::{AccessLogEntry, AccessLogger, LogFormat};
 use crate::middleware::metrics::GlobalMetrics;
+use crate::middleware::proxy_cache::ProxyCache;
 use crate::server::tls::{SniResolver, TlsManager};
 
 /// Sweety 服务器入口结构体
@@ -77,14 +79,51 @@ impl SweetyServer {
             }
         }
 
+        // HTTP 端口集合（用于判断请求是否是 HTTP）
+        let http_port_set: HashSet<u16> = collect_http_ports(&cfg).into_iter().collect();
+
+        // 为各站点创建访问日志写入器（同步打开文件，避免在运行时内 block_on）
+        let access_loggers = {
+            let mut map: HashMap<String, Arc<AccessLogger>> = HashMap::new();
+            for site in &cfg.sites {
+                if let Some(log_path) = &site.access_log {
+                    match AccessLogger::file_sync(log_path, LogFormat::Combined) {
+                        Ok(l) => {
+                            info!("站点 '{}' 访问日志: {}", site.name, log_path.display());
+                            map.insert(site.name.clone(), Arc::new(l));
+                        }
+                        Err(e) => tracing::warn!("站点 '{}' 访问日志初始化失败: {}", site.name, e),
+                    }
+                }
+            }
+            Arc::new(map)
+        };
+
+        // 按站点配置创建反代缓存实例
+        let proxy_caches = {
+            let mut map: HashMap<String, Arc<ProxyCache>> = HashMap::new();
+            for site in &cfg.sites {
+                if let Some(cache_cfg) = &site.proxy_cache {
+                    let cache = ProxyCache::from_config(cache_cfg);
+                    map.insert(site.name.clone(), cache);
+                    info!("站点 '{}' 反代缓存已开启（max_entries={}, ttl={}s）",
+                        site.name, cache_cfg.max_entries, cache_cfg.ttl);
+                }
+            }
+            Arc::new(map)
+        };
+
         // 第二步：构建 state
         let state = AppState {
             registry: registry.clone(),
             metrics: metrics.clone(),
             cfg: cfg.clone(),
             tls_ports: Arc::new(tls_port_set),
+            http_ports: Arc::new(http_port_set),
             conn_pool,
             sni_resolvers: Arc::new(port_resolvers),
+            access_loggers,
+            proxy_caches,
         };
 
         // 第三步：构建 xitca-web App
@@ -139,12 +178,17 @@ impl SweetyServer {
         // 启动 ACME 自动续期后台任务
         if cfg.sites.iter().any(|s| s.tls.as_ref().map(|t| t.acme).unwrap_or(false)) {
             let cfg_clone = cfg.clone();
+            // 克隆 sni_resolvers 供 ACME 续期后热重载证书
+            let resolvers_for_acme: HashMap<u16, Arc<SniResolver>> = (*state.sni_resolvers).clone();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap();
-                rt.block_on(crate::server::tls::TlsManager::acme_renewal_loop(cfg_clone));
+                rt.block_on(crate::server::tls::TlsManager::acme_renewal_loop(
+                    cfg_clone,
+                    resolvers_for_acme,
+                ));
             });
         }
 
@@ -171,12 +215,18 @@ pub struct AppState {
     pub registry: Arc<VHostRegistry>,
     pub metrics: Arc<GlobalMetrics>,
     pub cfg: Arc<AppConfig>,
-    /// HTTPS 端口集合（用于判断是否注入 HSTS 头）
+    /// HTTPS/TLS 端口集合
     pub tls_ports: Arc<HashSet<u16>>,
+    /// HTTP 明文端口集合（O(1) 查找判断 HTTP/HTTPS，不依赖 scheme）
+    pub http_ports: Arc<HashSet<u16>>,
     /// 上游 TCP/TLS 连接池（跨请求复用 idle 连接）
     pub conn_pool: ConnPool,
     /// SNI 证书 Resolver 按端口索引（热重载时原地更新证书，不断连）
     pub sni_resolvers: Arc<HashMap<u16, Arc<SniResolver>>>,
+    /// 访问日志写入器（按站点名索引）
+    pub access_loggers: Arc<HashMap<String, Arc<AccessLogger>>>,
+    /// 反代响应缓存（按站点名索引）
+    pub proxy_caches: Arc<HashMap<String, Arc<ProxyCache>>>,
 }
 
 /// 多站点请求分发处理器
@@ -199,20 +249,35 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         .to_string();
 
     let path = ctx.req().uri().path().to_string();
+    // $request_uri 包含路径和查询字符串（等价 Nginx $request_uri）
+    let request_uri = ctx.req().uri().path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| path.clone());
 
-    // 判断是否 HTTPS 请求（scheme 或端口集合）
-    let is_https = ctx.req().uri().scheme_str() == Some("https")
-        || {
-            let host_val = ctx.req().headers()
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if let Some(port_str) = host_val.split(':').nth(1) {
-                port_str.parse::<u16>().map(|p| state.tls_ports.contains(&p)).unwrap_or(false)
-            } else {
-                state.tls_ports.contains(&443)
-            }
-        };
+    // 判断是否 HTTPS 请求
+    // 策略：解析 Host 头中的端口号，查 http_ports 和 tls_ports。
+    // Host 带端口：在 http_ports 里 = HTTP，在 tls_ports 里 = HTTPS。
+    // Host 无端口：默认 80 属于 HTTP，443 属于 HTTPS；
+    //   若两者都没配置，默认 HTTPS（居多数不带端口访问的即 443 HTTPS）。
+    // O(1) HashSet 查找，高并发无开销。
+    let host_port: Option<u16> = ctx.req().headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.split(':').nth(1))
+        .and_then(|p| p.parse().ok());
+    // URI scheme（H2/H3 有效，H1 通常为 None）
+    let uri_scheme = ctx.req().uri().scheme_str();
+    let is_https = match uri_scheme {
+        Some("https") => true,
+        Some("http")  => false,
+        _ => match host_port {
+            // Host 带端口：在 http_ports 里 = HTTP，否则 = HTTPS
+            Some(p) => !state.http_ports.contains(&p),
+            // Host 无端口 + H1：无法可靠判断，默认视为 HTTPS
+            // （tls_ports 有端口说明站点有 TLS，无端口访问通常是通过浏览器直接输入 https://）
+            None => !state.http_ports.is_empty() && state.tls_ports.contains(&443),
+        },
+    };
 
     // HTTPS 请求严格匹配（防跨站）：无精确/通配符匹配时返回 421 Misdirected Request
     // HTTP 请求允许 fallback 到默认站点（与 Nginx 行为一致）
@@ -233,6 +298,37 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
             }
         }
     };
+
+    // force_https：与 Nginx 行为完全一致
+    // Nginx 的 return 301 https://... 写在 HTTP server block 里，HTTPS 连接根本不会进入那个 block。
+    // Sweety 等效实现：只对 Host 头明确带了 HTTP 端口（如 :80）的请求跳转，
+    // 无端口的请求不跳转（无法可靠判断协议，避免死循环）。
+    // 带端口访问（http://ip:80 → Host: ip:80）完全可靠。
+    // 无端口直接访问（http://ip → Host: ip，H1）无法区分，不处理，由用户在 DNS/CDN 层做强制 HTTPS。
+    if site.force_https {
+        let should_redirect = match uri_scheme {
+            Some("http") => true,   // H2/H3 明确 scheme=http
+            Some("https") => false, // H2/H3 明确 scheme=https
+            _ => {
+                // H1 无 scheme：只有 Host 头明确带了 http_port 才跳转
+                match host_port {
+                    Some(p) => state.http_ports.contains(&p),
+                    None => false,  // 无端口：不跳转，无法可靠判断
+                }
+            }
+        };
+        if should_redirect {
+            let tls_port = if site.listen_tls.contains(&443) { 443 }
+                           else { site.listen_tls.first().copied().unwrap_or(443) };
+            let host_for_redirect = if tls_port == 443 { host.clone() }
+                                    else { format!("{}:{}", host, tls_port) };
+            let redirect_url = format!("https://{}{}",
+                host_for_redirect,
+                ctx.req().uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+            state.metrics.record_status(301);
+            return make_redirect_resp(&redirect_url, StatusCode::MOVED_PERMANENTLY);
+        }
+    }
 
     // 安全检查：拦截敏感路径
     if crate::middleware::security::is_sensitive_path(&path) {
@@ -278,7 +374,15 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         }
     }
 
-    // 直接返回状态码（健康检查）
+    // return_url：带 URL 的 return 指令（等价 Nginx return 301 https://...）
+    // 格式: "301 https://..." 或 "302 https://..." 或直接 URL（默认 301）
+    if let Some(ref ret) = location.return_url {
+        let (code, url) = parse_return_directive(ret, &path);
+        state.metrics.record_status(code);
+        return make_redirect_resp(&url, StatusCode::from_u16(code).unwrap_or(StatusCode::MOVED_PERMANENTLY));
+    }
+
+    // return_code：直接返回状态码（健康检查）
     if let Some(code) = location.return_code {
         let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
         state.metrics.record_status(code);
@@ -305,9 +409,39 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
 
     state.metrics.record_status(resp.status().as_u16());
 
+    // error_page：自定义错误页（等价 Nginx error_page 404 /404.html）
+    let status_u16 = resp.status().as_u16();
+    if (400..600).contains(&status_u16) {
+        if let Some(ep_path) = site.error_pages.get(&status_u16) {
+            if let Some(root) = location.root.as_ref().or(site.root.as_ref()) {
+                let ep_file = root.join(ep_path.trim_start_matches('/'));
+                if ep_file.is_file() {
+                    if let Ok(content) = std::fs::read(&ep_file) {
+                        let mut ep_resp = WebResponse::new(ResponseBody::from(content));
+                        *ep_resp.status_mut() = resp.status();
+                        let ext = ep_file.extension().and_then(|e| e.to_str()).unwrap_or("html");
+                        let mime = crate::middleware::cache::mime_type_for(ext);
+                        if let Ok(v) = HeaderValue::from_str(mime) {
+                            ep_resp.headers_mut().insert(CONTENT_TYPE, v);
+                        }
+                        return ep_resp;
+                    }
+                }
+            }
+        }
+    }
+
     // 注入 HSTS 响应头（仅当 HTTPS 且站点配置了 hsts 时）
+    // 兴趣：is_https 为 false 时也检查 Host 端口，兼容部分反代场景 scheme 未设置的情况
+    let inject_hsts = is_https || {
+        let host_val = ctx.req().headers()
+            .get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if let Some(p) = host_val.split(':').nth(1) {
+            p.parse::<u16>().map(|p| state.tls_ports.contains(&p)).unwrap_or(false)
+        } else { false }
+    };
     if let Some(hsts) = &site.hsts {
-        if is_https && hsts.max_age > 0 {
+        if inject_hsts && hsts.max_age > 0 {
             if let Ok(v) = HeaderValue::try_from(build_hsts_value(hsts)) {
                 resp.headers_mut().insert(
                     xitca_web::http::header::HeaderName::from_static("strict-transport-security"),
@@ -315,6 +449,42 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
                 );
             }
         }
+    }
+
+    // 访问日志：异步写文件（spawn 避免阻塞响应返回）
+    if let Some(logger) = state.access_loggers.get(&site.name) {
+        let logger = logger.clone();
+        let client_ip = ctx.req().body().socket_addr().ip().to_string();
+        let method = ctx.req().method().as_str().to_string();
+        let uri = ctx.req().uri().path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| path.clone());
+        let http_version = format!("{:?}", ctx.req().version());
+        let status = resp.status().as_u16();
+        let bytes_sent = resp.headers()
+            .get(xitca_web::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0u64);
+        let referer = ctx.req().headers()
+            .get(xitca_web::http::header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let user_agent = ctx.req().headers()
+            .get(xitca_web::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let site_name = site.name.clone();
+        tokio::spawn(async move {
+            logger.write(&AccessLogEntry {
+                client_ip, method, uri, http_version,
+                status, bytes_sent, referer, user_agent,
+                duration_ms: 0,  // TODO: 计时
+                site: site_name,
+            }).await;
+        });
     }
 
     resp
@@ -342,6 +512,27 @@ fn make_error_resp(status: StatusCode) -> WebResponse {
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
     resp
+}
+
+/// 解析 return 指令："301 https://..." 或 "https://..."（默认 301）
+/// 支持 $request_uri 变量替换
+fn parse_return_directive(ret: &str, request_uri: &str) -> (u16, String) {
+    let ret = ret.trim();
+    // 尝试解析 "<code> <url>" 格式
+    if let Some(space) = ret.find(' ') {
+        let code_str = &ret[..space];
+        let url = ret[space + 1..].trim()
+            .replace("$request_uri", request_uri)
+            .replace("$uri", request_uri.split('?').next().unwrap_or(request_uri));
+        if let Ok(code) = code_str.parse::<u16>() {
+            return (code, url);
+        }
+    }
+    // 纯 URL，默认 301
+    let url = ret
+        .replace("$request_uri", request_uri)
+        .replace("$uri", request_uri.split('?').next().unwrap_or(request_uri));
+    (301, url)
 }
 
 /// 构造重定向响应

@@ -41,9 +41,18 @@ error_log = "/var/log/sweety/example_error.log"
 
 # TLS 配置
 [sites.tls]
-# 使用 ACME 自动申请证书
+# 使用 ACME 自动申请证书（TLS-ALPN-01，无需开放 80 端口）
 acme = true
 acme_email = "admin@example.com"
+# 证书提供商（默认 letsencrypt）：
+#   letsencrypt         — Let's Encrypt 生产环境（90 天，最流行）
+#   letsencrypt_staging — Let's Encrypt 测试环境（不消耗配额，证书不受信任）
+#   zerossl             — ZeroSSL（90 天，可登录管理面板）
+#   buypass             — Buypass / LiteSSL（180 天，挪威 CA）
+#   https://...         — 自定义 ACME 目录 URL
+acme_provider = "letsencrypt"
+# 到期前多少天自动续期（默认 30 天）
+acme_renew_days_before = 30
 # 或手动指定证书（与 acme = true 二选一）
 # cert = "/etc/ssl/example.com.crt"
 # key  = "/etc/ssl/example.com.key"

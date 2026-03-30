@@ -102,6 +102,20 @@ async fn watch_loop(
 
 /// 对比新旧配置，只更新有变化的站点
 fn apply_diff(old: &AppConfig, new: &AppConfig, ctx: &HotReloadContext) {
+    // 检测端口变更：端口绑定在进程启动时完成，运行时无法热更新（与 Nginx reload 行为一致）
+    let old_http: HashSet<u16> = old.sites.iter().flat_map(|s| s.listen.iter().copied()).collect();
+    let new_http: HashSet<u16> = new.sites.iter().flat_map(|s| s.listen.iter().copied()).collect();
+    let old_tls: HashSet<u16> = old.sites.iter().flat_map(|s| s.listen_tls.iter().copied()).collect();
+    let new_tls: HashSet<u16> = new.sites.iter().flat_map(|s| s.listen_tls.iter().copied()).collect();
+    let added_ports: Vec<u16> = new_http.difference(&old_http).chain(new_tls.difference(&old_tls)).copied().collect();
+    let removed_ports: Vec<u16> = old_http.difference(&new_http).chain(old_tls.difference(&new_tls)).copied().collect();
+    if !added_ports.is_empty() || !removed_ports.is_empty() {
+        tracing::warn!(
+            "热重载: 检测到端口变更（新增: {:?}，删除: {:?}）——端口绑定需重启服务器生效，其他配置已热更新",
+            added_ports, removed_ports
+        );
+    }
+
     let old_map: HashMap<&str, &SiteConfig> =
         old.sites.iter().map(|s| (s.name.as_str(), s)).collect();
     let new_map: HashMap<&str, &SiteConfig> =
@@ -234,6 +248,12 @@ mod tests {
                 proxy_cookie_domain: None,
                 proxy_redirect_from: None,
                 proxy_redirect_to: None,
+                proxy_set_headers: vec![],
+                add_headers: vec![],
+                cache_rules: vec![],
+                return_url: None,
+                try_files: vec![],
+                sub_filter: vec![],
             }],
             rewrites: vec![],
             rate_limit: None,
@@ -242,6 +262,9 @@ mod tests {
             gzip: None,
             gzip_comp_level: None,
             websocket: true,
+            force_https: false,
+            error_pages: std::collections::HashMap::new(),
+            proxy_cache: None,
         };
         let mut site2 = site.clone();
         assert!(!site_changed(&site, &site2));

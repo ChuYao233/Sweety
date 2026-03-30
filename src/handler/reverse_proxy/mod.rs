@@ -22,6 +22,7 @@ use xitca_web::{
 
 use crate::config::model::LocationConfig;
 use crate::dispatcher::vhost::SiteInfo;
+use crate::middleware::proxy_cache::{CacheKey, ProxyCache};
 use crate::server::http::AppState;
 
 pub use lb::{health_check_task, NodeState, UpstreamPool, UpstreamRegistry};
@@ -62,7 +63,9 @@ pub async fn handle_xitca(
 
     // ── 过滤并收集请求头──────────────────────────────
     // WebSocket 升级请求需要保留 Upgrade/Sec-WebSocket-* 头，否则上游不能完成握手
-    let client_headers: Vec<(String, String)> = ctx.req().headers()
+    let client_ip_str_ref = client_ip_str.as_str();
+    let scheme_str = ctx.req().uri().scheme_str().unwrap_or("http");
+    let mut client_headers: Vec<(String, String)> = ctx.req().headers()
         .iter()
         .filter_map(|(k, v)| {
             let name = k.as_str().to_lowercase();
@@ -75,6 +78,19 @@ pub async fn handle_xitca(
             v.to_str().ok().map(|val| (k.as_str().to_string(), val.to_string()))
         })
         .collect();
+
+    // 应用 proxy_set_headers：重写指定请求头（支持 $remote_addr/$host/$scheme/$request_uri 变量）
+    for h in &location.proxy_set_headers {
+        let val = h.value
+            .replace("$remote_addr", client_ip_str_ref)
+            .replace("$host", &upstream_host)
+            .replace("$scheme", scheme_str)
+            .replace("$request_uri", &path);
+        // 删除同名旧头，再插入（高效覆盖）
+        let lower = h.name.to_lowercase();
+        client_headers.retain(|(k, _)| k.to_lowercase() != lower);
+        client_headers.push((h.name.clone(), val));
+    }
 
     // ── 检测 WebSocket 升级请求（H1 + H2 extended CONNECT 两种方式）──────
     // H1：Upgrade: websocket
@@ -117,12 +133,50 @@ pub async fn handle_xitca(
     let proxy_cookie_domain  = location.proxy_cookie_domain.clone();
     let proxy_redirect_from  = location.proxy_redirect_from.clone();
     let proxy_redirect_to    = location.proxy_redirect_to.clone();
+    let add_headers          = location.add_headers.clone();
+    let cache_rules          = location.cache_rules.clone();
+    let sub_filter           = location.sub_filter.clone();
 
-    // ── 转发请求 ───────────────────────────────
+    // ── proxy_cache 查询（读缓存，O(1) 内存匹配） ─────────────────────
+    let cache_key = CacheKey::new(&method, &upstream_host, &path);
+    let proxy_cache: Option<std::sync::Arc<ProxyCache>> = ctx.state()
+        .proxy_caches
+        .get(&site.name)
+        .cloned();
+
+    if let Some(ref cache) = proxy_cache {
+        // 过滤请求头列表用于 bypass 判断
+        let req_headers_for_cache: Vec<(String, String)> = ctx.req().headers().iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
+            .collect();
+        if cache.should_lookup(&method, &req_headers_for_cache) {
+            if let Some(entry) = cache.get(&cache_key) {
+                // 缓存命中，直接构造响应返回
+                use xitca_web::body::ResponseBody;
+                use xitca_web::http::{StatusCode, WebResponse};
+                let mut resp = WebResponse::new(ResponseBody::from(entry.body));
+                *resp.status_mut() = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK);
+                use xitca_web::http::header::{HeaderName, HeaderValue};
+                for (k, v) in &entry.headers {
+                    if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
+                        resp.headers_mut().insert(name, val);
+                    }
+                }
+                // X-Cache: HIT 头标识缓存命中（与 Nginx 行为一致）
+                resp.headers_mut().insert(
+                    HeaderName::from_static("x-cache"),
+                    HeaderValue::from_static("HIT"),
+                );
+                return resp;
+            }
+        }
+    }
+
+    // ── 转发请求 ───────────────────────────────────────────
     node.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // WS/WSS 请求走专用的零拷贝反代路径
-    let resp = if is_ws {
+    let mut resp = if is_ws {
         ws_proxy::handle_ws_proxy(
             ctx, &node.addr, node.tls, &node.tls_sni, node.tls_insecure,
             &client_headers, &client_ip_str, &upstream_host, &path,
@@ -131,6 +185,8 @@ pub async fn handle_xitca(
             is_ws_h2,
         ).await
     } else {
+        // 将 proxy_cache 引用传入 conn 层，在有完整 body bytes 时导入缓存
+        let cache_ref = proxy_cache.as_ref().map(|c| (c, &cache_key));
         let result = conn::forward_request(
             &ctx.state().conn_pool,
             &node.addr, &method, &path, &upstream_host,
@@ -139,6 +195,8 @@ pub async fn handle_xitca(
             &request_body,
             strip_cookie_secure, proxy_cookie_domain.as_deref(),
             proxy_redirect_from.as_deref(), proxy_redirect_to.as_deref(),
+            &sub_filter,
+            cache_ref,
         ).await;
 
         match result {
@@ -155,5 +213,60 @@ pub async fn handle_xitca(
     };
 
     node.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+    // 缓存写入已在 conn::forward_request 里完成（在 body 完整时导入）
+    // 这里只需设置 X-Cache: MISS 头
+    if proxy_cache.is_some() {
+        use xitca_web::http::header::{HeaderName, HeaderValue};
+        resp.headers_mut().insert(
+            HeaderName::from_static("x-cache"),
+            HeaderValue::from_static("MISS"),
+        );
+    }
+
+    // apply_extra_headers：向客户端响应注入自定义头（等价 Nginx add_header）
+    apply_extra_headers(&mut resp, &add_headers, &cache_rules, &path, client_ip_str_ref, scheme_str);
     resp
+}
+
+/// 应用 add_headers 和 cache_rules 到响应
+///
+/// - `add_headers`：直接向响应头插入自定义头
+/// - `cache_rules`：按正则匹配请求路径，匹配则覆盖 Cache-Control
+fn apply_extra_headers(
+    resp: &mut xitca_web::http::WebResponse,
+    add_headers: &[crate::config::model::HeaderOverride],
+    cache_rules: &[crate::config::model::CacheRule],
+    path: &str,
+    remote_addr: &str,
+    scheme: &str,
+) {
+    use xitca_web::http::header::{HeaderName, HeaderValue, CACHE_CONTROL};
+
+    // 计算 cache_rules 匹配（只对成功响应）
+    if resp.status().is_success() {
+        for rule in cache_rules {
+            if let Ok(re) = regex::Regex::new(&rule.pattern) {
+                if re.is_match(path) {
+                    if let Ok(v) = HeaderValue::from_str(&rule.cache_control) {
+                        resp.headers_mut().insert(CACHE_CONTROL, v);
+                    }
+                    break; // 第一条匹配的规则生效
+                }
+            }
+        }
+    }
+
+    // 注入 add_headers
+    for h in add_headers {
+        let val = h.value
+            .replace("$remote_addr", remote_addr)
+            .replace("$scheme", scheme);
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(h.name.as_bytes()),
+            HeaderValue::from_str(&val),
+        ) {
+            resp.headers_mut().insert(name, val);
+        }
+    }
 }

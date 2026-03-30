@@ -36,6 +36,14 @@ pub struct SiteInfo {
     pub gzip: Option<bool>,
     /// 站点级 gzip 压缩等级覆盖
     pub gzip_comp_level: Option<u32>,
+    /// 是否强制 HTTP 跳转到 HTTPS
+    pub force_https: bool,
+    /// 站点 TLS 端口列表（用于构造跳转目标 URL）
+    pub listen_tls: Vec<u16>,
+    /// 自定义错误页（状态码 → 文件路径）
+    pub error_pages: std::collections::HashMap<u16, String>,
+    /// 反代响应缓存配置
+    pub proxy_cache: Option<crate::config::model::ProxyCacheConfig>,
 }
 
 impl SiteInfo {
@@ -59,6 +67,10 @@ impl SiteInfo {
             websocket: cfg.websocket,
             gzip: cfg.gzip,
             gzip_comp_level: cfg.gzip_comp_level,
+            force_https: cfg.force_https && !cfg.listen_tls.is_empty(),
+            listen_tls: cfg.listen_tls.clone(),
+            error_pages: cfg.error_pages.clone(),
+            proxy_cache: cfg.proxy_cache.clone(),
         }
     }
 }
@@ -241,6 +253,12 @@ mod tests {
                 proxy_cookie_domain: None,
                 proxy_redirect_from: None,
                 proxy_redirect_to: None,
+                proxy_set_headers: vec![],
+                add_headers: vec![],
+                cache_rules: vec![],
+                return_url: None,
+                try_files: vec![],
+                sub_filter: vec![],
             }],
             rewrites: vec![],
             rate_limit: None,
@@ -249,6 +267,9 @@ mod tests {
             gzip: None,
             gzip_comp_level: None,
             websocket: true,
+            force_https: false,
+            error_pages: std::collections::HashMap::new(),
+            proxy_cache: None,
         }
     }
 

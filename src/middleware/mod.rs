@@ -5,5 +5,6 @@ pub mod access_log;
 pub mod cache;
 pub mod error_log;
 pub mod metrics;
+pub mod proxy_cache;
 pub mod rate_limit;
 pub mod security;

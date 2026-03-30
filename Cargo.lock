@@ -2231,6 +2231,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "webpki-roots 0.26.11",
+ "x509-parser",
  "xitca-io 0.5.1",
  "xitca-web",
 ]

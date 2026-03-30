@@ -71,10 +71,24 @@ pub async fn handle_xitca(
         file_path
     };
 
-    // 文件不存在
-    if !file_path.is_file() {
-        return make_error(StatusCode::NOT_FOUND, "Not Found");
-    }
+    // 文件不存在时应用 try_files（等价 Nginx try_files $uri $uri/ /index.html）
+    let file_path = if !file_path.is_file() {
+        if !location.try_files.is_empty() {
+            match try_files_resolve(&root, &path, &location.try_files, &site.index).await {
+                TryFilesResult::File(p) => p,
+                TryFilesResult::Code(code) => {
+                    return make_error(StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND), "");
+                }
+                TryFilesResult::NotFound => {
+                    return make_error(StatusCode::NOT_FOUND, "Not Found");
+                }
+            }
+        } else {
+            return make_error(StatusCode::NOT_FOUND, "Not Found");
+        }
+    } else {
+        file_path
+    };
 
     // 读取文件元数据（用于 ETag 和 Last-Modified）
     let meta = match tokio::fs::metadata(&file_path).await {
@@ -296,6 +310,71 @@ fn set_file_headers(
     if let Ok(v) = HeaderValue::from_str(cc) {
         headers.insert(CACHE_CONTROL, v);
     }
+}
+
+/// try_files 解析结果
+pub enum TryFilesResult {
+    /// 找到可用文件
+    File(PathBuf),
+    /// 返回指定错误码（如 =404）
+    Code(u16),
+    /// 所有路径均不存在
+    NotFound,
+}
+
+/// 按 try_files 列表依次尝试路径（等价 Nginx try_files $uri $uri/ /fallback.html =404）
+///
+/// 支持的条目格式：
+/// - `$uri`      → 请求路径对应的文件
+/// - `$uri/`     → 请求路径对应的目录（查找 index 文件）
+/// - `/path`     → 固定路径的文件
+/// - `=<code>`   → 返回指定 HTTP 状态码（必须是最后一项）
+pub async fn try_files_resolve(
+    root: &Path,
+    request_path: &str,
+    try_files: &[String],
+    index_files: &[String],
+) -> TryFilesResult {
+    let uri = request_path.split('?').next().unwrap_or(request_path);
+
+    for entry in try_files {
+        let entry = entry.trim();
+
+        // =<code>：返回状态码
+        if let Some(code_str) = entry.strip_prefix('=') {
+            if let Ok(code) = code_str.parse::<u16>() {
+                return TryFilesResult::Code(code);
+            }
+            continue;
+        }
+
+        // 展开变量
+        let expanded = entry
+            .replace("$uri", uri)
+            .replace("$request_uri", request_path);
+
+        if expanded.ends_with('/') {
+            // 目录模式：查找 index 文件
+            let dir_path = match resolve_safe_path(root, expanded.trim_end_matches('/')) {
+                Some(p) => p,
+                None => continue,
+            };
+            if let Some(idx) = find_index(&dir_path, index_files).await {
+                return TryFilesResult::File(idx);
+            }
+        } else {
+            // 文件模式
+            let file_path = match resolve_safe_path(root, &expanded) {
+                Some(p) => p,
+                None => continue,
+            };
+            if file_path.is_file() {
+                return TryFilesResult::File(file_path);
+            }
+        }
+    }
+
+    TryFilesResult::NotFound
 }
 
 /// 在目录中查找第一个存在的默认文档

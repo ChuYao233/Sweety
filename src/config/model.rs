@@ -189,6 +189,19 @@ pub struct SiteConfig {
     /// 默认 true，设为 false 可明确禁止升级 WebSocket
     #[serde(default = "default_true")]
     pub websocket: bool,
+
+    /// 是否强制 HTTP 跳转到 HTTPS（仅当站点配置了 listen_tls 时生效）
+    #[serde(default)]
+    pub force_https: bool,
+
+    /// 自定义错误页（等价 Nginx error_page 404 /404.html）
+    /// key = HTTP 状态码，value = 静态文件路径（相对于 root）
+    #[serde(default)]
+    pub error_pages: std::collections::HashMap<u16, String>,
+
+    /// 反代响应缓存配置（等价 Nginx proxy_cache）
+    #[serde(default)]
+    pub proxy_cache: Option<ProxyCacheConfig>,
 }
 
 // ─────────────────────────────────────────────
@@ -226,6 +239,20 @@ pub struct TlsConfig {
     /// 最高 TLS 版本（"tls1.2" / "tls1.3"，默认 tls1.3）
     #[serde(default = "default_tls_max_version")]
     pub max_version: String,
+
+    /// ACME 证书到期前多少天自动续期（默认 30 天）
+    /// Let's Encrypt 证书有效期 90 天，建议不要小于 7 天
+    #[serde(default = "default_acme_renew_days")]
+    pub acme_renew_days_before: u64,
+
+    /// ACME 证书提供商
+    /// - "letsencrypt"（默认）：Let's Encrypt 生产环境
+    /// - "letsencrypt_staging"：Let's Encrypt 测试环境（不稏耗配额，证书不受信任）
+    /// - "zerossl"：ZeroSSL（免费 90 天证书）
+    /// - "buypass"：Buypass / LiteSSL（免费，180 天证书）
+    /// - 自定义 URL：任何其他支持 ACME 协议的 CA
+    #[serde(default = "default_acme_provider")]
+    pub acme_provider: String,
 }
 
 /// 证书/私钥文件对（用于多证书配置）
@@ -355,6 +382,91 @@ pub struct LocationConfig {
     /// proxy_redirect 的目标地址（客户端访问的 URL 前缀）
     #[serde(default)]
     pub proxy_redirect_to: Option<String>,
+
+    /// 自定义转发请求头（覆盖或新增）
+    /// 等价 Nginx proxy_set_header
+    /// 示例: [{name="X-Custom", value="foo"}]
+    #[serde(default)]
+    pub proxy_set_headers: Vec<HeaderOverride>,
+
+    /// 向客户端响应中注入自定义头
+    /// 等价 Nginx add_header
+    #[serde(default)]
+    pub add_headers: Vec<HeaderOverride>,
+
+    /// 按扩展名正则设置缓存规则（等价 Nginx if $uri ~* "..." { expires ... }）
+    #[serde(default)]
+    pub cache_rules: Vec<CacheRule>,
+
+    /// 直接返回（带 URL 的 return 指令，等价 Nginx return 301 https://...）
+    /// 格式: "301 https://example.com$request_uri" 或 "https://example.com"
+    #[serde(default)]
+    pub return_url: Option<String>,
+
+    /// 尝试文件列表（等价 Nginx try_files $uri $uri/ /index.html）
+    /// 支持: $uri、$uri/、/fallback.html、=404 等
+    #[serde(default)]
+    pub try_files: Vec<String>,
+
+    /// 响应体内容替换（等价 Nginx sub_filter）
+    /// 仅对文本类 Content-Type（html/json/js/text）生效
+    #[serde(default)]
+    pub sub_filter: Vec<SubFilter>,
+}
+
+/// 请求头/响应头覆盖配置
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HeaderOverride {
+    /// 头名称
+    pub name: String,
+    /// 头值（支持变量: $remote_addr, $host, $scheme, $request_uri）
+    pub value: String,
+}
+
+/// 按扩展名缓存规则
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheRule {
+    /// 匹配扩展名的正则表达式（如 ".\\.(css|js|png)$"）
+    pub pattern: String,
+    /// Cache-Control 头值（如 "public, max-age=2592000"）
+    pub cache_control: String,
+}
+
+/// 响应体内容替换规则（等价 Nginx sub_filter）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubFilter {
+    /// 被替换的字符串或正则（以 `~` 开头表示正则）
+    pub pattern: String,
+    /// 替换内容（支持 $1 $2 捕获组）
+    pub replacement: String,
+}
+
+/// 反代响应缓存配置（等价 Nginx proxy_cache）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProxyCacheConfig {
+    /// 磁盘缓存目录（不设则只用内存缓存）
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+
+    /// 内存缓存最大条数（默认 1000）
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+
+    /// 缓存有效期（秒，默认 60）
+    #[serde(default = "default_cache_ttl")]
+    pub ttl: u64,
+
+    /// 可缓存的 HTTP 状态码（默认 [200, 301, 302]）
+    #[serde(default = "default_cache_statuses")]
+    pub cacheable_statuses: Vec<u16>,
+
+    /// 可缓存的 HTTP 方法（默认 ["GET", "HEAD"]）
+    #[serde(default = "default_cache_methods")]
+    pub cacheable_methods: Vec<String>,
+
+    /// 跳过缓存的请求头（如 Authorization 头存在时不缓存）
+    #[serde(default = "default_no_cache_headers")]
+    pub bypass_headers: Vec<String>,
 }
 
 /// 请求处理器类型
@@ -567,6 +679,13 @@ fn default_gzip_min_length() -> usize { 1 }
 fn default_gzip_comp_level() -> u32 { 5 }
 fn default_tls_min_version() -> String { "tls1.2".into() }
 fn default_tls_max_version() -> String { "tls1.3".into() }
+fn default_acme_renew_days() -> u64 { 30 }
+fn default_acme_provider() -> String { "letsencrypt".into() }
+fn default_cache_max_entries() -> usize { 1000 }
+fn default_cache_ttl() -> u64 { 60 }
+fn default_cache_statuses() -> Vec<u16> { vec![200, 301, 302] }
+fn default_cache_methods() -> Vec<String> { vec!["GET".into(), "HEAD".into()] }
+fn default_no_cache_headers() -> Vec<String> { vec!["Authorization".into(), "Cookie".into()] }
 
 // ─────────────────────────────────────────────
 // 单元测试

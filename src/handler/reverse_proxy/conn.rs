@@ -15,6 +15,7 @@ use xitca_web::{
 use super::pool::{ConnPool, PooledConn};
 use super::response::{apply_response_headers, parse_status_code};
 use super::tls_client::tls_connect;
+use crate::middleware::proxy_cache::{CacheKey, ProxyCache};
 
 /// 向上游转发请求，优先复用连接池里的 idle 连接
 #[allow(clippy::too_many_arguments)]
@@ -34,6 +35,8 @@ pub async fn forward_request(
     proxy_cookie_domain: Option<&str>,
     proxy_redirect_from: Option<&str>,
     proxy_redirect_to: Option<&str>,
+    sub_filter: &[crate::config::model::SubFilter],
+    proxy_cache: Option<(&std::sync::Arc<ProxyCache>, &CacheKey)>,
 ) -> Result<WebResponse> {
     debug!("转发 {} {} → {} (tls={}, body={}B)",
         method, path, upstream_addr, use_tls, body.len());
@@ -58,7 +61,8 @@ pub async fn forward_request(
         };
 
         match send_recv_pooled(conn, method, path, host, extra_headers, client_ip, body,
-            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to).await
+            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
+            sub_filter, proxy_cache).await
         {
             Ok((resp, maybe_conn)) => {
                 // 如果连接可复用，归还到池
@@ -114,6 +118,8 @@ async fn send_recv_pooled(
     proxy_cookie_domain: Option<&str>,
     proxy_redirect_from: Option<&str>,
     proxy_redirect_to: Option<&str>,
+    sub_filter: &[crate::config::model::SubFilter],
+    proxy_cache: Option<(&std::sync::Arc<ProxyCache>, &CacheKey)>,
 ) -> Result<(WebResponse, Option<PooledConn>)> {
     // ── 构造请求头（keep-alive）────────────────────────────────────────────
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
@@ -200,8 +206,23 @@ async fn send_recv_pooled(
     drop(buf);
     let maybe_conn = if !resp_conn_close { Some(conn) } else { None };
 
-    // ── URL 替换（仅文本类型）────────────────────────────────────────────
-    let final_body = rewrite_body_urls(body_bytes, &response_headers, proxy_redirect_from, proxy_redirect_to);
+    // ── URL 替换（仅文本类型）────────────────────────────────────
+    let body_after_url = rewrite_body_urls(body_bytes, &response_headers, proxy_redirect_from, proxy_redirect_to);
+    // ── sub_filter 替换（在 URL 替换之后）───────────────────────────
+    let final_body = super::response::apply_sub_filter(body_after_url, &response_headers, sub_filter);
+
+    // ── proxy_cache 写入（在 body 完整且未被消耗之前）────────────
+    if let Some((cache, cache_key)) = proxy_cache {
+        if cache.is_cacheable(status_code, &response_headers) {
+            let body_clone = bytes::Bytes::from(final_body.clone());
+            let headers_clone = response_headers.clone();
+            let cache_clone = cache.clone();
+            let key_clone = cache_key.clone();
+            tokio::spawn(async move {
+                cache_clone.set(key_clone, status_code, headers_clone, body_clone);
+            });
+        }
+    }
 
     let body_len = final_body.len();
     let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);

@@ -9,13 +9,15 @@
 //! 生命周期：随 `AppState` Arc 共享，进程级单例。
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
-use std::collections::HashMap;
+use dashmap::DashMap;
 
 /// FastCGI 连接池（进程级，线程安全）
+///
+/// 用 DashMap 替代 Mutex<HashMap>：DashMap 内部分片锁，
+/// 高并发下几乎无竞争，避免在 tokio async worker 内阻塞。
 pub struct FcgiPool {
     /// key = socket 地址（Unix socket 路径 或 "host:port"）
-    inner: Mutex<HashMap<String, VecDeque<FcgiConn>>>,
+    inner: DashMap<String, VecDeque<FcgiConn>>,
     /// 每个地址最多保留的 idle 连接数
     max_idle: usize,
     /// 连接超时（秒）
@@ -35,7 +37,7 @@ impl FcgiPool {
     /// 创建新连接池
     pub fn new(max_idle: usize, connect_timeout_secs: u64, read_timeout_secs: u64) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: DashMap::new(),
             max_idle,
             connect_timeout_secs,
             read_timeout_secs,
@@ -43,19 +45,15 @@ impl FcgiPool {
     }
 
     /// 从池中取出 idle 连接，没有则新建
-    ///
-    /// 返回连接和"是否是复用的 idle 连接"标志
+    /// DashMap 分片锁：不同地址的请求并行无竞争。
     pub async fn acquire(&self, addr: &str, is_unix: bool) -> anyhow::Result<FcgiConn> {
-        // 先尝试取 idle
-        {
-            let mut guard = self.inner.lock().unwrap();
-            if let Some(queue) = guard.get_mut(addr) {
-                if let Some(conn) = queue.pop_front() {
-                    return Ok(conn);
-                }
+        // 先尝试取 idle（分片锁，不阻塞 worker）
+        if let Some(mut queue) = self.inner.get_mut(addr) {
+            if let Some(conn) = queue.pop_front() {
+                return Ok(conn);
             }
         }
-        // 新建连接（带超时）
+        // 新建连接（异步，锁已释放）
         let timeout = std::time::Duration::from_secs(self.connect_timeout_secs);
         let conn = tokio::time::timeout(timeout, new_conn(addr, is_unix)).await
             .map_err(|_| anyhow::anyhow!("FastCGI 连接超时 {}", addr))??;
@@ -64,8 +62,7 @@ impl FcgiPool {
 
     /// 归还连接到 idle 队列（超出 max_idle 则 drop）
     pub fn release(&self, addr: &str, conn: FcgiConn) {
-        let mut guard = self.inner.lock().unwrap();
-        let queue = guard.entry(addr.to_string()).or_insert_with(VecDeque::new);
+        let mut queue = self.inner.entry(addr.to_string()).or_insert_with(VecDeque::new);
         if queue.len() < self.max_idle {
             queue.push_back(conn);
         }
@@ -74,8 +71,7 @@ impl FcgiPool {
 
     /// 清空指定地址的所有 idle 连接（地址变更时调用）
     pub fn evict(&self, addr: &str) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.remove(addr);
+        self.inner.remove(addr);
     }
 }
 

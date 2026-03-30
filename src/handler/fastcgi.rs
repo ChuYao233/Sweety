@@ -255,10 +255,6 @@ pub async fn handle_xitca(
     }
 
     // ── 发送 FastCGI 请求（连接池 + 超时控制）─────────────────────────────
-    let params_ref: Vec<(&str, &str)> = params.iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-
     let pool      = ctx.state().fcgi_pool.clone();
     let read_tmo  = std::time::Duration::from_secs(pool.read_timeout_secs);
     let (addr_str, is_unix) = match &addr_mode {
@@ -279,7 +275,7 @@ pub async fn handle_xitca(
         // 带超时发送请求并读取响应头（body 用 Stream 流式传输）
         let header_result = tokio::time::timeout(
             read_tmo,
-            fcgi_send_and_read_headers(conn, &params_ref, &req_body),
+            fcgi_send_and_read_headers(conn, &params, &req_body),
         ).await;
 
         match header_result {
@@ -362,7 +358,7 @@ struct FcgiParsedHeaders {
 /// 用 macro 消除 TCP/Unix 分支重复，不使用 trait object
 async fn fcgi_send_and_read_headers(
     conn: crate::handler::fastcgi_pool::FcgiConn,
-    params: &[(&str, &str)],
+    params: &[(String, String)],
     stdin_body: &[u8],
 ) -> anyhow::Result<FcgiParsedHeaders> {
     use crate::handler::fastcgi_pool::FcgiConn;

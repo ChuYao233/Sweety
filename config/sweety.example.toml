@@ -79,7 +79,6 @@ handler = "static"
 
 # ─────────────────────────────────────────────
 # 站点 2：WordPress / PHP 站点（生产级配置）
-# 等价宝塔面板 Nginx PHP 站点模板
 # ─────────────────────────────────────────────
 [[sites]]
 name        = "wordpress"
@@ -116,7 +115,7 @@ pool_size    = 32   # 连接池 idle 连接数
 connect_timeout = 5
 read_timeout = 60   # WordPress 后台操作可能耗时较长
 
-# ── Location 1：静态资源强缓存（等价宝塔 Nginx 静态文件规则）──────────────
+# ── Location 1：静态资源强缓存 ────────────────────────────────────────────
 [[sites.locations]]
 path          = "^~ /wp-content/uploads/"
 handler       = "static"
@@ -132,7 +131,7 @@ path          = "^~ /wp-includes/"
 handler       = "static"
 cache_control = "public, max-age=604800"
 
-# ── Location 2：拒绝访问敏感文件（等价宝塔安全规则）────────────────────────
+# ── Location 2：拒绝访问敏感文件 ─────────────────────────────────────────────
 [[sites.locations]]
 path        = "~ /\\."
 handler     = "static"
@@ -154,7 +153,7 @@ return_code = 403
 path    = "~ \\.php$"
 handler = "fastcgi"
 
-# ── Location 4：WordPress 伪静态（等价宝塔 try_files 规则）─────────────────
+# ── Location 4：WordPress 伪静态（等价 try_files 规则）─────────────────
 # 访问 /wp-admin/ 等非 .php 路径时：
 #   1. 先尝试静态文件（$uri）
 #   2. 再尝试目录（$uri/）
@@ -370,3 +369,178 @@ cache_control = "public, max-age=2592000, immutable"
 [[sites.locations.cache_rules]]
 pattern       = "\\.html$"
 cache_control = "no-cache"
+
+# 多 PHP 版本示例
+# 不同站点使用不同 PHP 版本，互不干扰
+
+# ── 站点 A：WordPress（PHP 8.3）─────────────────────────────────────────────
+[[sites]]
+name        = "wordpress-php83"
+server_name = ["blog.example.com"]
+listen      = [80]
+listen_tls  = [443]
+root        = "/var/www/wordpress"
+index       = ["index.php", "index.html"]
+access_log  = "/var/log/sweety/wordpress_access.log"
+force_https = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+
+[sites.error_pages]
+404 = "/404.html"
+
+# PHP 8.3 socket
+[sites.fastcgi]
+socket          = "/var/run/php/php8.3-fpm.sock"
+pool_size       = 32
+connect_timeout = 5
+read_timeout    = 120   # WordPress 后台导入/更新可能耗时
+
+# WordPress 静态资源强缓存
+[[sites.locations]]
+path          = "^~ /wp-content/uploads/"
+handler       = "static"
+cache_control = "public, max-age=2592000"
+
+[[sites.locations]]
+path          = "^~ /wp-content/"
+handler       = "static"
+cache_control = "public, max-age=604800"
+
+[[sites.locations]]
+path          = "^~ /wp-includes/"
+handler       = "static"
+cache_control = "public, max-age=604800"
+
+# 禁止访问隐藏文件和 xmlrpc.php
+[[sites.locations]]
+path        = "~ /\\."
+handler     = "static"
+return_code = 403
+
+[[sites.locations]]
+path        = "= /xmlrpc.php"
+handler     = "static"
+return_code = 403
+
+# .php 文件由 PHP 8.3 执行
+[[sites.locations]]
+path    = "~ \\.php$"
+handler = "fastcgi"
+
+# WordPress 伪静态
+[[sites.locations]]
+path      = "/"
+handler   = "fastcgi"
+try_files = ["$uri", "$uri/", "/index.php"]
+
+# 防爆破 wp-login.php
+[sites.rate_limit]
+[[sites.rate_limit.rules]]
+dimension    = "path"
+path_pattern = "^/wp-login\\.php"
+rate         = 5
+burst        = 10
+
+# ── 站点 B：旧系统（PHP 7.4）────────────────────────────────────────────────
+[[sites]]
+name        = "legacy-php74"
+server_name = ["old.example.com"]
+listen      = [80]
+listen_tls  = [443]
+root        = "/var/www/legacy"
+index       = ["index.php", "index.html"]
+access_log  = "/var/log/sweety/legacy_access.log"
+force_https = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+
+# PHP 7.4 socket（旧系统使用低版本 PHP，与其他站点完全隔离）
+[sites.fastcgi]
+socket          = "/var/run/php/php7.4-fpm.sock"
+pool_size       = 16
+connect_timeout = 5
+read_timeout    = 60
+
+[sites.error_pages]
+404 = "/404.html"
+500 = "/500.html"
+
+[[sites.locations]]
+path    = "~ \\.php$"
+handler = "fastcgi"
+
+[[sites.locations]]
+path      = "/"
+handler   = "fastcgi"
+try_files = ["$uri", "$uri/", "/index.php"]
+
+# ── 站点 C：Laravel（PHP 8.1，TCP 模式，容器化部署）─────────────────────────
+[[sites]]
+name        = "laravel-php81"
+server_name = ["app.example.com"]
+listen      = [80]
+listen_tls  = [443]
+root        = "/var/www/laravel/public"
+index       = ["index.php"]
+access_log  = "/var/log/sweety/laravel_access.log"
+force_https = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+
+# PHP 8.1，TCP 模式（Docker 容器里 PHP-FPM 监听 9001 端口，与其他版本错开）
+# PHP 8.3 用 9000，PHP 8.1 用 9001，PHP 7.4 用 9002
+[sites.fastcgi]
+host            = "127.0.0.1"
+port            = 9001
+pool_size       = 32
+connect_timeout = 5
+read_timeout    = 60
+
+[sites.error_pages]
+404 = "/404.html"
+500 = "/500.html"
+
+# Laravel 只需要一条伪静态规则
+# try_files 找不到文件就 fallback 到 index.php（Laravel 路由入口）
+[[sites.locations]]
+path      = "/"
+handler   = "fastcgi"
+try_files = ["$uri", "$uri/", "/index.php"]
+
+# ── 站点 D：同域名不同路径用不同 PHP 版本（进阶）────────────────────────────
+# /shop/ 路径用 PHP 8.3（新商城），其他路径用 PHP 8.1（主站）
+# 通过配置两个独立站点 + 反代实现是最干净的方案
+# 如果必须同一站点，可用两个 fastcgi location + 不同 root 的方式：
+[[sites]]
+name        = "mixed-php"
+server_name = ["mixed.example.com"]
+listen      = [80]
+listen_tls  = [443]
+root        = "/var/www/main/public"
+index       = ["index.php"]
+access_log  = "/var/log/sweety/mixed_access.log"
+force_https = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+
+# 默认用 PHP 8.1
+[sites.fastcgi]
+host     = "127.0.0.1"
+port     = 9001   # PHP 8.1
+
+# /shop/ 目录用 PHP 8.3（覆盖 root + 使用独立 fastcgi socket）
+# 注意：当前 Sweety 的 fastcgi 配置是站点级别的，
+# 若需要 location 级别不同 PHP-FPM，建议拆分为两个站点 + 反代
+[[sites.locations]]
+path      = "/"
+handler   = "fastcgi"
+try_files = ["$uri", "$uri/", "/index.php"]

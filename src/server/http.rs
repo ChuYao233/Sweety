@@ -237,6 +237,20 @@ impl SweetyServer {
             });
         }
 
+        // 启动文件缓存 notify 监听：文件修改时自动淘汰内存缓存，无需每请求 stat
+        {
+            let roots: Vec<std::path::PathBuf> = cfg.sites.iter()
+                .filter_map(|s| s.root.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .filter(|p| p.exists())
+                .collect();
+            if let Some(watcher) = crate::handler::static_file::start_file_cache_watcher(roots) {
+                // watcher 必须保持存活，用 Box::leak 绑定到进程生命周期
+                Box::leak(Box::new(watcher));
+            }
+        }
+
         // 启动配置热重载后台线程（监听配置文件及证书目录变更，只更新变化站点，不断连）
         if let Some(config_path) = self.config_path {
             // 从 state.sni_resolvers 克隆一份 HashMap（直接解包 Arc）

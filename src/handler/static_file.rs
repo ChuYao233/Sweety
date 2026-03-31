@@ -12,6 +12,7 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tracing::debug;
@@ -61,6 +62,46 @@ static FILE_CACHE: OnceLock<DashMap<PathBuf, FileCacheEntry>> = OnceLock::new();
 fn file_cache() -> &'static DashMap<PathBuf, FileCacheEntry> {
     FILE_CACHE.get_or_init(|| DashMap::with_capacity(FILE_CACHE_MAX_ENTRIES))
 }
+
+/// 启动文件变更监听：文件修改/删除时直接淡化 FILE_CACHE 对应条目
+/// 返回 watcher 句柄，调用方需保持其生命周期与服务器相同
+pub fn start_file_cache_watcher(roots: Vec<PathBuf>) -> Option<RecommendedWatcher> {
+    if roots.is_empty() { return None; }
+
+    let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+        let Ok(event) = res else { return };
+        // 只处理文件内容变化事件（写入、创建、删除、重命名）
+        if !matches!(event.kind,
+            EventKind::Modify(_) | EventKind::Create(_)
+            | EventKind::Remove(_)
+        ) { return; }
+
+        let cache = file_cache();
+        for path in &event.paths {
+            // 直接移除命中的缓存条目，下次请求将重新从磁盘加载
+            if cache.remove(path).is_some() {
+                debug!("文件缓存已淡化: {}", path.display());
+            }
+        }
+    });
+
+    match watcher {
+        Ok(mut w) => {
+            for root in &roots {
+                if let Err(e) = w.watch(root, RecursiveMode::Recursive) {
+                    tracing::warn!("文件缓存监听启动失败 ({}): {}", root.display(), e);
+                }
+            }
+            tracing::info!("文件缓存 notify 监听已启动，共 {} 个目录", roots.len());
+            Some(w)
+        }
+        Err(e) => {
+            tracing::warn!("文件缓存 notify 初始化失败: {}，回退到定期检查模式", e);
+            None
+        }
+    }
+}
+
 
 /// 处理静态文件请求（xitca-web WebContext 版本）
 pub async fn handle_xitca(
@@ -654,13 +695,10 @@ fn resolve_safe_path_with_canon(
     }
 }
 
-/// 构造简单错误响应
-fn make_error(status: StatusCode, msg: &str) -> WebResponse {
-    let body = if msg.is_empty() {
-        crate::handler::error_page::build_default_html(status.as_u16())
-    } else {
-        msg.to_string()
-    };
+/// 构造简单错误响应（使用预构建 Bytes 缓存，零堆分配）
+#[inline(always)]
+fn make_error(status: StatusCode, _msg: &str) -> WebResponse {
+    let body = crate::handler::error_page::get_error_bytes(status.as_u16());
     let mut resp = WebResponse::new(ResponseBody::from(body));
     *resp.status_mut() = status;
     resp.headers_mut().insert(

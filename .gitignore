@@ -1,6 +1,7 @@
 # ─── Rust 编译产物 ───────────────────────────
 /target/
 **/*.rs.bk
+*.exe
 
 # ─── Cargo 锁文件（库保留，应用忽略可选）───
 # 如果是应用（binary crate）建议提交 Cargo.lock

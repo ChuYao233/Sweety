@@ -707,9 +707,7 @@ fn collect_http_ports(cfg: &AppConfig) -> Vec<u16> {
             ports.insert(p);
         }
     }
-    if ports.is_empty() {
-        ports.insert(80);
-    }
+    // 没有配置 HTTP 端口时不自动绑 80，纯 TLS 站点直接跳过 HTTP 绑定
     let mut v: Vec<u16> = ports.into_iter().collect();
     v.sort_unstable();
     v

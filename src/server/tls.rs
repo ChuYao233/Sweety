@@ -55,6 +55,9 @@ impl TlsManager {
             .with_cert_resolver(resolver.clone());
         // h2 优先：客户端支持 HTTP/2 时优先协商 h2，不支持时降级到 http/1.1
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        // TLS 1.2 session cache：缓存 10240 个 session，减少重复握手开销
+        // TLS 1.3 session tickets 由 rustls 自动处理，无需额外配置
+        cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(10240);
         Ok((cfg, resolver))
     }
 
@@ -265,12 +268,14 @@ fn load_pem_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig> {
         .with_context(|| format!("解析私钥失败: {}", key_path.display()))?;
 
     // 构建 ServerConfig，使用优先 AES-128-GCM 的 provider
-    let config = ServerConfig::builder_with_provider(make_crypto_provider())
+    let mut config = ServerConfig::builder_with_provider(make_crypto_provider())
         .with_safe_default_protocol_versions()
         .context("TLS 版本配置失败")?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("构建 Rustls ServerConfig 失败")?;
+    // TLS 1.2 session cache：缓存 10240 个 session，减少重复握手开销
+    config.session_storage = rustls::server::ServerSessionMemoryCache::new(10240);
 
     info!("TLS 证书加载成功: {}", cert_path.display());
     Ok(config)

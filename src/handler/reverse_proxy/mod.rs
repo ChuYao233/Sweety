@@ -49,6 +49,17 @@ pub async fn handle_sweety(
         ),
     };
 
+    // ── 非 WS CONNECT 早期拦截（与 Nginx 行为一致）───────────────────────
+    // Nginx 作为反向代理不支持 HTTP CONNECT 隧道，直接拒绝非 WebSocket 的 CONNECT 请求
+    // is_h2_ws() 由框架 H2 dispatcher 在接收请求时检测 h2::ext::Protocol 写入，可靠
+    {
+        let m = ctx.req().method().as_str();
+        if m.eq_ignore_ascii_case("CONNECT") && !ctx.req().body().is_h2_ws() {
+            // 纯隧道 CONNECT，Nginx 也不支持，返回 400
+            return response::proxy_error(StatusCode::BAD_REQUEST, "CONNECT tunneling not supported");
+        }
+    }
+
     // ── 负载均衡选节点 ───────────────────────────────────────
     let client_ip_str = ctx.req().body().socket_addr().ip().to_string();
     let node = match pool.pick(Some(&client_ip_str)) {
@@ -58,7 +69,11 @@ pub async fn handle_sweety(
 
     // ── 提取请求信息（用 &str 借用，避免堆分配）────────────────────────────
     let method = ctx.req().method().as_str();
-    let path   = ctx.req().uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    // H2 CONNECT（extended CONNECT / WS）的 URI 是 authority-form，path_and_query() 可能为空
+    // 此时用 uri.path()，H1 WS 的 GET 请求 path_and_query() 正常有值
+    let path   = ctx.req().uri().path_and_query().map(|p| p.as_str())
+        .filter(|p| !p.is_empty() && *p != "/")
+        .unwrap_or_else(|| ctx.req().uri().path());
     // HTTP/2 下没有 Host 头，:authority 伪头在 uri.authority() 里
     let client_host: &str = ctx.req().uri().authority()
         .map(|a| a.as_str())
@@ -69,18 +84,15 @@ pub async fn handle_sweety(
     let upstream_host: &str = upstream_host_owned.as_deref().unwrap_or(client_host);
 
     // ── 检测 WebSocket 升级请求（H1 + H2 extended CONNECT 两种方式）──────
-    // H1：Upgrade: websocket
-    // H2：method=CONNECT + h2::ext::Protocol="websocket"（RFC 8441）
-    // 必须在头过滤之前判断，否则 is_ws 变量尚未定义
-    let is_ws_h1 = ctx.req().headers()
-        .get(sweety_web::http::header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
-    let is_ws_h2 = method.eq_ignore_ascii_case("CONNECT")
-        && ctx.req().extensions()
-            .get::<h2::ext::Protocol>()
-            .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
+    // H2 WS：框架在 dispatcher 层已检测 h2::ext::Protocol，通过 RequestExt::is_h2_ws() 可靠传递
+    // H1 WS：GET + Upgrade: websocket（RFC 6455）
+    // 非 WS CONNECT（正向代理隧道）不命中，在入口已拦截返回 400
+    let is_ws_h2 = ctx.req().body().is_h2_ws();
+    let is_ws_h1 = !is_ws_h2
+        && ctx.req().headers()
+            .get(sweety_web::http::header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("websocket"))
             .unwrap_or(false);
     let is_ws = is_ws_h1 || is_ws_h2;
 

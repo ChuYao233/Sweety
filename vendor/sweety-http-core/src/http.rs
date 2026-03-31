@@ -149,6 +149,16 @@ impl Extension {
     pub(crate) fn new(addr: SocketAddr) -> Self {
         Self(Box::new(_Extension {
             addr,
+            h2_ws: false,
+            #[cfg(feature = "router")]
+            params: Default::default(),
+        }))
+    }
+
+    pub(crate) fn new_h2_ws(addr: SocketAddr) -> Self {
+        Self(Box::new(_Extension {
+            addr,
+            h2_ws: true,
             #[cfg(feature = "router")]
             params: Default::default(),
         }))
@@ -158,6 +168,8 @@ impl Extension {
 #[derive(Clone, Debug)]
 struct _Extension {
     addr: SocketAddr,
+    /// H2 extended CONNECT 且 :protocol=websocket（RFC 8441）
+    pub h2_ws: bool,
     #[cfg(feature = "router")]
     params: Params,
 }
@@ -165,6 +177,12 @@ struct _Extension {
 impl<B> RequestExt<B> {
     pub(crate) fn from_parts(body: B, ext: Extension) -> Self {
         Self { body, ext }
+    }
+
+    /// 是否为 H2 extended CONNECT WebSocket（RFC 8441）
+    #[inline]
+    pub fn is_h2_ws(&self) -> bool {
+        self.ext.0.h2_ws
     }
 
     /// retrieve remote peer's socket address.

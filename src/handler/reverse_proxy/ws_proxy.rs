@@ -21,7 +21,7 @@ use bytes::Bytes;
 use futures_util::stream::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf as TokioReadBuf};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 use sweety_web::{
     body::{RequestBody, ResponseBody},
     http::{StatusCode, WebResponse},
@@ -43,6 +43,8 @@ struct BiDirStream<R, W> {
     upstream_read:  R,
     upstream_write: W,
     client_body:    RequestBody,
+    /// 握手响应头之后同包携带的上游首帧（避免首包被吞）
+    prefetched_upstream: Option<Bytes>,
     /// 从上游读取的缓冲区（80KB BytesMut， freeze() 零拷贝转 Bytes）
     read_buf:       bytes::BytesMut,
     /// 暂存已从 client body 拿到但尚未写完上游的数据
@@ -56,13 +58,14 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    fn new(upstream_read: R, upstream_write: W, client_body: RequestBody) -> Self {
+    fn new(upstream_read: R, upstream_write: W, client_body: RequestBody, prefetched_upstream: Option<Bytes>) -> Self {
         let mut read_buf = bytes::BytesMut::with_capacity(65536);
         read_buf.resize(65536, 0);
         Self {
             upstream_read,
             upstream_write,
             client_body,
+            prefetched_upstream,
             read_buf,
             pending_write: None,
             client_done: false,
@@ -81,48 +84,52 @@ where
         let this = self.get_mut();
 
         // ── 方向 A：client → upstream ──────────────────────────────
-        // 先把上次未写完的数据继续写
         if let Some(ref data) = this.pending_write.as_ref() {
             match Pin::new(&mut this.upstream_write).poll_write(cx, data.as_ref()) {
                 Poll::Ready(Ok(n)) if n == data.len() => { this.pending_write = None; }
                 Poll::Ready(Ok(n)) => { this.pending_write = Some(data.slice(n..)); }
-                Poll::Ready(Err(_)) => { this.client_done = true; this.pending_write = None; }
-                Poll::Pending => {} // 写缓冲满，稍后继续
+                Poll::Ready(Err(e)) => { trace!("WS A方向 pending_write 写上游失败: {}", e); this.client_done = true; this.pending_write = None; }
+                Poll::Pending => {}
             }
         }
-        // 从 client body 读下一帧
         if !this.client_done && this.pending_write.is_none() {
             match Pin::new(&mut this.client_body).poll_next(cx) {
                 Poll::Ready(Some(Ok(b))) => {
-                    // 尝试立即写上游
+                    trace!("WS A方向 client→upstream {}B", b.len());
                     match Pin::new(&mut this.upstream_write).poll_write(cx, b.as_ref()) {
                         Poll::Ready(Ok(n)) if n == b.len() => {}
                         Poll::Ready(Ok(n)) => { this.pending_write = Some(b.slice(n..)); }
-                        Poll::Ready(Err(_)) => { this.client_done = true; }
+                        Poll::Ready(Err(e)) => { trace!("WS A方向写上游失败: {}", e); this.client_done = true; }
                         Poll::Pending => { this.pending_write = Some(b); }
                     }
                 }
-                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => { this.client_done = true; }
+                Poll::Ready(Some(Err(e))) => { trace!("WS A方向 client body 错误: {}", e); this.client_done = true; }
+                Poll::Ready(None) => { trace!("WS A方向 client body EOF"); this.client_done = true; }
                 Poll::Pending => {}
             }
         }
 
         // ── 方向 B：upstream → client ───────────────────────────────
-        // 读入 BytesMut 后 split_to().freeze() 零拷贝转 Bytes，与 Nginx sendfile 语义相同
+        if let Some(chunk) = this.prefetched_upstream.take() {
+            trace!("WS B方向 prefetched upstream→client {}B", chunk.len());
+            return Poll::Ready(Some(Ok(chunk)));
+        }
         this.read_buf.resize(65536, 0);
         let mut rb = TokioReadBuf::new(&mut this.read_buf);
         match Pin::new(&mut this.upstream_read).poll_read(cx, &mut rb) {
             Poll::Ready(Ok(())) => {
                 let n = rb.filled().len();
                 if n == 0 {
-                    // 上游关闭连接，结束 stream
+                    trace!("WS B方向 upstream EOF");
                     return Poll::Ready(None);
                 }
-                // freeze() 零拷贝：内部将 BytesMut 的内存所有权转移给 Bytes，不复制
+                trace!("WS B方向 upstream→client {}B", n);
                 let chunk = this.read_buf.split_to(n).freeze();
                 Poll::Ready(Some(Ok(chunk)))
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            // 上游关闭连接（含 TLS close_notify 缺失）：当 EOF，让流优雅结束
+            // 若报 Err，h2_handler 会 RST H2 stream，浏览器报 "WebSocket connection failed"
+            Poll::Ready(Err(e)) => { trace!("WS B方向 upstream 关闭: {}", e); Poll::Ready(None) }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -149,18 +156,11 @@ pub async fn handle_ws_proxy(
     proxy_redirect_to: Option<&str>,
     is_h2_ws: bool,
 ) -> WebResponse {
-    // H2 extended CONNECT：sweety-web 不支持 RFC 8441 双向流，
-    // 返回 501 让浏览器降级到 HTTP/1.1 重连，与 Nginx 行为一致
-    if is_h2_ws {
-        let mut resp = WebResponse::new(ResponseBody::empty());
-        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
-        return resp;
-    }
-
     match do_ws_proxy(
         ctx, upstream_addr, use_tls, tls_sni, tls_insecure,
         extra_headers, client_ip, upstream_host, path,
         strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
+        is_h2_ws,
     ).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -187,8 +187,9 @@ async fn do_ws_proxy(
     proxy_cookie_domain: Option<&str>,
     proxy_redirect_from: Option<&str>,
     proxy_redirect_to: Option<&str>,
+    is_h2_ws: bool,
 ) -> Result<WebResponse> {
-    debug!("WS 代理: {} (tls={})", upstream_addr, use_tls);
+    debug!("WS 代理: {} (tls={}) path={} host={}", upstream_addr, use_tls, path, upstream_host);
 
     // ── Step 1：连接上游 ──────────────────────────────────────────────────
     let tcp = tokio::time::timeout(
@@ -214,10 +215,31 @@ async fn do_ws_proxy(
     upgrade_req.push_str("X-Forwarded-For: "); upgrade_req.push_str(client_ip); upgrade_req.push_str("\r\n");
     // 对标 Nginx: proxy_http_version 1.1 + proxy_set_header Upgrade $http_upgrade
     // 必须显式加上 Upgrade + Connection，上游才能完成 WebSocket 升级握手
-    // Sec-WebSocket-Key/Version/Extensions 已通过 extra_headers 透传（mod.rs 保留了）
     let is_already_upgrade = extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("upgrade"));
     if !is_already_upgrade {
         upgrade_req.push_str("Upgrade: websocket\r\n");
+    }
+    // H2 WS（RFC 8441）客户端不发 Sec-WebSocket-Key，但上游 HTTP/1.1 WS 服务器必须有此头
+    // 若缺失则自动生成随机 key（与 Nginx 对 H2 WS 的处理方式一致）
+    let has_ws_key = extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-key"));
+    if !has_ws_key {
+        use base64::Engine as _;
+        let mut key_bytes = [0u8; 16];
+        key_bytes.iter_mut().enumerate().for_each(|(i, b)| {
+            // 用连接时间和索引生成伪随机 key（足够唯一，不需要密码学随机）
+            let t = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() >> (i % 8)) as u8;
+            *b = t ^ ((i as u32).wrapping_mul(0x9e3779b9) as u8);
+        });
+        let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
+        upgrade_req.push_str("Sec-WebSocket-Key: "); upgrade_req.push_str(&key); upgrade_req.push_str("\r\n");
+    }
+    // Sec-WebSocket-Version 必须是 13（RFC 6455）
+    let has_ws_version = extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-version"));
+    if !has_ws_version {
+        upgrade_req.push_str("Sec-WebSocket-Version: 13\r\n");
     }
     upgrade_req.push_str("Connection: Upgrade\r\n\r\n");
 
@@ -225,12 +247,12 @@ async fn do_ws_proxy(
     if use_tls {
         let tls = tls_connect(tcp, tls_sni, tls_insecure).await?;
         ws_handshake_and_relay(
-            ctx, tls, upgrade_req,
+            ctx, tls, upgrade_req, is_h2_ws,
             strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
         ).await
     } else {
         ws_handshake_and_relay(
-            ctx, tcp, upgrade_req,
+            ctx, tcp, upgrade_req, is_h2_ws,
             strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
         ).await
     }
@@ -238,12 +260,14 @@ async fn do_ws_proxy(
 
 /// 完成上游 WS 握手，建立双向转发管道
 ///
-/// 使用 BiDirStream：框架 poll 响应 body 时同时驱动两个方向，
-/// 无需跨线程，与 Nginx 单 worker 事件循环等价。
+/// - H1 Upgrade：上游返回 101，给客户端返回 101 + Upgrade 头
+/// - H2 extended CONNECT（RFC 8441）：上游返回 101，给客户端返回 200
+///   （H2 不需要 Upgrade/Connection 头，直接用 DATA 帧双向传输）
 async fn ws_handshake_and_relay<IO>(
     ctx: &WebContext<'_, AppState>,
     mut upstream: IO,
     upgrade_req: String,
+    is_h2_ws: bool,
     strip_cookie_secure: bool,
     proxy_cookie_domain: Option<&str>,
     proxy_redirect_from: Option<&str>,
@@ -253,11 +277,15 @@ where
     IO: AsyncRead + AsyncReadExt + AsyncWrite + AsyncWriteExt + Unpin + Send + 'static,
 {
     // 发送 Upgrade 请求
-    upstream.write_all(upgrade_req.as_bytes()).await?;
-    upstream.flush().await?;
+    trace!("WS 发送 Upgrade 请求:\n{}", upgrade_req);
+    upstream.write_all(upgrade_req.as_bytes()).await
+        .map_err(|e| anyhow::anyhow!("发送 Upgrade 请求失败: {}", e))?;
+    upstream.flush().await
+        .map_err(|e| anyhow::anyhow!("flush Upgrade 请求失败: {}", e))?;
+    trace!("WS Upgrade 请求发送完毕，等待上游 101");
 
     // 读取上游响应头，等待 101
-    let (status_code, response_headers) = read_upstream_headers(&mut upstream).await?;
+    let (status_code, response_headers, prefetched_upstream) = read_upstream_headers(&mut upstream).await?;
 
     if status_code != 101 {
         warn!("WS 上游返回非 101: {}", status_code);
@@ -268,25 +296,32 @@ where
 
     debug!("WS 上游握手成功（101），建立双向管道");
 
-    // 构造 101 响应头（需借用 ctx.req()，在 take_body_ref 之前完成）
-    let resp_builder = http_ws::handshake(ctx.req().method(), ctx.req().headers())
-        .map_err(|e| anyhow::anyhow!("客户端 WS 握手验证失败: {:?}", e))?;
-    let http_resp = resp_builder
-        .body(())
-        .map_err(|e| anyhow::anyhow!("构建 101 响应失败: {}", e))?;
-
-    // take_body_ref：RefCell 内部可变性拿走 owned RequestBody
+    // take_body_ref：取走 owned RequestBody（H1/H2 均适用）
+    // H1：取走后 dispatcher 的 body_reader 仍正常工作（decoder=Upgrade，src.split() 推数据）
+    // H2：RecvStream 直接持有，take 后由 BiDirStream 负责 flow control 释放
     let client_body = ctx.take_body_ref();
 
     // 拆分上游连接，构造双向 stream
     let (upstream_read, upstream_write) = tokio::io::split(upstream);
-    let bidir = BiDirStream::new(upstream_read, upstream_write, client_body);
+    let bidir = BiDirStream::new(upstream_read, upstream_write, client_body, prefetched_upstream);
 
-    // 立即返回 101，框架持续 poll bidir stream 驱动双向转发
     let mut final_resp = WebResponse::new(ResponseBody::box_stream(bidir));
-    *final_resp.status_mut() = http_resp.status();
-    for (name, value) in http_resp.headers() {
-        final_resp.headers_mut().insert(name.clone(), value.clone());
+
+    if is_h2_ws {
+        // H2 extended CONNECT（RFC 8441）：返回 200，无 Upgrade/Connection 头
+        // H2 DATA 帧天然双向，框架持续 poll bidir stream 驱动转发
+        *final_resp.status_mut() = StatusCode::OK;
+    } else {
+        // H1 Upgrade：需要验证客户端握手头（Sec-WebSocket-Key 等），返回 101
+        let resp_builder = http_ws::handshake(ctx.req().method(), ctx.req().headers())
+            .map_err(|e| anyhow::anyhow!("客户端 WS 握手验证失败: {:?}", e))?;
+        let http_resp = resp_builder
+            .body(())
+            .map_err(|e| anyhow::anyhow!("构建 101 响应失败: {}", e))?;
+        *final_resp.status_mut() = http_resp.status();
+        for (name, value) in http_resp.headers() {
+            final_resp.headers_mut().insert(name.clone(), value.clone());
+        }
     }
 
     apply_response_headers(
@@ -298,7 +333,7 @@ where
 }
 
 /// 读取上游 HTTP 响应头，返回（状态码，头列表）
-async fn read_upstream_headers<IO>(io: &mut IO) -> Result<(u16, Vec<(String, String)>)>
+async fn read_upstream_headers<IO>(io: &mut IO) -> Result<(u16, Vec<(String, String)>, Option<Bytes>)>
 where IO: AsyncReadExt + Unpin {
     let mut buf = vec![0u8; 4096];
     let mut filled = 0usize;
@@ -308,19 +343,34 @@ where IO: AsyncReadExt + Unpin {
         if filled >= buf.len() { bail!("上游响应头过长"); }
         tokio::select! {
             n = io.read(&mut buf[filled..]) => {
-                match n? {
-                    0 => bail!("上游在握手前关闭连接"),
-                    n => filled += n,
+                match n {
+                    Ok(0) => {
+                        // 上游关闭连接（含 TLS close_notify 缺失）
+                        // 如果已读到完整响应头则正常退出，否则报错
+                        if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                        bail!("上游在握手前关闭连接");
+                    }
+                    Ok(n) => filled += n,
+                    Err(e) => {
+                        // TLS close_notify 缺失会报 UnexpectedEof，视为 EOF 处理
+                        if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                        bail!("上游握手读取失败: {}", e);
+                    }
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
                 bail!("等待上游 101 超时");
             }
         }
-        if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") { break; }
+        if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
     }
 
-    let header_str = std::str::from_utf8(&buf[..filled]).unwrap_or("");
+    let head_end = buf[..filled].windows(4).position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .ok_or_else(|| anyhow::anyhow!("上游响应头解析失败"))?;
+    let header_str = std::str::from_utf8(&buf[..head_end]).unwrap_or("");
     let status_code = parse_status_code(header_str);
     let headers: Vec<(String, String)> = header_str.lines()
         .skip(1)
@@ -330,6 +380,12 @@ where IO: AsyncReadExt + Unpin {
         )))
         .collect();
 
-    Ok((status_code, headers))
+    let prefetched_upstream = if head_end < filled {
+        Some(Bytes::copy_from_slice(&buf[head_end..filled]))
+    } else {
+        None
+    };
+
+    Ok((status_code, headers, prefetched_upstream))
 }
 

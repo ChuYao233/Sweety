@@ -175,11 +175,11 @@ impl SweetyServer {
         // 注册所有 HTTP 方法，避免 PUT/DELETE/PATCH/HEAD 等返回 405
         let h = || handler_service(multi_site_handler);
         let all_methods = get(h()).post(h()).put(h()).delete(h())
-            .patch(h()).head(h()).options(h()).trace(h());
+            .patch(h()).head(h()).options(h()).trace(h()).connect(h());
         let app = App::new()
             .with_state(state.clone())
             .at("/*path", all_methods)
-            .at("/", get(h()).post(h()).put(h()).delete(h()).patch(h()).head(h()).options(h()).trace(h()));
+            .at("/", get(h()).post(h()).put(h()).delete(h()).patch(h()).head(h()).options(h()).trace(h()).connect(h()));
 
         let mut server = sweety_web::HttpServer::serve(app.finish());
 

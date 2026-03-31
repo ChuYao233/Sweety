@@ -103,9 +103,14 @@ where
                 SelectOutput::A(Some(Ok((req, tx)))) => {
                     // Convert http::Request body type to crate::h2::Body
                     // and reconstruct as HttpRequest.
+                    // RFC 8441：在 map 之前先读 extensions，避免 req 同时被 move 和 borrow
+                    let is_h2_ws = req.extensions().get::<::h2::ext::Protocol>()
+                        .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
+                        .unwrap_or(false);
                     let req = req.map(|body| {
+                        let ext = if is_h2_ws { Extension::new_h2_ws(addr) } else { Extension::new(addr) };
                         let body = ReqB::from(RequestBody::from(body));
-                        RequestExt::from_parts(body, Extension::new(addr))
+                        RequestExt::from_parts(body, ext)
                     });
 
                     queue.push(async move {

@@ -272,35 +272,71 @@ async fn send_recv_pooled(
             return Ok((resp, None));
         }
 
-        // 用 bounded channel(cap=2) 流式转发：生产者读上游，消费者写客户端
-        // buf 已 move conn，直接 move buf 进 task
-        let stream_len = resp_content_length.unwrap_or(usize::MAX);
-        // channel cap=16：生产者（读上游）和消费者（写客户端）之间缓冲 16 个 64KB chunk
-        // 避免生产者在网络抖动时频繁 yield，对标 Nginx proxy_buffer_size 的缓冲效果
+        // 用 bounded channel 流式转发：生产者读上游解码后数据，消费者写客户端
+        // cap=16：生产者（读上游）和消费者（写客户端）之间缓冲 16 个 chunk
         let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(16);
 
-        tokio::spawn(async move {
-            let mut reader = buf;
-            let chunk_size = crate::handler::sendfile::STREAM_CHUNK;
-            let mut remaining = stream_len;
-            let mut heap_buf = vec![0u8; chunk_size];
-
-            loop {
-                if remaining == 0 { break; }
-                let to_read = remaining.min(chunk_size);
-                let slice = &mut heap_buf[..to_read];
-                match reader.read(slice).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let chunk = bytes::Bytes::copy_from_slice(&slice[..n]);
-                        remaining = remaining.saturating_sub(n);
-                        if tx.send(Ok(chunk)).await.is_err() { break; }
+        if resp_is_chunked {
+            // chunked 上游：解码后用 BytesMut.freeze() 零拷贝转 Bytes
+            tokio::spawn(async move {
+                let mut reader = buf;
+                let mut size_line = String::new();
+                loop {
+                    size_line.clear();
+                    match reader.read_line(&mut size_line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
                     }
-                    Err(e) => { let _ = tx.send(Err(e)).await; break; }
+                    let size_str = size_line.trim().split(';').next().unwrap_or("0");
+                    let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+                    if chunk_size == 0 {
+                        let mut trailer = String::new();
+                        let _ = reader.read_line(&mut trailer).await;
+                        break;
+                    }
+                    // BytesMut 直接读入，freeze() 零拷贝转 Bytes
+                    let mut buf = bytes::BytesMut::with_capacity(chunk_size);
+                    buf.resize(chunk_size, 0);
+                    let mut offset = 0;
+                    while offset < chunk_size {
+                        match reader.read(&mut buf[offset..]).await {
+                            Ok(0) => break,
+                            Ok(n) => offset += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                            Err(e) => { let _ = tx.send(Err(e)).await; return; }
+                        }
+                    }
+                    buf.truncate(offset);
+                    if tx.send(Ok(buf.freeze())).await.is_err() { break; }
+                    // 读 chunk 后面的 \r\n
+                    let mut crlf = [0u8; 2];
+                    let _ = reader.read_exact(&mut crlf).await;
                 }
-            }
-            // reader 在 task 结束时 drop，连接自动关闭
-        });
+            });
+        } else {
+            // Content-Length 或 EOF 上游：BytesMut.freeze() 零拷贝透传
+            let stream_len = resp_content_length.unwrap_or(usize::MAX);
+            let chunk_size = crate::handler::sendfile::STREAM_CHUNK;
+            tokio::spawn(async move {
+                let mut reader = buf;
+                let mut remaining = stream_len;
+                let mut heap = bytes::BytesMut::with_capacity(chunk_size);
+                loop {
+                    if remaining == 0 { break; }
+                    let to_read = remaining.min(chunk_size);
+                    heap.resize(to_read, 0);
+                    match reader.read(&mut heap[..to_read]).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            remaining = remaining.saturating_sub(n);
+                            // split_to(n).freeze()：将前 n 字节的所有权转移，不复制
+                            if tx.send(Ok(heap.split_to(n).freeze())).await.is_err() { break; }
+                        }
+                        Err(e) => { let _ = tx.send(Err(e)).await; break; }
+                    }
+                }
+            });
+        }
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let body = ResponseBody::box_stream(stream);
@@ -308,8 +344,11 @@ async fn send_recv_pooled(
         *resp.status_mut() = http_status;
         apply_response_headers(&mut resp, &response_headers,
             strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
-        // 流式路径：如果有 Content-Length 就设置，没有则让客户端靠 EOF 判断
-        if let Some(len) = resp_content_length {
+        // chunked 路径：移除上游的 Transfer-Encoding 头，由框架重新决定编码方式
+        // Content-Length 路径：保留 Content-Length 告知框架用 length 模式而非 chunked
+        if resp_is_chunked {
+            resp.headers_mut().remove(sweety_web::http::header::TRANSFER_ENCODING);
+        } else if let Some(len) = resp_content_length {
             if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(len)) {
                 resp.headers_mut().insert(CONTENT_LENGTH, v);
             }

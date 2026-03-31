@@ -9,17 +9,21 @@
 //!
 //! 零拷贝：tokio 读写操作底层使用内核缓冲区，性能与 Nginx 接近
 
-use std::time::Duration;
+use std::{
+    io,
+    pin::Pin,
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
 
 use anyhow::{Result, bail};
 use bytes::Bytes;
-use futures_util::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use futures_util::stream::Stream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf as TokioReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use sweety_web::{
-    body::ResponseBody,
+    body::{RequestBody, ResponseBody},
     http::{StatusCode, WebResponse},
     WebContext,
 };
@@ -27,6 +31,97 @@ use sweety_web::{
 use super::response::{apply_response_headers, parse_status_code};
 use super::tls_client::tls_connect;
 use crate::server::http::AppState;
+
+/// 双向 WebSocket 转发 Stream
+///
+/// 框架 poll 响应 body 时，同时驱动两个方向：
+/// - client → upstream：从 RequestBody 读帧写 upstream write half
+/// - upstream → client：从 upstream read half 读帧，输出给框架
+///
+/// 与 Nginx 单 worker 事件循环等价：一次 poll 同时检查两个 fd 的 ready 状态。
+struct BiDirStream<R, W> {
+    upstream_read:  R,
+    upstream_write: W,
+    client_body:    RequestBody,
+    /// 从上游读取的缓冲区（每帧 64KB）
+    read_buf:       Box<[u8; 65536]>,
+    /// 暂存已从 client body 拿到但尚未写完上游的数据
+    pending_write:  Option<Bytes>,
+    /// client body 是否已结束
+    client_done:    bool,
+}
+
+impl<R, W> BiDirStream<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    fn new(upstream_read: R, upstream_write: W, client_body: RequestBody) -> Self {
+        Self {
+            upstream_read,
+            upstream_write,
+            client_body,
+            read_buf: Box::new([0u8; 65536]),
+            pending_write: None,
+            client_done: false,
+        }
+    }
+}
+
+impl<R, W> Stream for BiDirStream<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Result<Bytes, io::Error>>> {
+        let this = self.get_mut();
+
+        // ── 方向 A：client → upstream ────────────────────────────────────
+        // 先把上次未写完的数据继续写
+        if let Some(ref data) = this.pending_write.clone() {
+            match Pin::new(&mut this.upstream_write).poll_write(cx, data.as_ref()) {
+                Poll::Ready(Ok(n)) if n == data.len() => { this.pending_write = None; }
+                Poll::Ready(Ok(n)) => { this.pending_write = Some(data.slice(n..)); }
+                Poll::Ready(Err(_)) => { this.client_done = true; this.pending_write = None; }
+                Poll::Pending => {} // 写缓冲满，稍后继续
+            }
+        }
+        // 从 client body 读下一帧
+        if !this.client_done && this.pending_write.is_none() {
+            match Pin::new(&mut this.client_body).poll_next(cx) {
+                Poll::Ready(Some(Ok(b))) => {
+                    // 尝试立即写上游
+                    match Pin::new(&mut this.upstream_write).poll_write(cx, b.as_ref()) {
+                        Poll::Ready(Ok(n)) if n == b.len() => {}
+                        Poll::Ready(Ok(n)) => { this.pending_write = Some(b.slice(n..)); }
+                        Poll::Ready(Err(_)) => { this.client_done = true; }
+                        Poll::Pending => { this.pending_write = Some(b); }
+                    }
+                }
+                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => { this.client_done = true; }
+                Poll::Pending => {}
+            }
+        }
+
+        // ── 方向 B：upstream → client ─────────────────────────────────────
+        let mut rb = TokioReadBuf::new(&mut *this.read_buf);
+        match Pin::new(&mut this.upstream_read).poll_read(cx, &mut rb) {
+            Poll::Ready(Ok(())) => {
+                let n = rb.filled().len();
+                if n == 0 {
+                    // 上游关闭连接，结束 stream
+                    return Poll::Ready(None);
+                }
+                let chunk = Bytes::copy_from_slice(rb.filled());
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 /// 处理 WS/WSS 反向代理请求的公开入口
 ///
@@ -112,7 +207,14 @@ async fn do_ws_proxy(
     }
     upgrade_req.push_str("X-Real-IP: "); upgrade_req.push_str(client_ip); upgrade_req.push_str("\r\n");
     upgrade_req.push_str("X-Forwarded-For: "); upgrade_req.push_str(client_ip); upgrade_req.push_str("\r\n");
-    upgrade_req.push_str("X-Forwarded-Proto: https\r\nConnection: upgrade\r\n\r\n");
+    // 对标 Nginx: proxy_http_version 1.1 + proxy_set_header Upgrade $http_upgrade
+    // 必须显式加上 Upgrade + Connection，上游才能完成 WebSocket 升级握手
+    // Sec-WebSocket-Key/Version/Extensions 已通过 extra_headers 透传（mod.rs 保留了）
+    let is_already_upgrade = extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("upgrade"));
+    if !is_already_upgrade {
+        upgrade_req.push_str("Upgrade: websocket\r\n");
+    }
+    upgrade_req.push_str("Connection: Upgrade\r\n\r\n");
 
     // 根据是否需要 TLS 分支处理
     if use_tls {
@@ -130,6 +232,9 @@ async fn do_ws_proxy(
 }
 
 /// 完成上游 WS 握手，建立双向转发管道
+///
+/// 使用 BiDirStream：框架 poll 响应 body 时同时驱动两个方向，
+/// 无需跨线程，与 Nginx 单 worker 事件循环等价。
 async fn ws_handshake_and_relay<IO>(
     ctx: &WebContext<'_, AppState>,
     mut upstream: IO,
@@ -140,7 +245,7 @@ async fn ws_handshake_and_relay<IO>(
     proxy_redirect_to: Option<&str>,
 ) -> Result<WebResponse>
 where
-    IO: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+    IO: AsyncRead + AsyncReadExt + AsyncWrite + AsyncWriteExt + Unpin + Send + 'static,
 {
     // 发送 Upgrade 请求
     upstream.write_all(upgrade_req.as_bytes()).await?;
@@ -158,44 +263,22 @@ where
 
     debug!("WS 上游握手成功（101），建立双向管道");
 
-    // ── Step 4：建立双向管道 ──────────────────────────────────────────────
-    // 上游→客户端：cap=64，覆盖高频小帧（心跳/消息）不频繁阻塞
-    let (up_tx, up_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let (upstream_read, upstream_write) = tokio::io::split(upstream);
-    tokio::spawn(relay_upstream_to_channel(upstream_read, up_tx));
-
-    // 客户端→上游：流式透传，不等 body 全部到达再 spawn
-    // 用 mpsc channel 桥接 body stream 和 upstream writer
-    let (body_tx, mut body_rx) = mpsc::channel::<Bytes>(64);
-    {
-        let mut body = ctx.body_borrow_mut();
-        let mut chunks = Vec::with_capacity(4);
-        // 只收集已到达的数据（非阻塞），剩余交由 spawn 流式处理
-        while let Some(chunk) = body.next().await {
-            if let Ok(b) = chunk { chunks.push(b); }
-        }
-        tokio::spawn(async move {
-            for c in chunks {
-                if body_tx.send(c).await.is_err() { return; }
-            }
-        });
-    }
-    tokio::spawn(async move {
-        let mut writer = upstream_write;
-        while let Some(chunk) = body_rx.recv().await {
-            if writer.write_all(chunk.as_ref()).await.is_err() { break; }
-        }
-        let _ = writer.flush().await;
-    });
-    let body_stream = tokio_stream::wrappers::ReceiverStream::new(up_rx);
-
-    // H1 WebSocket Upgrade：用 http_ws 生成标准 101 + Sec-WebSocket-Accept
+    // 构造 101 响应头（需借用 ctx.req()，在 take_body_ref 之前完成）
     let resp_builder = http_ws::handshake(ctx.req().method(), ctx.req().headers())
         .map_err(|e| anyhow::anyhow!("客户端 WS 握手验证失败: {:?}", e))?;
     let http_resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("构建 101 响应失败: {}", e))?;
-    let mut final_resp = WebResponse::new(ResponseBody::box_stream(body_stream));
+
+    // take_body_ref：RefCell 内部可变性拿走 owned RequestBody
+    let client_body = ctx.take_body_ref();
+
+    // 拆分上游连接，构造双向 stream
+    let (upstream_read, upstream_write) = tokio::io::split(upstream);
+    let bidir = BiDirStream::new(upstream_read, upstream_write, client_body);
+
+    // 立即返回 101，框架持续 poll bidir stream 驱动双向转发
+    let mut final_resp = WebResponse::new(ResponseBody::box_stream(bidir));
     *final_resp.status_mut() = http_resp.status();
     for (name, value) in http_resp.headers() {
         final_resp.headers_mut().insert(name.clone(), value.clone());
@@ -245,31 +328,3 @@ where IO: AsyncReadExt + Unpin {
     Ok((status_code, headers))
 }
 
-/// 从上游读取字节，发送到 mpsc channel（上游→客户端方向）
-/// 用 BytesMut 零拷贝：读入 BytesMut 后 freeze() 直接转 Bytes，无 copy_from_slice
-async fn relay_upstream_to_channel<R>(
-    mut reader: R,
-    tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
-)
-where R: AsyncReadExt + Unpin + Send {
-    // 64KB 初始容量，WebSocket 帧通常 < 64KB
-    let mut buf = bytes::BytesMut::with_capacity(65536);
-    loop {
-        buf.resize(65536, 0);
-        match reader.read(&mut buf[..]).await {
-            Ok(0) => break,
-            Ok(n) => {
-                // freeze 零拷贝转 Bytes
-                let chunk = buf.split_to(n).freeze();
-                if tx.send(Ok(chunk)).await.is_err() { break; }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => {
-                let _ = tx.send(Err(e)).await;
-                break;
-            }
-        }
-    }
-}
-
-// relay_chunks_to_upstream 已内联到 Step 4 的 spawn 闭包中

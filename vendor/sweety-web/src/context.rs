@@ -142,7 +142,7 @@ impl<'a, C, B> WebContext<'a, C, B> {
         self.req.as_response(body.into())
     }
 
-    pub(crate) fn take_body_ref(&self) -> B
+    pub fn take_body_ref(&self) -> B
     where
         B: Default,
     {

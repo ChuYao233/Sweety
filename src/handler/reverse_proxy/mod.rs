@@ -68,12 +68,27 @@ pub async fn handle_sweety(
     let upstream_host_owned: Option<String> = node.upstream_host.clone();
     let upstream_host: &str = upstream_host_owned.as_deref().unwrap_or(client_host);
 
+    // ── 检测 WebSocket 升级请求（H1 + H2 extended CONNECT 两种方式）──────
+    // H1：Upgrade: websocket
+    // H2：method=CONNECT + h2::ext::Protocol="websocket"（RFC 8441）
+    // 必须在头过滤之前判断，否则 is_ws 变量尚未定义
+    let is_ws_h1 = ctx.req().headers()
+        .get(sweety_web::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    let is_ws_h2 = method.eq_ignore_ascii_case("CONNECT")
+        && ctx.req().extensions()
+            .get::<h2::ext::Protocol>()
+            .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+    let is_ws = is_ws_h1 || is_ws_h2;
+
     // ── 过滤并收集请求头────────────────
     // WebSocket 升级请求需要保留 Upgrade/Sec-WebSocket-* 头，否则上游不能完成握手
+    // 对标 Nginx: proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";
     let client_ip_str_ref = client_ip_str.as_str();
     let scheme_str = ctx.req().uri().scheme_str().unwrap_or("http");
-    // 收集请求头：borrowed 部分用 &str，只有 proxy_set_headers 变量替换时才堆分配
-    // 两段分开存，forward_request 接受 &[(&str, &str)] + &[(String, String)]
     let header_count = ctx.req().headers().len();
     let mut client_headers: Vec<(String, String)> = Vec::with_capacity(header_count + 4);
     client_headers.extend(
@@ -81,8 +96,11 @@ pub async fn handle_sweety(
             .iter()
             .filter_map(|(k, v)| {
                 let name = k.as_str();
-                // hop-by-hop 头不透传，用 phf 查找（见 response.rs HOP_BY_HOP_SET）
-                if crate::handler::reverse_proxy::response::is_hop_by_hop(name) {
+                // WS 请求保留 Upgrade 和 Sec-WebSocket-* 头（不被 hop-by-hop 过滤）
+                let is_ws_header = is_ws
+                    && (name.eq_ignore_ascii_case("upgrade")
+                        || name.to_ascii_lowercase().starts_with("sec-websocket-"));
+                if !is_ws_header && crate::handler::reverse_proxy::response::is_hop_by_hop(name) {
                     return None;
                 }
                 v.to_str().ok().map(|val| (name.to_string(), val.to_string()))
@@ -99,21 +117,6 @@ pub async fn handle_sweety(
         client_headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&h.name));
         client_headers.push((h.name.clone(), val));
     }
-
-    // ── 检测 WebSocket 升级请求（H1 + H2 extended CONNECT 两种方式）──────
-    // H1：Upgrade: websocket
-    // H2：method=CONNECT + h2::ext::Protocol="websocket"（RFC 8441）
-    let is_ws_h1 = ctx.req().headers()
-        .get(sweety_web::http::header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
-    let is_ws_h2 = method.eq_ignore_ascii_case("CONNECT")
-        && ctx.req().extensions()
-            .get::<h2::ext::Protocol>()
-            .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false);
-    let is_ws = is_ws_h1 || is_ws_h2;
 
     // ── 读取请求体（POST/PUT/PATCH 等）──────────────────────────────────
     // 不能只依赖 Content-Length（H2 下无此头，chunked 也无），直接读 body stream
@@ -181,7 +184,7 @@ pub async fn handle_sweety(
     let mut resp = if is_ws {
         ws_proxy::handle_ws_proxy(
             ctx, &node.addr, node.tls, &node.tls_sni, node.tls_insecure,
-            &client_headers, &client_ip_str, &upstream_host, &path,
+            &client_headers, &client_ip_str, upstream_host, path,
             strip_cookie_secure, proxy_cookie_domain,
             proxy_redirect_from, proxy_redirect_to,
             is_ws_h2,

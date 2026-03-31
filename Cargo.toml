@@ -107,6 +107,11 @@ mime_guess   = "2"
 httpdate     = "1"
 # 系统目录（ACME 证书缓存目录）
 dirs-next    = "2"
+# HTTP 客户端（DNS-01 API 调用）
+reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# HMAC-SHA1（阿里云 DNS 签名）
+hmac         = "0.12"
+sha1         = "0.10"
 
 # ─────────────────────────────────────────────
 # 平台特定依赖

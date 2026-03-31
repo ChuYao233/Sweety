@@ -288,12 +288,51 @@ pub struct TlsConfig {
 
     /// ACME 证书提供商
     /// - "letsencrypt"（默认）：Let's Encrypt 生产环境
-    /// - "letsencrypt_staging"：Let's Encrypt 测试环境（不稏耗配额，证书不受信任）
+    /// - "letsencrypt_staging"：Let's Encrypt 测试环境（不稳耗配额，证书不受信任）
     /// - "zerossl"：ZeroSSL（免费 90 天证书）
     /// - "buypass"：Buypass / LiteSSL（免费，180 天证书）
     /// - 自定义 URL：任何其他支持 ACME 协议的 CA
     #[serde(default = "default_acme_provider")]
     pub acme_provider: String,
+
+    /// ACME 验证方式："http01"（默认） 或 "dns01"
+    /// dns01 支持通配符证书（*.example.com），不需要 80 端口可达
+    #[serde(default = "default_acme_challenge")]
+    pub acme_challenge: String,
+
+    /// DNS provider 配置（dns01 验证时必需）
+    #[serde(default)]
+    pub dns_provider: Option<DnsProviderConfig>,
+}
+
+/// DNS provider 配置（用于 ACME DNS-01 验证）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DnsProviderConfig {
+    /// Cloudflare DNS API
+    Cloudflare {
+        /// Cloudflare API Token（推荐）或 Global API Key
+        api_token: String,
+        /// Zone ID（可选，不填则自动查找）
+        #[serde(default)]
+        zone_id: Option<String>,
+    },
+    /// 阿里云 DNS
+    Aliyun {
+        /// AccessKey ID
+        access_key_id: String,
+        /// AccessKey Secret
+        access_key_secret: String,
+    },
+    /// 自定义 Shell 脚本（通用展展名）
+    /// 论本接受两个参数：域名、TXT 记录内容
+    Shell {
+        /// 设置 TXT 记录的脚本路径（参数: <domain> <txt_value>）
+        set_script: String,
+        /// 删除 TXT 记录的脚本路径（参数: <domain>）
+        #[serde(default)]
+        del_script: Option<String>,
+    },
 }
 
 /// 证书/私钥文件对（用于多证书配置）
@@ -850,6 +889,7 @@ fn default_tls_min_version() -> String { "tls1.2".into() }
 fn default_tls_max_version() -> String { "tls1.3".into() }
 fn default_acme_renew_days() -> u64 { 30 }
 fn default_acme_provider() -> String { "letsencrypt".into() }
+fn default_acme_challenge() -> String { "http01".into() }
 fn default_cache_max_entries() -> usize { 1000 }
 fn default_cache_ttl() -> u64 { 60 }
 fn default_cache_statuses() -> Vec<u16> { vec![200, 301, 302] }

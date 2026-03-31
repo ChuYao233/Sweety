@@ -20,8 +20,10 @@ use bytes::Bytes;
 use futures_util::Stream;
 use tokio::io::AsyncReadExt;
 
-/// 大文件流式传输块大小（256 KiB）
-pub const STREAM_CHUNK: usize = 256 * 1024;
+/// 大文件流式传输块大小（1 MiB）
+/// 提升 HTTPS/H2 大文件吞吐：更大的块减少 channel 轮次，降低调度开销
+/// RTT=20ms 时：32 * 1MB = 32MB 在途数据，可跑满 ~1.6Gbps
+pub const STREAM_CHUNK: usize = 1024 * 1024;
 
 /// 返回一个带背压的文件 stream（H2/通用路径）
 ///
@@ -36,25 +38,30 @@ pub fn file_stream_backpressure<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    let (tx, rx) = tokio::sync::mpsc::channel::<IoResult<Bytes>>(2);
+    // cap=32：最大在途数据 32×1MB=32MB
+    // RTT=20ms 时理论带宽上限 ~1.6Gbps，足以跑满千兆网卡
+    let (tx, rx) = tokio::sync::mpsc::channel::<IoResult<Bytes>>(32);
 
     tokio::spawn(async move {
         let mut reader = reader;
         let mut remaining = len;
-        let mut buf = vec![0u8; STREAM_CHUNK];
+        // 用 BytesMut 避免每次 read 后 copy_from_slice 的额外拷贝
+        let mut buf = bytes::BytesMut::with_capacity(STREAM_CHUNK);
 
         while remaining > 0 {
             let to_read = (remaining as usize).min(STREAM_CHUNK);
-            let slice = &mut buf[..to_read];
 
-            // read 而非 read_exact：EOF 提前结束也属正常
-            match reader.read(slice).await {
-                Ok(0) => break, // EOF
+            // 确保缓冲区有足够空间
+            buf.resize(to_read, 0);
+
+            match reader.read(&mut buf[..to_read]).await {
+                Ok(0) => break,
                 Ok(n) => {
-                    let chunk = Bytes::copy_from_slice(&slice[..n]);
                     remaining = remaining.saturating_sub(n as u64);
+                    // freeze 直接转 Bytes，零拷贝
+                    let chunk = buf.split_to(n).freeze();
                     if tx.send(Ok(chunk)).await.is_err() {
-                        return; // 客户端断开
+                        return;
                     }
                 }
                 Err(e) => {

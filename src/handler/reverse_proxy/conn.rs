@@ -1,4 +1,4 @@
-//! HTTP 连接层
+﻿//! HTTP 连接层
 //! 负责：与上游建立连接、发送请求、读取响应（支持 chunked/gzip）、健康检查探活
 
 use std::time::{Duration, Instant};
@@ -7,11 +7,12 @@ use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::debug;
-use xitca_web::{
+use sweety_web::{
     body::ResponseBody,
     http::{StatusCode, WebResponse, header::{CONTENT_LENGTH, HeaderValue}},
 };
 
+use super::error::{IoContext, ProxyError};
 use super::pool::{ConnPool, PooledConn};
 use super::response::{apply_response_headers, parse_status_code};
 use super::tls_client::tls_connect;
@@ -108,7 +109,13 @@ async fn new_conn(
         Duration::from_secs(timeout),
         TcpStream::connect(upstream_addr),
     ).await
-    .map_err(|_| anyhow::anyhow!("连接上游超时 ({}s): {}", timeout, upstream_addr))??;
+    .map_err(|_| ProxyError::ConnTimeout {
+        addr: upstream_addr.to_string(),
+        timeout_secs: timeout,
+    })
+    .and_then(|r| r.map_err(|e| ProxyError::from_io(upstream_addr, e, IoContext::Connect)))?;
+    // TCP_NODELAY：禁用 Nagle，确保请求头和 body 立即发出，降低代理延迟
+    let _ = tcp.set_nodelay(true);
 
     if use_tls {
         let tls = tls_connect(tcp, tls_sni, tls_insecure).await?;
@@ -164,23 +171,34 @@ async fn send_recv_pooled(
     // HTTP/1.1 串行：先写请求，再读响应
     // BufReader::new(conn) 直接 move conn，后续流式路径可直接 move buf 进 task
     let mut conn = conn;
-    // 写入请求头（带 write_timeout）
-    tokio::time::timeout(write_timeout, conn.write_all(req.as_bytes())).await
-        .map_err(|_| anyhow::anyhow!("写入请求头超时 ({}s)", write_timeout.as_secs()))??;
-    if !req_body.is_empty() {
-        tokio::time::timeout(write_timeout, conn.write_all(req_body)).await
-            .map_err(|_| anyhow::anyhow!("写入请求体超时 ({}s)", write_timeout.as_secs()))??;
-    }
-    conn.flush().await?;
+    // 合并请求头+body 为单次发送，减少 syscall（对标 Nginx writev 行为）
+    let send_result = tokio::time::timeout(write_timeout, async {
+        if req_body.is_empty() {
+            // 无 body：直接写头部
+            conn.write_all(req.as_bytes()).await?;
+        } else {
+            // 有 body：头部+body 一次性写出，内核层面可能合并为单个 TCP 段
+            conn.write_all(req.as_bytes()).await?;
+            conn.write_all(req_body).await?;
+        }
+        conn.flush().await
+    }).await
+    .map_err(|_| ProxyError::WriteTimeout { addr: String::new(), timeout_secs: write_timeout.as_secs() })
+    .and_then(|r| r.map_err(|e| ProxyError::from_io("", e, IoContext::Write)))?;
+    let _ = send_result;
 
     // ── 读取响应头（BufReader move conn，不借用）─────────────────────────
     let mut buf = BufReader::new(conn);
 
     let mut status_line = String::new();
     match tokio::time::timeout(read_timeout, buf.read_line(&mut status_line)).await {
-        Err(_) => return Err(anyhow::anyhow!("等待上游响应超时")),
+        Err(_) => return Err(ProxyError::TtfbTimeout { addr: String::new() }.into()),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof && !status_line.is_empty() => {}
-        Ok(Err(e)) => return Err(e.into()),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset
+                   || e.kind() == std::io::ErrorKind::BrokenPipe => {
+            return Err(ProxyError::ConnReset { addr: String::new() }.into());
+        }
+        Ok(Err(e)) => return Err(ProxyError::from_io("", e, IoContext::Read).into()),
         Ok(Ok(_)) => {}
     }
 
@@ -190,10 +208,11 @@ async fn send_recv_pooled(
     let mut resp_content_length: Option<usize> = None;
     let mut resp_is_chunked = false;
     let mut resp_conn_close = false;
-    let mut response_headers: Vec<(String, String)> = Vec::with_capacity(16);
-
+    let mut response_headers: Vec<(String, String)> = Vec::with_capacity(24);
+    // 复用 line 缓冲，避免每行都堆分配
+    let mut line = String::with_capacity(128);
     loop {
-        let mut line = String::new();
+        line.clear();
         match buf.read_line(&mut line).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
@@ -256,7 +275,9 @@ async fn send_recv_pooled(
         // 用 bounded channel(cap=2) 流式转发：生产者读上游，消费者写客户端
         // buf 已 move conn，直接 move buf 进 task
         let stream_len = resp_content_length.unwrap_or(usize::MAX);
-        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(2);
+        // channel cap=16：生产者（读上游）和消费者（写客户端）之间缓冲 16 个 64KB chunk
+        // 避免生产者在网络抖动时频繁 yield，对标 Nginx proxy_buffer_size 的缓冲效果
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(16);
 
         tokio::spawn(async move {
             let mut reader = buf;
@@ -359,12 +380,12 @@ async fn send_recv_pooled(
 async fn read_exact_body<R>(buf: &mut BufReader<R>, len: usize) -> Result<Vec<u8>>
 where R: AsyncRead + Unpin {
     let mut b = Vec::with_capacity(len);
+    // 64KB 栈 buf：减少 syscall 次数，对标 Nginx proxy_buffer_size 64k
+    let mut tmp = [0u8; 65536];
     let mut remaining = len;
-    let mut tmp = vec![0u8; 8192];
-    let tmp_cap = tmp.len();
     loop {
         if remaining == 0 { break; }
-        match buf.read(&mut tmp[..remaining.min(tmp_cap)]).await {
+        match buf.read(&mut tmp[..remaining.min(65536)]).await {
             Ok(0) => break,
             Ok(n) => { b.extend_from_slice(&tmp[..n]); remaining -= n; }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,

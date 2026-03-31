@@ -1,0 +1,78 @@
+﻿use core::marker::PhantomData;
+
+use std::rc::Rc;
+
+use tokio::task::JoinHandle;
+use sweety_io_compat::net::Stream;
+use sweety_service::{Service, ready::ReadyService};
+
+use crate::{
+    net::ListenerDyn,
+    worker::{self, ServiceAny},
+};
+
+pub type ServiceObj = Box<
+    dyn for<'a> sweety_service::object::ServiceObject<
+            (&'a str, &'a [(String, ListenerDyn)]),
+            Response = (Vec<JoinHandle<()>>, ServiceAny),
+            Error = (),
+        > + Send
+        + Sync,
+>;
+
+struct Container<F, Req> {
+    inner: F,
+    _t: PhantomData<fn(Req)>,
+}
+
+impl<'a, F, Req> Service<(&'a str, &'a [(String, ListenerDyn)])> for Container<F, Req>
+where
+    F: IntoServiceObj<Req>,
+    Req: TryFrom<Stream> + 'static,
+{
+    type Response = (Vec<JoinHandle<()>>, ServiceAny);
+    type Error = ();
+
+    async fn call(
+        &self,
+        (name, listeners): (&'a str, &'a [(String, ListenerDyn)]),
+    ) -> Result<Self::Response, Self::Error> {
+        let service = self.inner.call(()).await.map_err(|_| ())?;
+        let service = Rc::new(service);
+
+        let handles = listeners
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, listener)| worker::start(listener, &service))
+            .collect::<Vec<_>>();
+
+        Ok((handles, service as _))
+    }
+}
+
+/// helper trait for erase generic params of [Service]
+pub trait IntoServiceObj<Req>: Send + Sync + 'static
+where
+    Self: Service<Response = Self::Service> + Send + Sync + 'static,
+    Req: TryFrom<Stream> + 'static,
+{
+    type Service: ReadyService + Service<Req>;
+
+    fn into_object(self) -> ServiceObj;
+}
+
+impl<T, Req> IntoServiceObj<Req> for T
+where
+    T: Service + Send + Sync + 'static,
+    T::Response: ReadyService + Service<Req>,
+    Req: TryFrom<Stream> + 'static,
+{
+    type Service = T::Response;
+
+    fn into_object(self) -> ServiceObj {
+        Box::new(Container {
+            inner: self,
+            _t: PhantomData,
+        })
+    }
+}

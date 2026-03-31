@@ -32,8 +32,19 @@ pub async fn start(cfg: AdminApiConfig, metrics: Arc<GlobalMetrics>) -> anyhow::
                 let cfg = cfg.clone();
                 let metrics = metrics.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_admin_request(stream, cfg, metrics).await {
-                        error!("管理 API 请求处理失败 [{}]: {}", peer, e);
+                    // catch_unwind 捕获 panic，防止单连接 panic 导致 admin 服务崩溃
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle_admin_request(stream, cfg, metrics)
+                    }));
+                    match result {
+                        Ok(fut) => {
+                            if let Err(e) = fut.await {
+                                error!("管理 API 请求处理失败 [{}]: {}", peer, e);
+                            }
+                        }
+                        Err(_) => {
+                            error!("管理 API 请求处理 panic [{}]，已恢复", peer);
+                        }
                     }
                 });
             }

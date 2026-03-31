@@ -1,4 +1,4 @@
-//! 虚拟主机（VHost）匹配模块
+﻿//! 虚拟主机（VHost）匹配模块
 //! 负责：根据请求的 Host header 找到对应的站点配置
 //! 支持精确匹配、通配符匹配（*.example.com）
 
@@ -47,7 +47,7 @@ pub struct SiteInfo {
     /// HSTS 配置
     pub hsts: Option<HstsConfig>,
     /// 预构建的 HSTS HeaderValue（启动时生成，请求时 clone 只增引用计数，零堆分配）
-    pub hsts_header_value: Option<xitca_web::http::header::HeaderValue>,
+    pub hsts_header_value: Option<sweety_web::http::header::HeaderValue>,
     /// 是否作为 fallback 站点
     pub fallback: bool,
     /// 站点 TLS 端口列表（force_https 跳转时使用）
@@ -97,7 +97,7 @@ impl SiteInfo {
             let mut val = format!("max-age={}", h.max_age);
             if h.include_sub_domains { val.push_str("; includeSubDomains"); }
             if h.preload { val.push_str("; preload"); }
-            xitca_web::http::header::HeaderValue::try_from(val).ok()
+            sweety_web::http::header::HeaderValue::try_from(val).ok()
         });
 
         Self {
@@ -371,6 +371,7 @@ mod tests {
             root: None,
             index: vec!["index.html".into()],
             access_log: None,
+            access_log_format: None,
             error_log: None,
             tls: None,
             fastcgi: None,
@@ -403,14 +404,16 @@ mod tests {
     fn test_exact_match() {
         let sites = vec![make_site("demo", &["example.com"])];
         let reg = VHostRegistry::from_config(&sites);
-        assert_eq!(reg.lookup("example.com").map(|s| s.name.as_str()), Some("demo"));
+        let r = reg.lookup("example.com");
+        assert_eq!(r.as_ref().map(|s| s.name.as_str()), Some("demo"));
     }
 
     #[test]
     fn test_wildcard_match() {
         let sites = vec![make_site("demo", &["*.example.com"])];
         let reg = VHostRegistry::from_config(&sites);
-        assert_eq!(reg.lookup("sub.example.com").map(|s| s.name.as_str()), Some("demo"));
+        let r = reg.lookup("sub.example.com");
+        assert_eq!(r.as_ref().map(|s| s.name.as_str()), Some("demo"));
         // 无 fallback 站点时不匹配返回 None
         assert!(reg.lookup("example.com").is_none());
     }
@@ -430,7 +433,8 @@ mod tests {
         ];
         let reg = VHostRegistry::from_config(&sites);
         // 显式 fallback 站点才会被返回
-        assert_eq!(reg.lookup("unknown.com").map(|s| s.name.as_str()), Some("default"));
+        let r = reg.lookup("unknown.com");
+        assert_eq!(r.as_ref().map(|s| s.name.as_str()), Some("default"));
         // 无 fallback 站点时不匹配返回 None
         let sites2 = vec![make_site("only", &["only.com"])];
         let reg2 = VHostRegistry::from_config(&sites2);

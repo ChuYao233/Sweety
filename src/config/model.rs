@@ -303,6 +303,75 @@ pub struct TlsConfig {
     /// DNS provider 配置（dns01 验证时必需）
     #[serde(default)]
     pub dns_provider: Option<DnsProviderConfig>,
+
+    /// HTTP/3 QUIC 传输层调优（不填使用内置性能默认值）
+    #[serde(default)]
+    pub http3: Http3Config,
+}
+
+/// HTTP/3 QUIC 传输层调优参数
+///
+/// 对应 quinn::TransportConfig 的关键字段，不配置则使用性能优化的默认值
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Http3Config {
+    /// 单连接最大并发双向流数（等价 HTTP/2 max_concurrent_streams，默认 200）
+    /// 建议：API 服务设 100，静态资源服务设 300
+    #[serde(default = "default_h3_max_concurrent_bidi_streams")]
+    pub max_concurrent_bidi_streams: u32,
+
+    /// 单连接最大并发单向流数（默认 100）
+    #[serde(default = "default_h3_max_concurrent_uni_streams")]
+    pub max_concurrent_uni_streams: u32,
+
+    /// 连接空闲超时（毫秒，默认 30000 = 30s，0 = 禁用）
+    /// 客户端无活动超过此时间后服务端主动关闭连接
+    #[serde(default = "default_h3_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+
+    /// Keep-Alive 间隔（毫秒，默认 10000 = 10s，0 = 禁用）
+    /// 定期发送 PING 保持连接，避免 NAT/防火墙超时断开
+    #[serde(default = "default_h3_keep_alive_interval_ms")]
+    pub keep_alive_interval_ms: u64,
+
+    /// 连接级接收窗口（字节，默认 8MB）
+    /// 影响整个连接的吞吐量上限，高并发大文件传输建议设 16-64MB
+    #[serde(default = "default_h3_receive_window")]
+    pub receive_window: u64,
+
+    /// 流级接收窗口（字节，默认 2MB）
+    /// 单个 HTTP 请求/响应流的流控窗口
+    #[serde(default = "default_h3_stream_receive_window")]
+    pub stream_receive_window: u64,
+
+    /// 连接级发送窗口（字节，默认 8MB）
+    #[serde(default = "default_h3_send_window")]
+    pub send_window: u64,
+
+    /// 是否启用 0-RTT（Early Data，默认 false）
+    /// 开启后客户端可在握手前发送请求，减少 RTT，但有重放攻击风险
+    /// 仅在内网或低风险场景开启
+    #[serde(default)]
+    pub enable_0rtt: bool,
+
+    /// MTU 探测（默认 true）：自动发现最优 PMTU，减少分片，提升吞吐
+    #[serde(default = "default_true")]
+    pub mtu_discovery: bool,
+}
+
+impl Default for Http3Config {
+    fn default() -> Self {
+        Self {
+            max_concurrent_bidi_streams: default_h3_max_concurrent_bidi_streams(),
+            max_concurrent_uni_streams:  default_h3_max_concurrent_uni_streams(),
+            idle_timeout_ms:             default_h3_idle_timeout_ms(),
+            keep_alive_interval_ms:      default_h3_keep_alive_interval_ms(),
+            receive_window:              default_h3_receive_window(),
+            stream_receive_window:       default_h3_stream_receive_window(),
+            send_window:                 default_h3_send_window(),
+            enable_0rtt:                 false,
+            mtu_discovery:               true,
+        }
+    }
 }
 
 /// DNS provider 配置（用于 ACME DNS-01 验证）
@@ -962,6 +1031,13 @@ fn default_proxy_write_timeout() -> u64 { 60 }
 fn default_cb_max_failures() -> u32 { 5 }
 fn default_cb_window() -> u64 { 60 }
 fn default_cb_fail_timeout() -> u64 { 30 }
+fn default_h3_max_concurrent_bidi_streams() -> u32 { 200 }
+fn default_h3_max_concurrent_uni_streams() -> u32 { 100 }
+fn default_h3_idle_timeout_ms() -> u64 { 30_000 }
+fn default_h3_keep_alive_interval_ms() -> u64 { 10_000 }
+fn default_h3_receive_window() -> u64 { 8 * 1024 * 1024 }        // 8 MB
+fn default_h3_stream_receive_window() -> u64 { 2 * 1024 * 1024 } // 2 MB
+fn default_h3_send_window() -> u64 { 8 * 1024 * 1024 }           // 8 MB
 
 // ─────────────────────────────────────────────
 // 单元测试

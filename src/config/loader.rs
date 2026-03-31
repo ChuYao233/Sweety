@@ -26,17 +26,58 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
         .to_lowercase();
 
     let cfg: AppConfig = match ext.as_str() {
-        "toml" => toml::from_str(&content)
-            .with_context(|| format!("TOML 解析失败: {}", path.display()))?,
-        "json" => serde_json::from_str(&content)
-            .with_context(|| format!("JSON 解析失败: {}", path.display()))?,
-        "yaml" | "yml" => serde_yaml::from_str(&content)
-            .with_context(|| format!("YAML 解析失败: {}", path.display()))?,
-        other => bail!("不支持的配置文件格式: .{}", other),
+        "toml" => toml::from_str(&content).map_err(|e| {
+            // 从 byte-offset span 转换为人类可读的行列号
+            let loc = e.span()
+                .map(|s| byte_offset_to_line_col(&content, s.start))
+                .unwrap_or_else(|| "（位置未知）".to_string());
+            // toml::de::Error::message() 含字段路径，如 "invalid type: integer `80`, expected a string"
+            anyhow::anyhow!(
+                "配置文件解析失败\n  位置: {}\n  原因: {}\n  文件: {}\n  提示: 检查字段类型是否正确，字符串需加引号",
+                loc, e, path.display()
+            )
+        })?,
+        "json" => serde_json::from_str(&content).map_err(|e| {
+            // serde_json::Error 直接提供 line()/column()
+            let loc = if e.line() > 0 {
+                format!("第 {} 行第 {} 列", e.line(), e.column())
+            } else {
+                "（位置未知）".to_string()
+            };
+            anyhow::anyhow!(
+                "配置文件解析失败\n  位置: {}\n  原因: {}\n  文件: {}\n  提示: 检查 JSON 语法（引号、逗号、括号是否匹配）",
+                loc, e, path.display()
+            )
+        })?,
+        "yaml" | "yml" => serde_yaml::from_str(&content).map_err(|e| {
+            // serde_yaml::Error::Display 已含 "at line X column Y" 格式
+            anyhow::anyhow!(
+                "配置文件解析失败\n  原因: {}\n  文件: {}\n  提示: YAML 使用空格缩进，不能用 Tab；检查冒号后是否有空格",
+                e, path.display()
+            )
+        })?,
+        other => bail!("不支持的配置文件格式: .{}（支持 .toml / .json / .yaml / .yml）", other),
     };
 
     validate_config(&cfg)?;
     Ok(cfg)
+}
+
+/// 将字节偏移量转换为「第 N 行第 M 列」字符串
+///
+/// 用于将 TOML span 的 byte offset 转换为人类可读的行列号
+fn byte_offset_to_line_col(content: &str, offset: usize) -> String {
+    let safe = offset.min(content.len());
+    let before = &content[..safe];
+    let line = before.lines().count().max(1);
+    // 列号 = 最后一行的字节长度 + 1（1-indexed）
+    let col = before.lines().next_back().map(|l| l.len() + 1).unwrap_or(1);
+    format!("第 {} 行第 {} 列", line, col)
+}
+
+/// 配置校验：检查必填字段、端口合法性等（对外暴露，供热重载模块复用）
+pub fn validate_config_pub(cfg: &AppConfig) -> Result<()> {
+    validate_config(cfg)
 }
 
 /// 配置校验：检查必填字段、端口合法性等
@@ -59,12 +100,14 @@ fn validate_config(cfg: &AppConfig) -> Result<()> {
                         site.name, loc.path
                     );
                 }
-                let up_name = loc.upstream.as_deref().unwrap();
-                if !site.upstreams.iter().any(|u| u.name == up_name) {
-                    bail!(
-                        "站点 '{}' 的 location '{}' 引用了不存在的上游组 '{}'",
-                        site.name, loc.path, up_name
-                    );
+                // if let 防御性取值（上方 bail! 已排除 None，此处仅作双重保障）
+                if let Some(up_name) = loc.upstream.as_deref() {
+                    if !site.upstreams.iter().any(|u| u.name == up_name) {
+                        bail!(
+                            "站点 '{}' 的 location '{}' 引用了不存在的上游组 '{}'",
+                            site.name, loc.path, up_name
+                        );
+                    }
                 }
             }
         }

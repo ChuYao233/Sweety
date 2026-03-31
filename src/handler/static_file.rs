@@ -1,4 +1,4 @@
-//! 静态文件处理器
+﻿//! 静态文件处理器
 //!
 //! # 压缩策略
 //! - **Brotli**：当客户端支持 `br` 时优先使用，压缩率比 gzip 高 20-30%
@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::debug;
-use xitca_web::{
+use sweety_web::{
     body::ResponseBody,
     http::{
         StatusCode, WebResponse,
@@ -100,8 +100,8 @@ pub fn start_file_cache_watcher(roots: Vec<PathBuf>) -> Option<RecommendedWatche
 }
 
 
-/// 处理静态文件请求（xitca-web WebContext 版本）
-pub async fn handle_xitca(
+/// 处理静态文件请求（sweety-web WebContext 版本）
+pub async fn handle_sweety(
     ctx: &WebContext<'_, AppState>,
     site: &SiteInfo,
     location: &LocationConfig,
@@ -161,7 +161,7 @@ pub async fn handle_xitca(
 
     // ── 小文件内存缓存（单层，热路径：完全跳过 metadata + open 系统调用）─────────
     // 仅对普通 GET（非 Range、非 HEAD）的小文件启用；Range / HEAD / 大文件走下方磁盘路径
-    let is_range_req = req_headers.get(xitca_web::http::header::RANGE).is_some();
+    let is_range_req = req_headers.get(sweety_web::http::header::RANGE).is_some();
     let is_head      = method.eq_ignore_ascii_case("HEAD");
 
     if !is_head && !is_range_req {
@@ -321,7 +321,7 @@ pub async fn handle_xitca(
 
     // 解析 Range 头（bytes=start-end，只支持单区间）
     let range = req_headers
-        .get(xitca_web::http::header::RANGE)
+        .get(sweety_web::http::header::RANGE)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| parse_range(s, file_size));
 
@@ -650,7 +650,7 @@ pub fn resolve_safe_path(root: &Path, request_path: &str) -> Option<PathBuf> {
     resolve_safe_path_with_canon(root, request_path, None)
 }
 
-/// 带预计算 canonical root 的版本（供 handle_xitca 调用以消除重复系统调用）
+/// 带预计算 canonical root 的版本（供 handle_sweety 调用以消除重复系统调用）
 pub fn resolve_safe_path_fast(
     root: &Path,
     request_path: &str,

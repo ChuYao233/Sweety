@@ -184,6 +184,10 @@ fn cmd_run(config: &PathBuf) {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.global.log_level));
     tracing_subscriber::fmt().with_env_filter(log_filter).init();
 
+    // 安装全局 panic hook：将 panic 信息路由到 tracing error！日志
+    // 默认 panic 只输出到 stderr，日志系统感知不到；hook 后可写入日志文件、监控系统
+    install_panic_hook();
+
     info!(
         "Sweety {} 正在启动，共 {} 个站点（日志级别: {}）",
         env!("CARGO_PKG_VERSION"),
@@ -194,6 +198,40 @@ fn cmd_run(config: &PathBuf) {
         error!("服务器启动失败: {:#}", e);
         std::process::exit(1);
     }
+}
+
+/// 安装全局 panic hook
+///
+/// 将 panic 信息（包含文件/行号/消息）输出到 tracing error 日志，
+/// 同时保留原有的 stderr 输出行为，确保运维人员能通过日志系统感知崩溃
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // 提取 panic 消息
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "(unknown panic payload)"
+        };
+
+        // 提取文件/行号位置
+        let location = info.location().map(|l| {
+            format!("{}:{}", l.file(), l.line())
+        }).unwrap_or_else(|| "(unknown location)".to_string());
+
+        // 输出到 tracing 日志（会写入日志文件 / 监控 / 结构化输出）
+        error!(
+            panic.message = msg,
+            panic.location = %location,
+            "PANIC: {} at {}",
+            msg, location,
+        );
+
+        // 调用默认 hook 保留 stderr 输出（方便直接查看终端）
+        default_hook(info);
+    }));
 }
 
 // ─────────────────────────────────────────────

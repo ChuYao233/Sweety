@@ -1,4 +1,4 @@
-//! auth_request 子请求鉴权模块
+﻿//! auth_request 子请求鉴权模块
 //! 等价 Nginx `auth_request /auth;`
 //!
 //! 工作原理：
@@ -9,7 +9,7 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::debug;
-use xitca_web::http::header::HeaderMap;
+use sweety_web::http::header::HeaderMap;
 
 use crate::config::model::HeaderOverride;
 
@@ -76,7 +76,7 @@ async fn do_auth_request(
 
     // 透传安全相关头（Cookie、Authorization、X-Forwarded-For 等）
     // 直接遍历 HeaderMap，零中间分配
-    use xitca_web::http::header;
+    use sweety_web::http::header;
     let pass_headers = [
         header::COOKIE,
         header::AUTHORIZATION,

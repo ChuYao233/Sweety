@@ -1,4 +1,4 @@
-//! 反向代理处理器
+﻿//! 反向代理处理器
 //! 支持：HTTP / HTTPS / WS / WSS + gzip / chunked 透传
 //! 子模块职责：
 //!   lb.rs         — 负载均衡、节点状态、健康检查
@@ -8,6 +8,7 @@
 
 pub mod circuit_breaker;
 pub mod conn;
+pub mod error;
 pub mod lb;
 pub mod pool;
 pub mod response;
@@ -16,7 +17,7 @@ pub mod ws_proxy;
 
 use futures_util::StreamExt;
 use tracing::error;
-use xitca_web::{
+use sweety_web::{
     http::{StatusCode, WebResponse},
     WebContext,
 };
@@ -29,7 +30,7 @@ use crate::server::http::AppState;
 pub use lb::{health_check_task, NodeState, UpstreamPool, UpstreamRegistry};
 
 /// 处理反向代理请求（公开入口）
-pub async fn handle_xitca(
+pub async fn handle_sweety(
     ctx: &WebContext<'_, AppState>,
     site: &SiteInfo,
     location: &LocationConfig,
@@ -103,7 +104,7 @@ pub async fn handle_xitca(
     // H1：Upgrade: websocket
     // H2：method=CONNECT + h2::ext::Protocol="websocket"（RFC 8441）
     let is_ws_h1 = ctx.req().headers()
-        .get(xitca_web::http::header::UPGRADE)
+        .get(sweety_web::http::header::UPGRADE)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
@@ -118,7 +119,7 @@ pub async fn handle_xitca(
     // 不能只依赖 Content-Length（H2 下无此头，chunked 也无），直接读 body stream
     let request_body: Vec<u8> = if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
         let cap = ctx.req().headers()
-            .get(xitca_web::http::header::CONTENT_LENGTH)
+            .get(sweety_web::http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0);
@@ -153,11 +154,11 @@ pub async fn handle_xitca(
         if cache.should_lookup(method, ctx.req().headers()) {
             if let Some(entry) = cache.get(&cache_key) {
                 // 缓存命中，直接构造响应返回
-                use xitca_web::body::ResponseBody;
-                use xitca_web::http::{StatusCode, WebResponse};
+                use sweety_web::body::ResponseBody;
+                use sweety_web::http::{StatusCode, WebResponse};
                 let mut resp = WebResponse::new(ResponseBody::from(entry.body));
                 *resp.status_mut() = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK);
-                use xitca_web::http::header::{HeaderName, HeaderValue};
+                use sweety_web::http::header::{HeaderName, HeaderValue};
                 for (k, v) in &entry.headers {
                     if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
                         resp.headers_mut().insert(name, val);
@@ -191,8 +192,7 @@ pub async fn handle_xitca(
         // retry 循环：失败时重新选节点重试，第一次失败不算在 retry 次数内
         let max_attempts = 1 + pool.retry as usize;
         let mut last_err = String::new();
-        let mut success = false;
-        let mut resp_opt: Option<xitca_web::http::WebResponse> = None;
+        let mut resp_opt: Option<sweety_web::http::WebResponse> = None;
 
         'retry: for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -230,7 +230,6 @@ pub async fn handle_xitca(
                 Ok(r) => {
                     node.record_success();
                     resp_opt = Some(r);
-                    success = true;
                     break 'retry;
                 }
                 Err(e) => {
@@ -241,11 +240,9 @@ pub async fn handle_xitca(
             }
         }
 
-        if success {
-            resp_opt.unwrap()
-        } else {
+        resp_opt.unwrap_or_else(|| {
             response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败: {}", node.addr, last_err))
-        }
+        })
     };
 
     node.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -253,7 +250,7 @@ pub async fn handle_xitca(
     // 缓存写入已在 conn::forward_request 里完成（在 body 完整时导入）
     // 这里只需设置 X-Cache: MISS 头
     if proxy_cache.is_some() {
-        use xitca_web::http::header::{HeaderName, HeaderValue};
+        use sweety_web::http::header::{HeaderName, HeaderValue};
         resp.headers_mut().insert(
             HeaderName::from_static("x-cache"),
             HeaderValue::from_static("MISS"),
@@ -288,14 +285,14 @@ fn cache_rule_regex(pattern: &str) -> Option<regex::Regex> {
 /// - `add_headers`：直接向响应头插入自定义头
 /// - `cache_rules`：按正则匹配请求路径，匹配则覆盖 Cache-Control
 fn apply_extra_headers(
-    resp: &mut xitca_web::http::WebResponse,
+    resp: &mut sweety_web::http::WebResponse,
     add_headers: &[crate::config::model::HeaderOverride],
     cache_rules: &[crate::config::model::CacheRule],
     path: &str,
     remote_addr: &str,
     scheme: &str,
 ) {
-    use xitca_web::http::header::{HeaderName, HeaderValue, CACHE_CONTROL};
+    use sweety_web::http::header::{HeaderName, HeaderValue, CACHE_CONTROL};
 
     // 计算 cache_rules 匹配（只对成功响应）
     if resp.status().is_success() {

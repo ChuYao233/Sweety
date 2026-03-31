@@ -1,4 +1,4 @@
-//! 插件系统
+﻿//! 插件系统
 //!
 //! # 接入方式（配置）
 //! ```toml
@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use xitca_web::http::{WebResponse, header::HeaderMap};
+use sweety_web::http::{WebResponse, header::HeaderMap};
 
 // ─────────────────────────────────────────────
 // 插件 trait
@@ -89,18 +89,18 @@ impl PluginRegistry {
 
     /// 注册插件（通常在 main.rs 启动阶段调用）
     pub fn register(&self, name: impl Into<String>, plugin: Arc<dyn Plugin>) {
-        self.plugins.write().unwrap().insert(name.into(), plugin);
+        self.plugins.write().unwrap_or_else(|e| e.into_inner()).insert(name.into(), plugin);
     }
 
     /// 按名称查找插件（热路径：读锁，O(1) HashMap 查找）
     #[inline]
     pub fn lookup(&self, name: &str) -> Option<Arc<dyn Plugin>> {
-        self.plugins.read().unwrap().get(name).cloned()
+        self.plugins.read().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
     }
 
     /// 返回所有已注册插件名（用于 /api/v1/plugins 和 --api-doc）
     pub fn plugin_names(&self) -> Vec<String> {
-        self.plugins.read().unwrap().keys().cloned().collect()
+        self.plugins.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
     }
 }
 

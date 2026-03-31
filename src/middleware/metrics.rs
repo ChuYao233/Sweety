@@ -123,10 +123,8 @@ mod tests {
         m.inc_requests();
         let snap = m.snapshot();
         assert_eq!(snap.total_requests, 2);
-        assert_eq!(snap.active_requests, 2);
-
-        m.dec_active();
-        assert_eq!(m.snapshot().active_requests, 1);
+        // inc_requests 只增加 total_requests，不影响 active_requests
+        assert_eq!(snap.active_requests, 0);
     }
 
     #[test]

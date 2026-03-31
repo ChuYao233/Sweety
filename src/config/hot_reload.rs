@@ -35,10 +35,16 @@ pub fn start_hot_reload(
     ctx: HotReloadContext,
 ) {
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("热重载运行时创建失败");
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("热重载线程 tokio runtime 创建失败: {}，配置热重载已禁用", e);
+                return;
+            }
+        };
         rt.block_on(watch_loop(config_path, initial_config, ctx));
     });
 }
@@ -49,7 +55,8 @@ async fn watch_loop(
     mut current_config: Arc<AppConfig>,
     ctx: HotReloadContext,
 ) {
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // 事件通道：true = 文件被删除，false = 文件被修改/创建
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
 
     // 把配置文件路径 canonicalize，用于事件过滤
     let watch_target = config_path.canonicalize().unwrap_or_else(|_| config_path.clone());
@@ -67,7 +74,9 @@ async fn watch_loop(
                     || p == &watch_target
                 });
                 if is_config {
-                    let _ = event_tx.send(());
+                    // 区分删除和修改/创建：删除事件发 true
+                    let is_remove = matches!(event.kind, EventKind::Remove(_));
+                    let _ = event_tx.send(is_remove);
                 }
             }
         }
@@ -91,31 +100,76 @@ async fn watch_loop(
     }
 
     loop {
-        if event_rx.recv().await.is_none() { break; }
-        // 防抖 500ms
+        let is_remove = match event_rx.recv().await {
+            None => break, // 发送端关闭，退出循环
+            Some(v) => v,
+        };
+        // 防抖 500ms：聚合短时间内的多个事件（编辑器保存时常触发多个事件）
         tokio::time::sleep(Duration::from_millis(500)).await;
-        while event_rx.try_recv().is_ok() {}
-
-        match load_config(&config_path) {
-            Err(e) => {
-                error!("配置热重载失败（文件解析错误），继续使用旧配置: {:#}", e);
-            }
-            Ok(new_cfg) => {
-                // 热重载前全量验证：证书格式非法时拒绝加载，等价 nginx -t + nginx reload
-                match validate_config(&new_cfg) {
-                    Err(e) => {
-                        error!("配置验证失败，继续使用旧配置: {:#}", e);
-                        error!("  提示：运行 `sweety -t` 可详细检查配置和证书");
-                    }
-                    Ok(()) => {
-                        let new_arc = Arc::new(new_cfg);
-                        apply_diff(&current_config, &new_arc, &ctx);
-                        current_config = new_arc;
-                        info!("配置热重载成功");
-                    }
-                }
-            }
+        // 排空多余事件，最终的 is_remove 以最后一个事件为准
+        let mut final_remove = is_remove;
+        while let Ok(v) = event_rx.try_recv() {
+            final_remove = v;
         }
+
+        // ── 文件删除处理 ─────────────────────────────────────────────────────
+        // 文件删除后不尝试解析，仅 warn 提示，等待文件重新出现
+        // 与 Nginx 行为一致：删除配置文件不影响正在运行的服务
+        if final_remove || !config_path.exists() {
+            warn!(
+                "配置文件已被删除或不可访问: {}",
+                config_path.display()
+            );
+            warn!("  旧配置继续生效，服务正常运行");
+            warn!("  提示：恢复配置文件后将自动检测并重新加载");
+            continue;
+        }
+
+        // ── Nginx 风格 pre-flight 检查 ──────────────────────────────────────
+        // 阶段1：解析配置文件（语法 + 类型 + 行号）
+        let new_cfg = match load_config(&config_path) {
+            Err(e) => {
+                // 再次检查是否是文件不存在（删除后 Create 事件误触发时的兜底）
+                if !config_path.exists() {
+                    warn!("配置文件不存在: {}，旧配置继续生效", config_path.display());
+                } else {
+                    // load_config 已含行号信息（见 config/loader.rs）
+                    error!("配置文件有误，旧配置继续生效:");
+                    for line in format!("{:#}", e).lines() {
+                        error!("  {}", line);
+                    }
+                    error!("  提示：修正后配置将自动重新加载，无需重启服务器");
+                }
+                continue;
+            }
+            Ok(c) => c,
+        };
+
+        // 阶段2：逻辑校验（upstream 引用、server_name 非空等）
+        if let Err(e) = crate::config::loader::validate_config_pub(&new_cfg) {
+            error!("配置逻辑校验失败，旧配置继续生效:");
+            for line in format!("{:#}", e).lines() {
+                error!("  {}", line);
+            }
+            error!("  提示：修正后配置将自动重新加载，无需重启服务器");
+            continue;
+        }
+
+        // 阶段3：TLS 证书预加载检查（非 ACME 证书）
+        if let Err(e) = preflight_tls(&new_cfg) {
+            error!("TLS 证书校验失败，旧配置继续生效:");
+            for line in format!("{:#}", e).lines() {
+                error!("  {}", line);
+            }
+            error!("  提示：修正后配置将自动重新加载，无需重启服务器");
+            continue;
+        }
+
+        // 全部检查通过：原子切换配置（等价 nginx -s reload）
+        let new_arc = Arc::new(new_cfg);
+        apply_diff(&current_config, &new_arc, &ctx);
+        current_config = new_arc;
+        info!("配置热重载成功（旧连接不受影响）");
     }
 }
 
@@ -212,39 +266,41 @@ fn tls_changed(old: &SiteConfig, new: &SiteConfig) -> bool {
     toml::to_string(&old.tls).ok() != toml::to_string(&new.tls).ok()
 }
 
-/// 全量验证新配置的合法性（等价 nginx -t）
+/// TLS 证书预检（阶段3）：非 ACME 证书能否正常加载
 ///
-/// 检查项：
-/// 1. 所有站点的 TLS 证书（非 ACME）能否正确加载
-/// 2. 证书和私钥格式是否匹配
-///
-/// 任一站点验证失败则返回 Err，调用方应保持旧配置继续服务。
-fn validate_config(cfg: &AppConfig) -> anyhow::Result<()> {
+/// 只检查证书文件可读性和格式合法性，不影响运行中的 TLS 连接。
+/// 返回 Err 时调用方应放弃本次热重载，保持旧配置继续服务。
+fn preflight_tls(cfg: &AppConfig) -> anyhow::Result<()> {
     for site in &cfg.sites {
         let Some(tls) = &site.tls else { continue };
-        if tls.acme { continue; } // ACME 证书由后台任务管理，跳过
+        if tls.acme { continue; } // ACME 证书由后台任务管理，此处跳过
 
-        // 验证单证书模式
+        // 验证单证书模式（cert + key）
         if tls.cert.is_some() || tls.key.is_some() {
             TlsManager::build_certified_keys_pub(tls)
                 .map_err(|e| anyhow::anyhow!(
-                    "站点 '{}' TLS 证书无效: {:#}", site.name, e
+                    "站点 '{}' TLS 证书无效\n  cert: {}\n  key:  {}\n  原因: {:#}",
+                    site.name,
+                    tls.cert.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    tls.key.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    e
                 ))?;
         }
 
-        // 验证多证书列表
+        // 验证多证书列表（certs[]）
         for (i, c) in tls.certs.iter().enumerate() {
             let single_tls = crate::config::model::TlsConfig {
-                cert: Some(c.cert.clone()),
-                key:  Some(c.key.clone()),
+                cert:  Some(c.cert.clone()),
+                key:   Some(c.key.clone()),
                 certs: vec![],
-                acme: false,
+                acme:  false,
                 ..tls.clone()
             };
             TlsManager::build_certified_keys_pub(&single_tls)
                 .map_err(|e| anyhow::anyhow!(
-                    "站点 '{}' 第 {} 张证书无效 ({}): {:#}",
-                    site.name, i + 1, c.cert.display(), e
+                    "站点 '{}' 第 {} 张证书无效\n  cert: {}\n  key:  {}\n  原因: {:#}",
+                    site.name, i + 1,
+                    c.cert.display(), c.key.display(), e
                 ))?;
         }
     }
@@ -272,6 +328,7 @@ mod tests {
             root: None,
             index: vec!["index.html".into()],
             access_log: None,
+            access_log_format: None,
             error_log: None,
             tls: None,
             fastcgi: None,

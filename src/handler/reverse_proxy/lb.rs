@@ -295,10 +295,18 @@ mod tests {
                     tls_sni: None,
                     tls_insecure: false,
                     upstream_host: None,
-                }))
+                }, None))
             }).collect(),
             strategy,
             rr_counter: AtomicUsize::new(0),
+            keepalive_requests: 0,
+            keepalive_time: 0,
+            keepalive_max_idle: 32,
+            connect_timeout: 10,
+            read_timeout: 60,
+            write_timeout: 60,
+            retry: 0,
+            retry_timeout: 0,
         }
     }
 

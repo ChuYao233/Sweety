@@ -1,4 +1,4 @@
-//! TLS 管理模块
+﻿//! TLS 管理模块
 //! 负责：Rustls ServerConfig 构建（手动证书）、ACME 自动申请续期、HTTP/3 QuicConfig
 //!
 //! 证书算法支持：RSA（2048/4096）、ECDSA P-256/P-384、Ed25519
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use quinn::TransportConfig;
 use rustls::ServerConfig;
 use rustls_pemfile::Item;
 use tracing::{error, info, warn};
@@ -57,7 +58,8 @@ impl TlsManager {
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         // TLS 1.2 session cache：缓存 10240 个 session，减少重复握手开销
         // TLS 1.3 session tickets 由 rustls 自动处理，无需额外配置
-        cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(10240);
+        // session cache 65536：高并发时大量客户端复用 TLS session，避免重复握手
+        cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(65536);
         Ok((cfg, resolver))
     }
 
@@ -93,26 +95,33 @@ impl TlsManager {
     ///
     /// `QuicConfig` 实际是 `quinn::ServerConfig`
     /// 使用 `with_single_cert` 直接构建，无需先构建 rustls::ServerConfig
-    pub fn build_quic_config(tls: &TlsConfig) -> Result<xitca_io::net::QuicConfig> {
-        if tls.acme {
+    pub fn build_quic_config(tls: &TlsConfig) -> Result<sweety_io::net::QuicConfig> {
+        let h3 = &tls.http3;
+        let mut server_config = if tls.acme {
             // ACME 模式：读取本地缓存证书
             let domain = tls.acme_email.as_deref().unwrap_or("default");
             let cert_path = acme_cert_path(domain);
             let key_path  = acme_key_path(domain);
             if cert_path.exists() && key_path.exists() {
-                return build_quinn_config_from_pem(&cert_path, &key_path);
+                build_quinn_config_from_pem(&cert_path, &key_path)?
+            } else {
+                // 证书尚未就绪，生成自签名证书作临时替代
+                build_quinn_config_self_signed(domain)?
             }
-            // 证书尚未就绪，生成自签名证书作临时替代
-            build_quinn_config_self_signed(domain)
         } else if !tls.certs.is_empty() {
             // 多证书模式：QUIC 只需一张，优先取列表第一张（通常是 ECDSA，兼容性最好）
             let first = &tls.certs[0];
-            build_quinn_config_from_pem(&first.cert, &first.key)
+            build_quinn_config_from_pem(&first.cert, &first.key)?
         } else {
             let cert = tls.cert.as_ref().context("QUIC TLS 需要 cert 路径")?;
             let key  = tls.key.as_ref().context("QUIC TLS 需要 key 路径")?;
-            build_quinn_config_from_pem(cert, key)
-        }
+            build_quinn_config_from_pem(cert, key)?
+        };
+
+        // 应用 TransportConfig 性能调优参数
+        apply_transport_config(&mut server_config, h3);
+
+        Ok(server_config)
     }
 
     /// ACME 证书自动申请与续期后台循环
@@ -358,8 +367,56 @@ fn generate_self_signed(domain: &str) -> Result<ServerConfig> {
 // 内部实现：Quinn（HTTP/3）配置构建
 // ─────────────────────────────────────────────
 
+/// 将 Http3Config 参数应用到 quinn::ServerConfig 的 TransportConfig
+fn apply_transport_config(
+    server_config: &mut sweety_io::net::QuicConfig,
+    h3: &crate::config::model::Http3Config,
+) {
+    use quinn::VarInt;
+
+    let mut tc = TransportConfig::default();
+
+    // 并发流数限制
+    tc.max_concurrent_bidi_streams(VarInt::from_u32(h3.max_concurrent_bidi_streams));
+    tc.max_concurrent_uni_streams(VarInt::from_u32(h3.max_concurrent_uni_streams));
+
+    // 空闲超时（0 表示禁用）
+    // IdleTimeout::try_from(Duration) 单位为毫秒级 VarInt，最大约 292 年
+    if h3.idle_timeout_ms > 0 {
+        let dur = Duration::from_millis(h3.idle_timeout_ms);
+        if let Ok(timeout) = quinn::IdleTimeout::try_from(dur) {
+            tc.max_idle_timeout(Some(timeout));
+        }
+    } else {
+        tc.max_idle_timeout(None);
+    }
+
+    // Keep-Alive PING 间隔（0 表示禁用）
+    if h3.keep_alive_interval_ms > 0 {
+        tc.keep_alive_interval(Some(Duration::from_millis(h3.keep_alive_interval_ms)));
+    } else {
+        tc.keep_alive_interval(None);
+    }
+
+    // 接收/发送窗口
+    if let Ok(rw) = VarInt::from_u64(h3.receive_window) {
+        tc.receive_window(rw);
+    }
+    if let Ok(srw) = VarInt::from_u64(h3.stream_receive_window) {
+        tc.stream_receive_window(srw);
+    }
+    tc.send_window(h3.send_window);
+
+    // MTU 探测
+    if !h3.mtu_discovery {
+        tc.mtu_discovery_config(None);
+    }
+
+    server_config.transport_config(std::sync::Arc::new(tc));
+}
+
 /// 从 PEM 文件构建 quinn::ServerConfig（用于 HTTP/3）
-fn build_quinn_config_from_pem(cert_path: &Path, key_path: &Path) -> Result<xitca_io::net::QuicConfig> {
+fn build_quinn_config_from_pem(cert_path: &Path, key_path: &Path) -> Result<sweety_io::net::QuicConfig> {
     let cert_bytes = std::fs::read(cert_path)
         .with_context(|| format!("读取证书失败: {}", cert_path.display()))?;
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
@@ -371,14 +428,17 @@ fn build_quinn_config_from_pem(cert_path: &Path, key_path: &Path) -> Result<xitc
         .with_context(|| format!("读取私钥失败: {}", key_path.display()))?;
     let key = load_private_key(&key_bytes)?;
 
-    let server_config = xitca_io::net::QuicConfig::with_single_cert(certs, key)
+    let server_config = sweety_io::net::QuicConfig::with_single_cert(certs, key)
         .context("构建 Quinn ServerConfig 失败")?;
+
+    // quinn 0.11 + rustls：0-RTT 通过 rustls session ticket 自动支持
+    // 客户端重连时 QUIC 层自动使用 early data，无需额外配置
 
     Ok(server_config)
 }
 
 /// 生成自签名证书构建 quinn::ServerConfig（ACME 证书未就绪时临时使用）
-fn build_quinn_config_self_signed(domain: &str) -> Result<xitca_io::net::QuicConfig> {
+fn build_quinn_config_self_signed(domain: &str) -> Result<sweety_io::net::QuicConfig> {
     let subject_alt_names = if domain.is_empty() {
         vec!["localhost".to_string()]
     } else {
@@ -393,7 +453,7 @@ fn build_quinn_config_self_signed(domain: &str) -> Result<xitca_io::net::QuicCon
         rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())
     );
 
-    xitca_io::net::QuicConfig::with_single_cert(vec![cert_der], key_der)
+    sweety_io::net::QuicConfig::with_single_cert(vec![cert_der], key_der)
         .context("构建 Quinn 自签名 ServerConfig 失败")
 }
 
@@ -549,7 +609,8 @@ async fn request_acme_cert(domain: &str, email: &str, acme_provider: &str) -> Re
     let b64 = base64::engine::general_purpose::STANDARD.encode(&key_der);
     let key_pem = format!(
         "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-        b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("\n")
+        // base64::STANDARD 只含 ASCII 字节，from_utf8 永远不会失败
+        b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or_default()).collect::<Vec<_>>().join("\n")
     );
     Ok((cert_chain_pem.into_bytes(), key_pem.into_bytes()))
 }
@@ -699,7 +760,8 @@ async fn request_acme_cert_dns01(
     let b64 = base64::engine::general_purpose::STANDARD.encode(&key_der);
     let key_pem = format!(
         "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-        b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("\n")
+        // base64::STANDARD 只含 ASCII 字节，from_utf8 永远不会失败
+        b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or_default()).collect::<Vec<_>>().join("\n")
     );
 
     info!("ACME DNS-01 证书申请成功: {}", domain);
@@ -828,7 +890,8 @@ mod sni_resolver {
         pub fn upsert_site(&self, names: &[String], keys: Vec<rustls::sign::CertifiedKey>) {
             let arcs: Vec<Arc<rustls::sign::CertifiedKey>> =
                 keys.into_iter().map(Arc::new).collect();
-            let mut inner = self.inner.write().unwrap();
+            // 锁中毒时（另一线程 panic 持有写锁）用 into_inner() 恢复，避免 panic 扩散
+            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
             if inner.fallback.is_empty() {
                 inner.fallback = arcs.clone();
             }
@@ -843,7 +906,7 @@ mod sni_resolver {
 
         /// 删除单个站点的证书
         pub fn remove_site(&self, names: &[String]) {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
             for name in names {
                 if let Some(suffix) = name.strip_prefix("*.") {
                     inner.wildcard.remove(&suffix.to_lowercase());
@@ -889,7 +952,7 @@ mod sni_resolver {
 
     impl rustls::server::ResolvesServerCert for SniResolver {
         fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
             let candidates = match client_hello.server_name() {
                 Some(name) => Self::lookup(&inner, name),
                 None => &inner.fallback,

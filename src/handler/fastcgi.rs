@@ -1,4 +1,4 @@
-//! FastCGI / PHP 处理器
+﻿//! FastCGI / PHP 处理器
 //!
 //! # 修复内容（对比旧版本）
 //! - **POST/PUT 请求体**：正确通过 STDIN 传递给 PHP-FPM
@@ -9,7 +9,7 @@
 //! - **SERVER_PORT / HTTPS 变量**
 //! - 参照 RFC 3875 (CGI) 和 FastCGI 1.0 规范
 
-use xitca_web::{
+use sweety_web::{
     body::ResponseBody,
     http::{StatusCode, WebResponse, header::{CONTENT_TYPE, HeaderValue}},
     WebContext,
@@ -82,7 +82,7 @@ fn encode_nv_pair(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
 ///
 /// `resolved_script`：由 try_files 解析得到的绝对脚本路径；
 /// 若为 None，则回退到从请求路径推断（直接访问 .php 文件时）。
-pub async fn handle_xitca(
+pub async fn handle_sweety(
     ctx: &WebContext<'_, AppState>,
     site: &SiteInfo,
     location: &LocationConfig,
@@ -106,9 +106,9 @@ pub async fn handle_xitca(
             let key = CacheKey::new(method_str, host_str, req_path);
             if let Some(entry) = cache.get(&key) {
                 // 命中：直接返回缓存响应
-                use xitca_web::http::header::HeaderName;
+                use sweety_web::http::header::HeaderName;
                 let mut resp = WebResponse::new(
-                    xitca_web::body::ResponseBody::from(entry.body.to_vec())
+                    sweety_web::body::ResponseBody::from(entry.body.to_vec())
                 );
                 *resp.status_mut() = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK);
                 for (k, v) in &entry.headers {
@@ -120,7 +120,7 @@ pub async fn handle_xitca(
                     }
                 }
                 resp.headers_mut().insert(
-                    xitca_web::http::header::HeaderName::from_static("x-fastcgi-cache"),
+                    sweety_web::http::header::HeaderName::from_static("x-fastcgi-cache"),
                     HeaderValue::from_static("HIT"),
                 );
                 return resp;
@@ -193,12 +193,12 @@ pub async fn handle_xitca(
         (mb as u64) * 1024 * 1024
     };
     let content_length = ctx.req().headers()
-        .get(xitca_web::http::header::CONTENT_LENGTH)
+        .get(sweety_web::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
     let content_type = ctx.req().headers()
-        .get(xitca_web::http::header::CONTENT_TYPE)
+        .get(sweety_web::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");  // 保持 &str 引用，不分配堆内存
 
@@ -436,13 +436,16 @@ async fn fcgi_send_and_read_headers(
 
     // 构建请求包（与连接类型无关）
     let rid: u16 = 1;
-    let mut pkt = Vec::with_capacity(4096);
+    // 预估总包大小：8字节头 + 每个 param 约 (name_len + val_len + 8) 字节 + STDIN
+    let params_est: usize = params.iter().map(|(k, v)| k.len() + v.len() + 8).sum();
+    let mut pkt = Vec::with_capacity(8 + 8 + params_est + 8 + stdin_body.len() + 64);
     write_fcgi_header(&mut pkt, FCGI_BEGIN_REQUEST, rid, 8, 0);
     pkt.extend_from_slice(&FCGI_RESPONDER.to_be_bytes());
     pkt.push(1); // FCGI_KEEP_CONN
     pkt.extend_from_slice(&[0u8; 5]);
     {
-        let mut body = Vec::new();
+        // 预分配 params 编码缓冲，与 pkt 一起规避连续 realloc
+        let mut body = Vec::with_capacity(params_est);
         for (k, v) in params {
             encode_nv_pair(&mut body, k.as_bytes(), v.as_bytes());
         }
@@ -532,6 +535,7 @@ where
     let content_len = u16::from_be_bytes([hdr[4], hdr[5]]) as usize;
     let padding_len = hdr[6] as usize;
     let total = content_len + padding_len;
+    // with_capacity 预分配，避免 read_exact 循环中 realloc
     let mut buf = vec![0u8; total];
     if total > 0 { stream.read_exact(&mut buf).await?; }
     buf.truncate(content_len);
@@ -621,7 +625,7 @@ async fn stream_remaining(
     status: u16,
     headers: Vec<(String, String)>,
 ) -> WebResponse {
-    use xitca_web::http::header::HeaderName;
+    use sweety_web::http::header::HeaderName;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(16);
 
@@ -679,7 +683,7 @@ async fn stream_remaining(
 
 /// 构造完整响应（body 已全量，无需 stream）
 fn make_complete_response(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> WebResponse {
-    use xitca_web::http::header::HeaderName;
+    use sweety_web::http::header::HeaderName;
     let http_status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
     // 304/204/205/1xx 不能带 body（HTTP 规范 + H2 dispatcher 要求）
     let no_body = http_status == StatusCode::NOT_MODIFIED
@@ -706,7 +710,7 @@ fn make_complete_response(status: u16, headers: Vec<(String, String)>, body: Vec
             resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
         }
         if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_len)) {
-            resp.headers_mut().insert(xitca_web::http::header::CONTENT_LENGTH, v);
+            resp.headers_mut().insert(sweety_web::http::header::CONTENT_LENGTH, v);
         }
     }
     resp
@@ -846,7 +850,7 @@ fn parse_fcgi_response(stdout: Vec<u8>) -> WebResponse {
     *resp.status_mut() = http_status;
 
     // 写入所有响应头
-    use xitca_web::http::header::HeaderName;
+    use sweety_web::http::header::HeaderName;
     for (k, v) in &response_headers {
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
@@ -864,7 +868,7 @@ fn parse_fcgi_response(stdout: Vec<u8>) -> WebResponse {
     // 设置 Content-Length（PHP 已知输出长度时有利于 keep-alive 复用）
     if let Ok(v) = HeaderValue::from_str(&body_len.to_string()) {
         resp.headers_mut().insert(
-            xitca_web::http::header::CONTENT_LENGTH,
+            sweety_web::http::header::CONTENT_LENGTH,
             v,
         );
     }

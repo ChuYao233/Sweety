@@ -1,4 +1,4 @@
-//! 反向代理响应缓存（等价 Nginx proxy_cache）
+﻿//! 反向代理响应缓存（等价 Nginx proxy_cache）
 //!
 //! # 架构
 //! - **内存层**：`DashMap<CacheKey, CacheEntry>` — O(1) 命中，无锁并发
@@ -108,7 +108,7 @@ impl ProxyCache {
     pub fn should_lookup(
         &self,
         method: &str,
-        req_headers: &xitca_web::http::header::HeaderMap,
+        req_headers: &sweety_web::http::header::HeaderMap,
     ) -> bool {
         // method 已是大写（HTTP 规范），直接大写比较
         if !self.cacheable_methods.iter().any(|m| m.eq_ignore_ascii_case(method)) {

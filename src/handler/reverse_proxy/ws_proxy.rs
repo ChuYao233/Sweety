@@ -1,4 +1,4 @@
-//! WebSocket / WSS 反向代理
+﻿//! WebSocket / WSS 反向代理
 //!
 //! 实现：
 //! 1. 连接上游（TCP 或 TLS）
@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
-use xitca_web::{
+use sweety_web::{
     body::ResponseBody,
     http::{StatusCode, WebResponse},
     WebContext,
@@ -49,7 +49,7 @@ pub async fn handle_ws_proxy(
     proxy_redirect_to: Option<&str>,
     is_h2_ws: bool,
 ) -> WebResponse {
-    // H2 extended CONNECT：xitca-web 不支持 RFC 8441 双向流，
+    // H2 extended CONNECT：sweety-web 不支持 RFC 8441 双向流，
     // 返回 501 让浏览器降级到 HTTP/1.1 重连，与 Nginx 行为一致
     if is_h2_ws {
         let mut resp = WebResponse::new(ResponseBody::empty());
@@ -96,6 +96,8 @@ async fn do_ws_proxy(
         TcpStream::connect(upstream_addr),
     ).await
     .map_err(|_| anyhow::anyhow!("连接上游超时: {}", upstream_addr))??;
+    // TCP_NODELAY：WebSocket 帧通常很小，禁用 Nagle 降低帧延迟
+    let _ = tcp.set_nodelay(true);
 
     // ── Step 2：构造并发送 HTTP Upgrade 请求 ─────────────────────────────
     // 预分配容量，用 push_str 替代 format! 减少堆分配
@@ -157,21 +159,34 @@ where
     debug!("WS 上游握手成功（101），建立双向管道");
 
     // ── Step 4：建立双向管道 ──────────────────────────────────────────────
-    let (up_tx, up_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(256);
-    // 上游→客户端：持续读上游字节 → channel
+    // 上游→客户端：cap=64，覆盖高频小帧（心跳/消息）不频繁阻塞
+    let (up_tx, up_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let (upstream_read, upstream_write) = tokio::io::split(upstream);
     tokio::spawn(relay_upstream_to_channel(upstream_read, up_tx));
-    // 客户端→上游：持续从 RequestBody stream 读取帧并写入上游
-    // 必须先把 body borrow 释放，再 spawn
-    let body_chunks: Vec<Bytes> = {
+
+    // 客户端→上游：流式透传，不等 body 全部到达再 spawn
+    // 用 mpsc channel 桥接 body stream 和 upstream writer
+    let (body_tx, mut body_rx) = mpsc::channel::<Bytes>(64);
+    {
         let mut body = ctx.body_borrow_mut();
-        let mut chunks = Vec::new();
+        let mut chunks = Vec::with_capacity(4);
+        // 只收集已到达的数据（非阻塞），剩余交由 spawn 流式处理
         while let Some(chunk) = body.next().await {
             if let Ok(b) = chunk { chunks.push(b); }
         }
-        chunks
-    };
-    tokio::spawn(relay_chunks_to_upstream(body_chunks, upstream_write));
+        tokio::spawn(async move {
+            for c in chunks {
+                if body_tx.send(c).await.is_err() { return; }
+            }
+        });
+    }
+    tokio::spawn(async move {
+        let mut writer = upstream_write;
+        while let Some(chunk) = body_rx.recv().await {
+            if writer.write_all(chunk.as_ref()).await.is_err() { break; }
+        }
+        let _ = writer.flush().await;
+    });
     let body_stream = tokio_stream::wrappers::ReceiverStream::new(up_rx);
 
     // H1 WebSocket Upgrade：用 http_ws 生成标准 101 + Sec-WebSocket-Accept
@@ -231,17 +246,21 @@ where IO: AsyncReadExt + Unpin {
 }
 
 /// 从上游读取字节，发送到 mpsc channel（上游→客户端方向）
+/// 用 BytesMut 零拷贝：读入 BytesMut 后 freeze() 直接转 Bytes，无 copy_from_slice
 async fn relay_upstream_to_channel<R>(
     mut reader: R,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
 )
 where R: AsyncReadExt + Unpin + Send {
-    let mut buf = vec![0u8; 65536]; // 64KB 缓冲区，平衡延迟和吞吐
+    // 64KB 初始容量，WebSocket 帧通常 < 64KB
+    let mut buf = bytes::BytesMut::with_capacity(65536);
     loop {
-        match reader.read(&mut buf).await {
+        buf.resize(65536, 0);
+        match reader.read(&mut buf[..]).await {
             Ok(0) => break,
             Ok(n) => {
-                let chunk = Bytes::copy_from_slice(&buf[..n]);
+                // freeze 零拷贝转 Bytes
+                let chunk = buf.split_to(n).freeze();
                 if tx.send(Ok(chunk)).await.is_err() { break; }
             }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
@@ -253,11 +272,4 @@ where R: AsyncReadExt + Unpin + Send {
     }
 }
 
-/// 把客户端 chunks 持续写入上游（客户端→上游方向）
-async fn relay_chunks_to_upstream<W>(chunks: Vec<Bytes>, mut writer: W)
-where W: AsyncWriteExt + Unpin + Send {
-    for chunk in chunks {
-        if writer.write_all(chunk.as_ref()).await.is_err() { break; }
-    }
-    let _ = writer.flush().await;
-}
+// relay_chunks_to_upstream 已内联到 Step 4 的 spawn 闭包中

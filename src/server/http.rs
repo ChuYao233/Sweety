@@ -1,5 +1,5 @@
-//! HTTP 服务器核心模块
-//! 负责：基于 xitca-web 构建多站点、多协议（HTTP/1.1 + HTTP/2 + HTTP/3）服务器
+﻿//! HTTP 服务器核心模块
+//! 负责：基于 sweety-web 构建多站点、多协议（HTTP/1.1 + HTTP/2 + HTTP/3）服务器
 //! 支持：明文 HTTP、TLS（rustls）、ACME 自动证书、HTTP/3（QUIC）
 
 use std::collections::{HashMap, HashSet};
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tracing::info;
-use xitca_web::{
+use sweety_web::{
     App,
     body::ResponseBody,
     handler::handler_service,
@@ -144,6 +144,12 @@ impl SweetyServer {
             );
         }
 
+        // 收集 HTTP/3 端口集合（用于 Alt-Svc 注入）
+        let h3_port_set: HashSet<u16> = collect_h3_ports(&cfg)
+            .into_iter()
+            .map(|(port, _)| port)
+            .collect();
+
         // 第二步：构建 state
         let state = AppState {
             registry: registry.clone(),
@@ -151,6 +157,7 @@ impl SweetyServer {
             cfg: cfg.clone(),
             tls_ports: Arc::new(tls_port_set),
             http_ports: Arc::new(http_port_set),
+            h3_ports: Arc::new(h3_port_set),
             conn_pool,
             sni_resolvers: Arc::new(port_resolvers),
             any_access_log,
@@ -164,7 +171,7 @@ impl SweetyServer {
             )),
         };
 
-        // 第三步：构建 xitca-web App
+        // 第三步：构建 sweety-web App
         // 注册所有 HTTP 方法，避免 PUT/DELETE/PATCH/HEAD 等返回 405
         let h = || handler_service(multi_site_handler);
         let all_methods = get(h()).post(h()).put(h()).delete(h())
@@ -174,7 +181,7 @@ impl SweetyServer {
             .at("/*path", all_methods)
             .at("/", get(h()).post(h()).put(h()).delete(h()).patch(h()).head(h()).options(h()).trace(h()));
 
-        let mut server = xitca_web::HttpServer::serve(app.finish());
+        let mut server = sweety_web::HttpServer::serve(app.finish());
 
         // 根据 worker 线程数配置并发
         let workers = if cfg.global.worker_threads == 0 {
@@ -206,7 +213,7 @@ impl SweetyServer {
 
         // 绑定 HTTP/3 QUIC 端口
         // 先构建好所有 H3 配置，再统一通过链式 bind_h3 绑定（避免所有权问题）
-        let h3_bindings: Vec<(String, xitca_io::net::QuicConfig)> = collect_h3_ports(&cfg)
+        let h3_bindings: Vec<(String, sweety_io::net::QuicConfig)> = collect_h3_ports(&cfg)
             .into_iter()
             .filter_map(|(port, tls_cfg)| {
                 match TlsManager::build_quic_config(tls_cfg) {
@@ -230,10 +237,16 @@ impl SweetyServer {
             // 克隆 sni_resolvers 供 ACME 续期后热重载证书
             let resolvers_for_acme: HashMap<u16, Arc<SniResolver>> = (*state.sni_resolvers).clone();
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
+                let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .unwrap();
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("ACME 续期线程 tokio runtime 创建失败: {}，ACME 自动续期已禁用", e);
+                        return;
+                    }
+                };
                 rt.block_on(crate::server::tls::TlsManager::acme_renewal_loop(
                     cfg_clone,
                     resolvers_for_acme,
@@ -300,6 +313,8 @@ pub struct AppState {
     pub sni_resolvers: Arc<HashMap<u16, Arc<SniResolver>>>,
     /// FastCGI 连接池（复用 PHP-FPM 连接）
     pub fcgi_pool: Arc<FcgiPool>,
+    /// HTTP/3 QUIC 端口集合（用于注入 Alt-Svc 响应头）
+    pub h3_ports: Arc<HashSet<u16>>,
 }
 
 /// max_connections RAII 守卫：Drop 时自动减计数器
@@ -312,7 +327,7 @@ impl Drop for ConnGuard {
 
 /// 多站点请求分发处理器
 ///
-/// 参数必须是 `&WebContext` 引用（xitca-web handler_service FromRequest 约束）
+/// 参数必须是 `&WebContext` 引用（sweety-web handler_service FromRequest 约束）
 async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     use std::sync::atomic::Ordering;
     let state = ctx.state();
@@ -364,7 +379,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     }
 
     // 一次解析 Host 头，同时得到 host 和 port（避免两次 split 迭代）
-    // HTTP/2 下没有 Host 头，:authority 伪头被 xitca-web 放到 URI authority 里
+    // HTTP/2 下没有 Host 头，:authority 伪头被 sweety-web 放到 URI authority 里
     // 优先用 URI authority（H2/H3），回退到 Host 头（H1）
     let host_raw = ctx.req().uri().authority()
         .map(|a| a.as_str())
@@ -490,7 +505,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     let max_body_bytes = state.max_body_bytes;
     if max_body_bytes > 0 {
         if let Some(content_length) = ctx.req().headers()
-            .get(xitca_web::http::header::CONTENT_LENGTH)
+            .get(sweety_web::http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
         {
@@ -574,7 +589,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     if let HandlerType::Plugin(ref plugin_name) = location.handler {
         let method_str = ctx.req().method().as_str();
         let body_len = ctx.req().headers()
-            .get(xitca_web::http::header::CONTENT_LENGTH)
+            .get(sweety_web::http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
@@ -596,7 +611,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     // FastCGI 的 try_files：先解析文件存在性，再决定走 FastCGI 还是 static
     let mut resp = match location.handler {
         HandlerType::Static => {
-            crate::handler::static_file::handle_xitca(ctx, &site, &location).await
+            crate::handler::static_file::handle_sweety(ctx, &site, &location).await
         }
         HandlerType::Fastcgi => {
             // 如果配置了 try_files，先解析目标路径再决定 handler
@@ -609,11 +624,11 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
                     // 找到文件：根据扩展名分流（.php → FastCGI，其他 → 静态）
                     TryFilesResult::File(p) => {
                         if p.extension().and_then(|e| e.to_str()) == Some("php") {
-                            crate::handler::fastcgi::handle_xitca(ctx, &site, &location, Some(&p)).await
+                            crate::handler::fastcgi::handle_sweety(ctx, &site, &location, Some(&p)).await
                         } else {
                             let mut static_loc = location.clone();
                             static_loc.handler = HandlerType::Static;
-                            crate::handler::static_file::handle_xitca(ctx, &site, &static_loc).await
+                            crate::handler::static_file::handle_sweety(ctx, &site, &static_loc).await
                         }
                     }
                     // =CODE（如 =404）
@@ -623,26 +638,26 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
                     }
                     // 所有路径不存在，fallback 到 FastCGI（与 Nginx 行为一致）
                     TryFilesResult::NotFound => {
-                        crate::handler::fastcgi::handle_xitca(ctx, &site, &location, None).await
+                        crate::handler::fastcgi::handle_sweety(ctx, &site, &location, None).await
                     }
                 }
             } else {
-                crate::handler::fastcgi::handle_xitca(ctx, &site, &location, None).await
+                crate::handler::fastcgi::handle_sweety(ctx, &site, &location, None).await
             }
         }
         HandlerType::Websocket => {
-            crate::handler::websocket::handle_xitca(ctx, &location).await
+            crate::handler::websocket::handle_sweety(ctx, &location).await
         }
         HandlerType::ReverseProxy => {
-            crate::handler::reverse_proxy::handle_xitca(ctx, &site, &location).await
+            crate::handler::reverse_proxy::handle_sweety(ctx, &site, &location).await
         }
         HandlerType::Grpc => {
-            crate::handler::grpc::handle_xitca(ctx, &site, &location).await
+            crate::handler::grpc::handle_sweety(ctx, &site, &location).await
         }
         // Plugin handler：on_request 已在上方处理，这里 on_request 返回 Continue
         // 插件可以作为独立 handler（不走其他 handler），直接返回 200 或交由 on_response 改写
         HandlerType::Plugin(ref plugin_name) => {
-            use xitca_web::body::ResponseBody;
+            use sweety_web::body::ResponseBody;
             let mut r = WebResponse::new(ResponseBody::none());
             *r.status_mut() = StatusCode::OK;
             // 调用 on_response：插件可在此修改响应体/头
@@ -686,9 +701,34 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     {
         if let Some(hsts_val) = &site.hsts_header_value {
             resp.headers_mut().insert(
-                xitca_web::http::header::HeaderName::from_static("strict-transport-security"),
+                sweety_web::http::header::HeaderName::from_static("strict-transport-security"),
                 hsts_val.clone(),  // HeaderValue::clone 只增引用计数，零堆分配
             );
+        }
+    }
+
+    // 注入 Alt-Svc 响应头（HTTP/3 升级广播）
+    // 仅对 HTTPS 响应且当前请求端口有对应 HTTP/3 端口时注入
+    // 浏览器收到后会尝试分群用 QUIC 重新连接
+    {
+        let on_tls = is_https
+            || host_port.map(|p| state.tls_ports.contains(&p)).unwrap_or(false);
+        if on_tls && !state.h3_ports.is_empty() {
+            // 取当前端口（优先用 host_port，没有则用 TLS 端口列表第一个）
+            let effective_port = host_port
+                .filter(|p| state.h3_ports.contains(p))
+                .or_else(|| state.h3_ports.iter().next().copied());
+            if let Some(port) = effective_port {
+                // Alt-Svc: h3=":443"; ma=86400
+                // ma = max-age（缓存时间，秒，默认 24h）
+                let alt_svc_val = format!("h3=\":{}\"; ma=86400", port);
+                if let Ok(v) = HeaderValue::try_from(alt_svc_val) {
+                    resp.headers_mut().insert(
+                        sweety_web::http::header::HeaderName::from_static("alt-svc"),
+                        v,
+                    );
+                }
+            }
         }
     }
 
@@ -701,25 +741,25 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
             method:    ctx.req().method().as_str().to_string(),
             uri:       request_uri.to_string(),
             http_version: match ctx.req().version() {
-                xitca_web::http::Version::HTTP_11 => "HTTP/1.1",
-                xitca_web::http::Version::HTTP_2  => "HTTP/2.0",
-                xitca_web::http::Version::HTTP_3  => "HTTP/3.0",
-                xitca_web::http::Version::HTTP_10 => "HTTP/1.0",
+                sweety_web::http::Version::HTTP_11 => "HTTP/1.1",
+                sweety_web::http::Version::HTTP_2  => "HTTP/2.0",
+                sweety_web::http::Version::HTTP_3  => "HTTP/3.0",
+                sweety_web::http::Version::HTTP_10 => "HTTP/1.0",
                 _                                  => "HTTP/?",
             }.to_string(),
             status:    resp.status().as_u16(),
             bytes_sent: resp.headers()
-                .get(xitca_web::http::header::CONTENT_LENGTH)
+                .get(sweety_web::http::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0u64),
             referer: ctx.req().headers()
-                .get(xitca_web::http::header::REFERER)
+                .get(sweety_web::http::header::REFERER)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("-")
                 .to_string(),
             user_agent: ctx.req().headers()
-                .get(xitca_web::http::header::USER_AGENT)
+                .get(sweety_web::http::header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("-")
                 .to_string(),

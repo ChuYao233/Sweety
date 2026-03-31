@@ -116,6 +116,7 @@ pub fn analyze(records: &[RequestRecord], top_n: usize, slow_threshold_ms: u64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn rec(path: &str, status: u16, dur_ms: u64) -> RequestRecord {
         RequestRecord {

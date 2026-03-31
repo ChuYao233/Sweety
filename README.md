@@ -1,6 +1,8 @@
 # Sweety
 
-高性能、单文件部署的多站点 Web 服务器，Rust 编写，基于 [xitca-web](https://github.com/HFQR/xitca-web)。
+高性能、单文件部署的多站点 Web 服务器，纯 Rust 编写。
+
+底层 HTTP 栈原基于 [xitca-web](https://github.com/HFQR/xitca-web)，现已完整 fork 到 `vendor/` 目录自行维护（sweety-web / sweety-http-core / sweety-server / sweety-io 等），与上游独立演进，包含多项针对生产场景的性能修复和优化。
 
 ---
 
@@ -348,7 +350,7 @@ sweety/
 ├─ src/
 │  ├─ main.rs              # CLI 子命令入口（run/validate/reload/api-doc/version）
 │  ├─ server/
-│  │  ├─ http.rs           # xitca-web 应用构建、多站点分发、AppState
+│  │  ├─ http.rs           # 应用构建、多站点分发、AppState
 │  │  ├─ tls.rs            # Rustls SNI Resolver、ACME HTTP-01 自动续期
 │  │  ├─ dns01.rs          # ACME DNS-01（Cloudflare/Aliyun/Shell）通配符证书
 │  │  └─ quic.rs           # HTTP/3 Quinn 集成
@@ -388,6 +390,9 @@ sweety/
 │  │  └─ hot_reload.rs     # notify 配置热重载
 │  ├─ monitor/             # 慢请求统计、Prometheus 导出
 │  └─ admin_api/           # 管理 API（HTTP REST + WebSocket 推送）
+├─ vendor/                 # 自主维护的底层 HTTP 栈（sweety-web/http-core/server/io 等）
+├─ scripts/
+│  └─ sysctl_tune.sh       # Linux 内核参数调优脚本
 └─ config/
    ├─ sweety.example.toml  # 完整配置示例（含所有配置项注释）
    └─ docs/architecture.md # 架构文档
@@ -435,7 +440,7 @@ sweety/
 | respond 直接返回内容 | ✅ | ❌ 仅状态码 | ✅ |
 | 反向代理超时/重试 | ✅ | ✅ | ✅ |
 | 断路器 circuit breaker | ✅ 三状态机 | ⚠️ max_fails 仅计数 | ❌ |
-| 零拷贝大文件传输 | ✅ sendfile / H2 背压 | ✅ sendfile | ⚠️ |
+| 零拷贝大文件传输 | ✅ sendfile(2) / H2 1MB 帧 | ✅ sendfile | ⚠️ |
 | 插件系统 | ✅ `plugin:xxx` | ✅ C 模块 | ✅ Go 模块 |
 | 子命令 CLI | ✅ run/validate/reload/api-doc | ⚠️ nginx -t/-s | ✅ |
 | Admin REST API | ✅ | ❌ | ✅ |
@@ -448,13 +453,31 @@ sweety/
 
 ---
 
-## 已知问题
+## 性能调优
 
-**H2 `UnexpectedFrameType` 错误日志**：底层 `xitca-http 0.7.1` 的已知 bug，浏览器取消 H2 请求时触发，**不影响功能**。临时规避：
+### Linux 内核参数（生产必配）
 
-```toml
-log_level = "sweety_lib=info,xitca_http=off"
+```bash
+sudo bash scripts/sysctl_tune.sh
 ```
+
+脚本自动配置：TCP BBR 拥塞控制、TCP Fast Open、SO_REUSEPORT、收发缓冲区 128MB、somaxconn 65535、文件描述符 1048576。
+
+撤销：`sudo bash scripts/sysctl_tune.sh restore`
+
+### 性能关键参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| H2 连接窗口 | 128MB | 高带宽下不因流控停顿 |
+| H2 流窗口 | 16MB | 单个大文件流无停顿 |
+| H2 最大帧 | 1MB | 大文件调度开销降低 64 倍 |
+| H2 发送缓冲 | 16MB | 生产者不频繁等待 |
+| 文件流 chunk | 1MB | HTTPS 大文件带宽利用率提升 |
+| 文件流 channel | 32 | 在途数据 32MB，覆盖千兆 RTT |
+| TLS session cache | 65536 | 减少重复握手 |
+| TCP_NODELAY | 默认开 | 响应头立即发出，降低 TTFB |
+| SO_RCVBUF/SNDBUF | 1MB | 内核 socket 缓冲区 |
 
 ---
 

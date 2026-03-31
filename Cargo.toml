@@ -1,3 +1,33 @@
+﻿[workspace]
+members = [
+    ".",
+    "crates/sweety-http",
+]
+exclude = [
+    "vendor/sweety-collection",
+    "vendor/sweety-service",
+    "vendor/sweety-io-v4",
+    "vendor/sweety-io-v5",
+    "vendor/sweety-router",
+    "vendor/sweety-tls",
+    "vendor/sweety-server",
+    "vendor/sweety-http-core",
+    "vendor/sweety-web",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# 共享版本约束，各 crate 通过 workspace = true 引用
+tokio        = { version = "1", features = ["full"] }
+anyhow       = "1"
+tracing      = "0.1"
+bytes        = "1"
+rustls       = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+sweety-web   = { path = "vendor/sweety-web" }
+sweety-io    = { path = "vendor/sweety-io-v5", features = ["quic"] }
+quinn        = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
+
 [package]
 name        = "sweety"
 version     = "0.1.0"
@@ -21,7 +51,7 @@ path = "src/lib.rs"
 # 异步运行时
 tokio = { version = "1", features = ["full"] }
 
-# ── Web 框架（xitca-web 0.8）──────────────────
+# ── Web 框架（sweety-web）──────────────────────
 # http1/http2/http3 协议支持
 # rustls TLS（纯 Rust，无 C 依赖）
 # websocket 内置 WS 支持
@@ -29,9 +59,9 @@ tokio = { version = "1", features = ["full"] }
 # rate-limit 内置限流
 # logger tracing 日志中间件
 # json/compress-gz 可选扩展
-# xitca-io：xitca-web HTTP/3 依赖的 IO 层（QuicConfig 等类型在此）
-xitca-io  = { version = "0.5", features = ["quic"] }
-xitca-web = { version = "0.7", features = [
+# sweety-io：HTTP/3 依赖的 IO 层（QuicConfig 等类型在此）
+sweety-io  = { path = "vendor/sweety-io-v5", features = ["quic"] }
+sweety-web = { path = "vendor/sweety-web", features = [
     "http1", "http2", "http3",
     "rustls",
     "websocket",
@@ -52,7 +82,7 @@ tokio-rustls    = { version = "0.26", default-features = false, features = ["rin
 webpki-roots    = "0.26"
 # ACME 自动证书（HTTP-01，instant-acme）
 instant-acme   = "0.7"
-# WebSocket 协议库（xitca-web websocket feature 已引入此 crate）
+# WebSocket 协议库（sweety-web websocket feature 已引入此 crate）
 http-ws        = { version = "0.3", features = ["stream"] }
 # http 基础类型（WebSocket handler 需要）
 http           = "1"
@@ -114,6 +144,8 @@ hmac         = "0.12"
 sha1         = "0.10"
 # sendfile(2) syscall（Linux/macOS 零拷贝静态文件传输）
 libc         = "0.2"
+# Quinn QUIC 传输层（HTTP/3），版本与 sweety-io 0.5.1 内部使用的版本一致
+quinn        = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
 
 # ─────────────────────────────────────────────
 # 平台特定依赖
@@ -128,7 +160,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 [features]
 # jemalloc 默认开启（Linux/macOS）；Windows 上此 feature 存在但依赖不引入
 default = ["jemalloc"]
-# HTTP/3 支持（由 xitca-web http3 feature 提供，此处仅作开关标志）
+# HTTP/3 支持（由 sweety-web http3 feature 提供，此处仅作开关标志）
 http3 = []
 # 高性能内存分配器（Linux/macOS 有效，Windows 自动跳过）
 jemalloc = ["dep:tikv-jemallocator"]

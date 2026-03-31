@@ -1,7 +1,7 @@
-//! 响应处理模块
+﻿//! 响应处理模块
 //! 负责：响应头透传（跳过 hop-by-hop）、Set-Cookie 改写、Location 重写、proxy_error
 
-use xitca_web::{
+use sweety_web::{
     body::ResponseBody,
     http::{
         StatusCode, WebResponse,
@@ -95,7 +95,7 @@ pub fn apply_response_headers(
     proxy_redirect_from: Option<&str>,
     proxy_redirect_to: Option<&str>,
 ) {
-    use xitca_web::http::header::HeaderName;
+    use sweety_web::http::header::HeaderName;
 
     for (k, v) in headers {
         // hop-by-hop 头不透传给客户端，phf O(1) 查找

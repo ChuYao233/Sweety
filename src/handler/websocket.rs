@@ -1,4 +1,4 @@
-//! WebSocket 处理器
+﻿//! WebSocket 处理器
 //! 负责：基于 http-ws 库的 WebSocket 握手升级、帧收发、每站点连接计数
 //! 使用 http_ws::handshake() 验证请求 + http_ws::ws() 建立流式连接
 
@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::RwLock;
 use tracing::warn;
-use xitca_web::{
+use sweety_web::{
     body::ResponseBody,
     http::{
         StatusCode, WebResponse,
@@ -71,7 +71,7 @@ impl WsRegistry {
 /// 1. 用 http_ws::handshake() 验证请求头
 /// 2. 用 http_ws::ws() 建立流式连接，返回 101 响应
 /// 3. 在后台 task 中进行帧收发（Echo + Ping/Pong + Close）
-pub async fn handle_xitca(
+pub async fn handle_sweety(
     ctx: &WebContext<'_, AppState>,
     location: &LocationConfig,
 ) -> WebResponse {
@@ -136,30 +136,4 @@ mod tests {
         assert_eq!(reg.count("site_b").await, 1);
     }
 
-    #[test]
-    fn test_ws_frame_text_small() {
-        let frame = WsFrame {
-            fin: true,
-            opcode: WsOpcode::Text,
-            payload: b"hello".to_vec(),
-        };
-        let bytes = frame.to_bytes();
-        // 第一字节：FIN(1) + text(0x1) = 0x81
-        assert_eq!(bytes[0], 0x81);
-        // 第二字节：长度 5，无掩码
-        assert_eq!(bytes[1], 5);
-        assert_eq!(&bytes[2..], b"hello");
-    }
-
-    #[test]
-    fn test_ws_frame_ping() {
-        let frame = WsFrame {
-            fin: true,
-            opcode: WsOpcode::Ping,
-            payload: vec![],
-        };
-        let bytes = frame.to_bytes();
-        assert_eq!(bytes[0], 0x89); // FIN + Ping
-        assert_eq!(bytes[1], 0);    // 空 payload
-    }
 }

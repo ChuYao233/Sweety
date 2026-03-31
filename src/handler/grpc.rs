@@ -1,9 +1,9 @@
-//! gRPC 反向代理处理器
+﻿//! gRPC 反向代理处理器
 //!
 //! gRPC = HTTP/2 + 二进制 Protobuf 帧 + Content-Type: application/grpc
 //!
 //! # 实现说明
-//! xitca-web 底层是 HTTP/1.1 连接层，直接透传 gRPC H2 帧不可行。
+//! sweety-web 底层是 HTTP/1.1 连接层，直接透传 gRPC H2 帧不可行。
 //! 实际方案：通过 HTTP/1.1 连接将 gRPC 请求转发给上游（适用于支持 h2c 的 gRPC 代理）。
 //! 对于生产 gRPC，推荐上游监听 HTTP/2 cleartext（h2c），Sweety 通过 HTTP/1.1 全量收集转发。
 //!
@@ -14,7 +14,7 @@
 //! 4. 不做 body 压缩/替换（Protobuf 二进制，替换无意义）
 
 use tracing::debug;
-use xitca_web::{
+use sweety_web::{
     body::ResponseBody,
     http::{StatusCode, WebResponse, header::{CONTENT_TYPE, HeaderValue}},
     WebContext,
@@ -25,7 +25,7 @@ use crate::dispatcher::vhost::SiteInfo;
 use crate::server::http::AppState;
 
 /// 处理 gRPC 反向代理请求
-pub async fn handle_xitca(
+pub async fn handle_sweety(
     ctx: &WebContext<'_, AppState>,
     site: &SiteInfo,
     location: &LocationConfig,
@@ -103,7 +103,7 @@ pub async fn handle_xitca(
 
     // ── 读取请求体（gRPC 帧，全量收集）──────────────────────────────────
     let cap = ctx.req().headers()
-        .get(xitca_web::http::header::CONTENT_LENGTH)
+        .get(sweety_web::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
@@ -151,7 +151,7 @@ pub async fn handle_xitca(
             }
             // 注入 grpc-status=0 (OK) 如果上游没有返回
             {
-                use xitca_web::http::header::HeaderName;
+                use sweety_web::http::header::HeaderName;
                 let grpc_status_name = HeaderName::from_static("grpc-status");
                 if !resp.headers().contains_key(&grpc_status_name) {
                     if let Ok(v) = HeaderValue::from_str("0") {
@@ -175,7 +175,7 @@ pub async fn handle_xitca(
 /// 构造 gRPC 错误响应
 /// gRPC 错误格式：HTTP 200 + grpc-status 非零（或 HTTP 5xx + grpc-status）
 fn grpc_error(http_status: StatusCode, grpc_status: u32, msg: &str) -> WebResponse {
-    use xitca_web::http::header::HeaderName;
+    use sweety_web::http::header::HeaderName;
     let mut resp = WebResponse::new(ResponseBody::none());
     *resp.status_mut() = http_status;
     resp.headers_mut().insert(

@@ -76,7 +76,8 @@ impl ConnPool {
             return;
         }
         let limit = if max_idle_override > 0 { max_idle_override } else { self.max_idle };
-        let mut entry = self.inner.entry(key.to_owned()).or_default();
+        // 用 or_insert_with 只在 key 不存在时才分配，复用已有节点时零堆分配
+        let mut entry = self.inner.entry(key.to_owned()).or_insert_with(NodePool::default);
         let pool = entry.value_mut();
         if pool.idle.len() >= limit {
             return; // 超过上限，丢弃

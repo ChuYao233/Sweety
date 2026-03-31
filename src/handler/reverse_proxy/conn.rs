@@ -45,6 +45,8 @@ pub async fn forward_request(
     connect_timeout_secs: u64,
     read_timeout_secs: u64,
     write_timeout_secs: u64,
+    // false = 流式透传（不等上游响应体完成即开始转发）
+    proxy_buffering: bool,
 ) -> Result<WebResponse> {
     debug!("转发 {} {} → {} (tls={}, body={}B)",
         method, path, upstream_addr, use_tls, body.len());
@@ -71,7 +73,7 @@ pub async fn forward_request(
         match send_recv_pooled(conn, method, path, host, extra_headers, client_ip, body,
             strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
             sub_filter, proxy_cache, client_proto,
-            read_timeout_secs, write_timeout_secs).await
+            read_timeout_secs, write_timeout_secs, proxy_buffering).await
         {
             Ok((resp, maybe_conn)) => {
                 if let Some(c) = maybe_conn {
@@ -136,6 +138,7 @@ async fn send_recv_pooled(
     client_proto: &str,
     read_timeout_secs: u64,
     write_timeout_secs: u64,
+    proxy_buffering: bool,
 ) -> Result<(WebResponse, Option<PooledConn>)> {
     let read_timeout  = Duration::from_secs(if read_timeout_secs  > 0 { read_timeout_secs  } else { 60 });
     let write_timeout = Duration::from_secs(if write_timeout_secs > 0 { write_timeout_secs } else { 60 });
@@ -158,7 +161,8 @@ async fn send_recv_pooled(
 
     debug!("→ {} {} Host:{} body={}B", method, path, host, req_body.len());
 
-    // HTTP/1.1 串行：先写请求，再读响应，不需要 split
+    // HTTP/1.1 串行：先写请求，再读响应
+    // BufReader::new(conn) 直接 move conn，后续流式路径可直接 move buf 进 task
     let mut conn = conn;
     // 写入请求头（带 write_timeout）
     tokio::time::timeout(write_timeout, conn.write_all(req.as_bytes())).await
@@ -169,8 +173,8 @@ async fn send_recv_pooled(
     }
     conn.flush().await?;
 
-    // ── 读取响应头 ──────────────────────────────────────────────────────
-    let mut buf = BufReader::new(&mut conn);
+    // ── 读取响应头（BufReader move conn，不借用）─────────────────────────
+    let mut buf = BufReader::new(conn);
 
     let mut status_line = String::new();
     match tokio::time::timeout(read_timeout, buf.read_line(&mut status_line)).await {
@@ -221,8 +225,7 @@ async fn send_recv_pooled(
             || s == StatusCode::RESET_CONTENT
             || s.is_informational();
         if no_body_status {
-            drop(buf);
-            let maybe_conn = if !resp_conn_close { Some(conn) } else { None };
+            let maybe_conn = if !resp_conn_close { Some(buf.into_inner()) } else { None };
             let mut resp = WebResponse::new(ResponseBody::none());
             *resp.status_mut() = s;
             apply_response_headers(&mut resp, &response_headers,
@@ -231,9 +234,70 @@ async fn send_recv_pooled(
         }
     }
 
+    // ── proxy_buffering = false：流式透传响应体 ─────────────────────────────
+    // 不把响应体读进内存，直接用 bounded channel stream 透传给客户端。
+    // 适用场景：大文件下载、SSE、长轮询、streaming API。
+    // 限制：sub_filter / proxy_cache / URL 替换在流式路径下不生效（需 buffering=true）。
+    if !proxy_buffering && sub_filter.is_empty() && proxy_cache.is_none() {
+        let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
+        let no_body = http_status == StatusCode::NOT_MODIFIED
+            || http_status == StatusCode::NO_CONTENT
+            || http_status == StatusCode::RESET_CONTENT
+            || http_status.is_informational();
+
+        if no_body {
+            let mut resp = WebResponse::new(ResponseBody::none());
+            *resp.status_mut() = http_status;
+            apply_response_headers(&mut resp, &response_headers,
+                strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
+            return Ok((resp, None));
+        }
+
+        // 用 bounded channel(cap=2) 流式转发：生产者读上游，消费者写客户端
+        // buf 已 move conn，直接 move buf 进 task
+        let stream_len = resp_content_length.unwrap_or(usize::MAX);
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(2);
+
+        tokio::spawn(async move {
+            let mut reader = buf;
+            let chunk_size = crate::handler::sendfile::STREAM_CHUNK;
+            let mut remaining = stream_len;
+            let mut heap_buf = vec![0u8; chunk_size];
+
+            loop {
+                if remaining == 0 { break; }
+                let to_read = remaining.min(chunk_size);
+                let slice = &mut heap_buf[..to_read];
+                match reader.read(slice).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = bytes::Bytes::copy_from_slice(&slice[..n]);
+                        remaining = remaining.saturating_sub(n);
+                        if tx.send(Ok(chunk)).await.is_err() { break; }
+                    }
+                    Err(e) => { let _ = tx.send(Err(e)).await; break; }
+                }
+            }
+            // reader 在 task 结束时 drop，连接自动关闭
+        });
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let body = ResponseBody::box_stream(stream);
+        let mut resp = WebResponse::new(body);
+        *resp.status_mut() = http_status;
+        apply_response_headers(&mut resp, &response_headers,
+            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
+        // 流式路径：如果有 Content-Length 就设置，没有则让客户端靠 EOF 判断
+        if let Some(len) = resp_content_length {
+            if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(len)) {
+                resp.headers_mut().insert(CONTENT_LENGTH, v);
+            }
+        }
+        return Ok((resp, None)); // 连接已 move 进 task，不归还池
+    }
+
     // ── 读取响应体（支持 chunked / Content-Length / EOF）───────────────────
     let body_bytes = if resp_is_chunked {
-        // chunked 读完后连接可复用（HTTP/1.1 标准行为）
         read_chunked_body(&mut buf).await?
     } else if let Some(len) = resp_content_length {
         read_exact_body(&mut buf, len).await?
@@ -244,9 +308,7 @@ async fn send_recv_pooled(
         b
     };
 
-    // BufReader 归还底层连接
-    drop(buf);
-    let maybe_conn = if !resp_conn_close { Some(conn) } else { None };
+    let maybe_conn = if !resp_conn_close { Some(buf.into_inner()) } else { drop(buf); None };
 
     // ── URL 替换（仅文本类型）────────────────────────────────────
     let body_after_url = rewrite_body_urls(body_bytes, &response_headers, proxy_redirect_from, proxy_redirect_to);
@@ -267,7 +329,6 @@ async fn send_recv_pooled(
     }
 
     let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
-    // 304/204/205/1xx 不能带 body（HTTP 规范 + H2 dispatcher 要求）
     let no_body = http_status == StatusCode::NOT_MODIFIED
         || http_status == StatusCode::NO_CONTENT
         || http_status == StatusCode::RESET_CONTENT
@@ -281,7 +342,6 @@ async fn send_recv_pooled(
     *resp.status_mut() = http_status;
     apply_response_headers(&mut resp, &response_headers,
         strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
-    // 304/204 不设 Content-Length
     if !no_body {
         if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_len)) {
             resp.headers_mut().insert(CONTENT_LENGTH, v);

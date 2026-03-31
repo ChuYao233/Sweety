@@ -223,6 +223,7 @@ pub async fn handle_xitca(
                 pool.connect_timeout,
                 pool.read_timeout,
                 pool.write_timeout,
+                location.proxy_buffering,
             ).await;
 
             match result {

@@ -133,6 +133,7 @@ pub async fn handle_xitca(
         scheme, // client_proto
         0, 0, 0, // keepalive_requests, keepalive_time, keepalive_max_idle（gRPC 不限制）
         10, 60, 60, // connect_timeout, read_timeout, write_timeout（gRPC 默认值）
+        true,        // proxy_buffering=true（gRPC 必须完整读取响应体）
     ).await;
 
     node.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);

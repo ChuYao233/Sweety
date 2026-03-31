@@ -651,19 +651,40 @@ pub struct ProxyCacheConfig {
 
 /// 请求处理器类型
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum HandlerType {
     /// 静态文件服务
     #[default]
+    #[serde(rename = "static")]
     Static,
     /// PHP / FastCGI
+    #[serde(rename = "fastcgi")]
     Fastcgi,
     /// WebSocket
+    #[serde(rename = "websocket")]
     Websocket,
     /// 反向代理
+    #[serde(rename = "reverse_proxy")]
     ReverseProxy,
     /// gRPC 反向代理（HTTP/2 二进制帧，Content-Type: application/grpc）
+    #[serde(rename = "grpc")]
     Grpc,
+    /// 插件处理器（handler = "plugin:name" 格式）
+    /// 序列化时保留完整字符串，反序列化时从 "plugin:xxx" 解析
+    #[serde(untagged, deserialize_with = "deserialize_plugin_handler")]
+    Plugin(String),
+}
+
+/// 反序列化 plugin:<name> 格式的 handler 字段
+fn deserialize_plugin_handler<'de, D>(de: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(de)?;
+    if let Some(name) = s.strip_prefix("plugin:") {
+        Ok(name.to_string())
+    } else {
+        Err(serde::de::Error::custom(format!("期望 plugin:<name> 格式，得到: {}", s)))
+    }
 }
 
 // ─────────────────────────────────────────────

@@ -570,6 +570,28 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         }
     }
 
+    // 插件 on_request 前置拦截（handler = "plugin:xxx" 时短路）
+    if let HandlerType::Plugin(ref plugin_name) = location.handler {
+        let method_str = ctx.req().method().as_str();
+        let body_len = ctx.req().headers()
+            .get(xitca_web::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let client_ip_str2 = ctx.req().body().socket_addr().ip().to_string();
+        let preq = crate::handler::plugin::PluginRequest {
+            method:    method_str,
+            path:      effective_path,
+            headers:   ctx.req().headers(),
+            client_ip: &client_ip_str2,
+            body_len,
+        };
+        if let Some(short_resp) = crate::handler::plugin::run_plugin_request(plugin_name, &preq) {
+            state.metrics.record_status(short_resp.status().as_u16());
+            return short_resp;
+        }
+    }
+
     // 根据 handler 类型分发
     // FastCGI 的 try_files：先解析文件存在性，再决定走 FastCGI 还是 static
     let mut resp = match location.handler {
@@ -617,7 +639,21 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         HandlerType::Grpc => {
             crate::handler::grpc::handle_xitca(ctx, &site, &location).await
         }
+        // Plugin handler：on_request 已在上方处理，这里 on_request 返回 Continue
+        // 插件可以作为独立 handler（不走其他 handler），直接返回 200 或交由 on_response 改写
+        HandlerType::Plugin(ref plugin_name) => {
+            use xitca_web::body::ResponseBody;
+            let mut r = WebResponse::new(ResponseBody::none());
+            *r.status_mut() = StatusCode::OK;
+            // 调用 on_response：插件可在此修改响应体/头
+            crate::handler::plugin::run_plugin_response(plugin_name, r)
+        }
     };
+
+    // 插件 on_response 后置处理（非 Plugin handler 也可挂载）
+    if let HandlerType::Plugin(ref plugin_name) = location.handler {
+        resp = crate::handler::plugin::run_plugin_response(plugin_name, resp);
+    }
 
     state.metrics.record_status(resp.status().as_u16());
 

@@ -19,7 +19,6 @@ use std::io::Result as IoResult;
 use bytes::Bytes;
 use futures_util::Stream;
 use tokio::io::AsyncReadExt;
-use tokio_util::io::ReaderStream;
 
 /// 大文件流式传输块大小（256 KiB）
 pub const STREAM_CHUNK: usize = 256 * 1024;
@@ -153,13 +152,13 @@ pub async fn sendfile_to_socket(
     Ok(sent)
 }
 
-/// Windows / 不支持 sendfile 的平台：常规分块读
-/// 静态文件流式传输降级路径（无 sendfile）
+/// Windows / 不支持 sendfile 的平台：常规分块读（复用背压 stream）
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn file_stream_fallback(
     file: tokio::fs::File,
+    len: u64,
 ) -> impl Stream<Item = IoResult<Bytes>> + Send + 'static {
-    ReaderStream::with_capacity(file, STREAM_CHUNK)
+    file_stream_backpressure(file, len)
 }
 
 /// 判断当前平台是否支持 sendfile（HTTP/1.1 零拷贝）

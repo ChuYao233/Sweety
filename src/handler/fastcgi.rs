@@ -91,7 +91,7 @@ pub async fn handle_xitca(
     use crate::middleware::proxy_cache::CacheKey;
 
     // ── FastCGI 缓存查询 ────────────────────────────────────────────────
-    let fcgi_cache = ctx.state().fcgi_caches.get(&site.name).cloned();
+    let fcgi_cache = site.fcgi_cache_arc.clone();
     let method_str = ctx.req().method().as_str();
     let req_path   = ctx.req().uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
     let host_str_owned: String = ctx.req().uri().authority()

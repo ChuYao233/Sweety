@@ -89,61 +89,56 @@ impl SweetyServer {
         // HTTP 端口集合（用于判断请求是否是 HTTP）
         let http_port_set: HashSet<u16> = collect_http_ports(&cfg).into_iter().collect();
 
-        // 为各站点创建访问日志写入器（同步打开文件，避免在运行时内 block_on）
-        let access_loggers = {
-            let mut map: HashMap<String, Arc<AccessLogger>> = HashMap::new();
-            for site in &cfg.sites {
-                if let Some(log_path) = &site.access_log {
-                    match AccessLogger::file_sync(log_path, LogFormat::Combined) {
-                        Ok(l) => {
-                            info!("站点 '{}' 访问日志: {}", site.name, log_path.display());
-                            map.insert(site.name.clone(), Arc::new(l));
-                        }
-                        Err(e) => tracing::warn!("站点 '{}' 访问日志初始化失败: {}", site.name, e),
+        // 为各站点创建 access_logger / proxy_cache / fcgi_cache 并直接注入 SiteInfo
+        // 消除每请求 HashMap 字符串哈希查找（从 O(1) 哈希 → 直接指针解引用）
+        // 注意：有日志配置的站点数量，用于判断是否需要记录 req_start
+        let mut any_access_log = false;
+        for site in &cfg.sites {
+            // 访问日志
+            let access_logger: Option<Arc<AccessLogger>> = if let Some(log_path) = &site.access_log {
+                any_access_log = true;
+                match AccessLogger::file_sync(log_path, LogFormat::Combined) {
+                    Ok(l) => {
+                        info!("站点 '{}' 访问日志: {}", site.name, log_path.display());
+                        Some(Arc::new(l))
+                    }
+                    Err(e) => {
+                        tracing::warn!("站点 '{}' 访问日志初始化失败: {}", site.name, e);
+                        None
                     }
                 }
-            }
-            Arc::new(map)
-        };
+            } else { None };
 
-        // 按站点配置创建 FastCGI 缓存实例
-        let fcgi_caches = {
-            let mut map: HashMap<String, Arc<ProxyCache>> = HashMap::new();
-            for site in &cfg.sites {
-                if let Some(fcgi) = &site.fastcgi {
-                    if let Some(cache_cfg) = &fcgi.cache {
-                        // 复用 ProxyCacheConfig 结构构建，字段对应
-                        let proxy_cfg = crate::config::model::ProxyCacheConfig {
-                            path: cache_cfg.path.clone(),
-                            max_entries: cache_cfg.max_entries,
-                            ttl: cache_cfg.ttl,
-                            cacheable_statuses: cache_cfg.cacheable_statuses.clone(),
-                            cacheable_methods: cache_cfg.cacheable_methods.clone(),
-                            bypass_headers: cache_cfg.bypass_headers.clone(),
-                        };
-                        let cache = ProxyCache::from_config(&proxy_cfg);
-                        map.insert(site.name.clone(), cache);
-                        info!("站点 '{}' FastCGI 缓存已开启（max_entries={}, ttl={}s)",
-                            site.name, cache_cfg.max_entries, cache_cfg.ttl);
-                    }
-                }
-            }
-            Arc::new(map)
-        };
+            // FastCGI 缓存
+            let fcgi_cache_arc: Option<Arc<ProxyCache>> = site.fastcgi.as_ref()
+                .and_then(|fcgi| fcgi.cache.as_ref())
+                .map(|cache_cfg| {
+                    let proxy_cfg = crate::config::model::ProxyCacheConfig {
+                        path: cache_cfg.path.clone(),
+                        max_entries: cache_cfg.max_entries,
+                        ttl: cache_cfg.ttl,
+                        cacheable_statuses: cache_cfg.cacheable_statuses.clone(),
+                        cacheable_methods: cache_cfg.cacheable_methods.clone(),
+                        bypass_headers: cache_cfg.bypass_headers.clone(),
+                    };
+                    info!("站点 '{}' FastCGI 缓存已开启（max_entries={}, ttl={}s)",
+                        site.name, cache_cfg.max_entries, cache_cfg.ttl);
+                    ProxyCache::from_config(&proxy_cfg)
+                });
 
-        // 按站点配置创建反代缓存实例
-        let proxy_caches = {
-            let mut map: HashMap<String, Arc<ProxyCache>> = HashMap::new();
-            for site in &cfg.sites {
-                if let Some(cache_cfg) = &site.proxy_cache {
-                    let cache = ProxyCache::from_config(cache_cfg);
-                    map.insert(site.name.clone(), cache);
+            // 反代缓存
+            let proxy_cache_arc: Option<Arc<ProxyCache>> = site.proxy_cache.as_ref()
+                .map(|cache_cfg| {
                     info!("站点 '{}' 反代缓存已开启（max_entries={}, ttl={}s）",
                         site.name, cache_cfg.max_entries, cache_cfg.ttl);
-                }
-            }
-            Arc::new(map)
-        };
+                    ProxyCache::from_config(cache_cfg)
+                });
+
+            // 将三个资源注入 SiteInfo（通过注册表 upsert 更新已有条目）
+            registry.inject_site_resources(
+                &site.name, access_logger, proxy_cache_arc, fcgi_cache_arc,
+            );
+        }
 
         // 第二步：构建 state
         let state = AppState {
@@ -154,8 +149,7 @@ impl SweetyServer {
             http_ports: Arc::new(http_port_set),
             conn_pool,
             sni_resolvers: Arc::new(port_resolvers),
-            access_loggers,
-            proxy_caches,
+            any_access_log,
             active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_connections: cfg.global.max_connections,
             max_body_bytes: (cfg.global.client_max_body_size as u64) * 1024 * 1024,
@@ -164,7 +158,6 @@ impl SweetyServer {
                 cfg.global.fastcgi_connect_timeout,
                 cfg.global.fastcgi_read_timeout,
             )),
-            fcgi_caches,
         };
 
         // 第三步：构建 xitca-web App
@@ -281,18 +274,14 @@ pub struct AppState {
     pub max_body_bytes: u64,
     /// 当前活跃连接数（原子计数器，无锁）
     pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
-    /// 访问日志写入器（按站点名索引）
-    pub access_loggers: Arc<HashMap<String, Arc<AccessLogger>>>,
+    /// 是否有任意站点配置了访问日志（用于 req_start 延迟初始化判断）
+    pub any_access_log: bool,
     /// 上游 TCP/TLS 连接池（跨请求复用 idle 连接）
     pub conn_pool: ConnPool,
     /// SNI 证书 Resolver 按端口索引（热重载时原地更新证书，不断连）
     pub sni_resolvers: Arc<HashMap<u16, Arc<SniResolver>>>,
-    /// 反代响应缓存（按站点名索引）
-    pub proxy_caches: Arc<HashMap<String, Arc<ProxyCache>>>,
     /// FastCGI 连接池（复用 PHP-FPM 连接）
     pub fcgi_pool: Arc<FcgiPool>,
-    /// FastCGI 响应缓存（按站点名索引，复用 ProxyCache 实现）
-    pub fcgi_caches: Arc<HashMap<String, Arc<ProxyCache>>>,
 }
 
 /// max_connections RAII 守卫：Drop 时自动减计数器
@@ -311,10 +300,11 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     let state = ctx.state();
     // req_start 延迟初始化：只有当该站点配置了访问日志时才计时
     // 大多数 bench 站点没有日志，就完全跳过此系统调用
-    let req_start: Option<std::time::Instant> = if state.access_loggers.is_empty() {
-        None
-    } else {
+    // req_start 延迟初始化：只有配置了访问日志的实例才计时
+    let req_start: Option<std::time::Instant> = if state.any_access_log {
         Some(std::time::Instant::now())
+    } else {
+        None
     };
 
     // max_connections 限流：超出并发上限时返回 503（与 Nginx limit_conn 行为一致）
@@ -619,8 +609,8 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     }
 
     // 访问日志：非阻塞投递到 channel，后台 task 批量写文件
-    // 只有该站点配置了日志记录器时才进入此分支（access_loggers 为空时直接跳过）
-    if let Some(logger) = state.access_loggers.get(&site.name) {
+    // site.access_logger 直接持有，零 HashMap 查找开销
+    if let Some(logger) = &site.access_logger {
         let duration_ms = req_start.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
         logger.send(AccessLogEntry {
             client_ip: ctx.req().body().socket_addr().ip().to_string(),

@@ -145,10 +145,7 @@ pub async fn handle_xitca(
 
     // ── proxy_cache 查询（读缓存，O(1) 内存匹配） ─────────────────────
     let cache_key = CacheKey::new(method, upstream_host, path);
-    let proxy_cache: Option<std::sync::Arc<ProxyCache>> = ctx.state()
-        .proxy_caches
-        .get(&site.name)
-        .cloned();
+    let proxy_cache: Option<std::sync::Arc<ProxyCache>> = site.proxy_cache_arc.clone();
 
     if let Some(ref cache) = proxy_cache {
         // 直接传 HeaderMap，跳过中间 Vec 堆分配

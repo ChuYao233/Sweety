@@ -12,6 +12,8 @@ use crate::config::model::{FastCgiConfig, HstsConfig, SiteConfig, TlsConfig, Ups
 use crate::dispatcher::location::CompiledLocation;
 use crate::dispatcher::rewrite::CompiledRewrite;
 use crate::handler::reverse_proxy::lb::UpstreamPool;
+use crate::middleware::access_log::AccessLogger;
+use crate::middleware::proxy_cache::ProxyCache;
 
 /// 运行时站点信息（从 SiteConfig 提取，去掉不需要运行时使用的字段）
 ///
@@ -62,6 +64,12 @@ pub struct SiteInfo {
     pub fastcgi: Option<FastCgiConfig>,
     /// 反代响应缓存配置
     pub proxy_cache: Option<crate::config::model::ProxyCacheConfig>,
+    /// 访问日志写入器（直接持有，避免每请求 HashMap 查找）
+    pub access_logger: Option<Arc<AccessLogger>>,
+    /// 反代响应缓存（直接持有，避免每请求 HashMap 查找）
+    pub proxy_cache_arc: Option<Arc<ProxyCache>>,
+    /// FastCGI 响应缓存（直接持有，避免每请求 HashMap 查找）
+    pub fcgi_cache_arc: Option<Arc<ProxyCache>>,
 }
 
 impl SiteInfo {
@@ -113,6 +121,10 @@ impl SiteInfo {
             listen_tls: cfg.listen_tls.clone(),
             error_pages: cfg.error_pages.clone(),
             proxy_cache: cfg.proxy_cache.clone(),
+            // 延迟注入：由 SweetyServer::run 在构建时填充
+            access_logger: None,
+            proxy_cache_arc: None,
+            fcgi_cache_arc: None,
         }
     }
 }
@@ -176,6 +188,51 @@ impl VHostRegistry {
         if site_cfg.fallback {
             fallback = Some(Arc::clone(&site_info));
         }
+        self.inner.store(Arc::new(VHostInner { exact, wildcard, fallback }));
+    }
+
+    /// 将运行时资源注入已注册站点（启动时调用，不触发完整 from_config 重建）
+    pub fn inject_site_resources(
+        &self,
+        site_name: &str,
+        access_logger: Option<Arc<AccessLogger>>,
+        proxy_cache_arc: Option<Arc<ProxyCache>>,
+        fcgi_cache_arc: Option<Arc<ProxyCache>>,
+    ) {
+        let old = self.inner.load_full();
+        let mut exact    = old.exact.clone();
+        let mut wildcard = old.wildcard.clone();
+        let fallback     = old.fallback.clone();
+
+        // 构建更新后的 SiteInfo（clone 原有，只替换三个资源字段）
+        let mut updated_info: Option<Arc<SiteInfo>> = None;
+        for val in exact.values() {
+            if val.name == site_name {
+                let mut info = (**val).clone();
+                info.access_logger  = access_logger.clone();
+                info.proxy_cache_arc = proxy_cache_arc.clone();
+                info.fcgi_cache_arc  = fcgi_cache_arc.clone();
+                updated_info = Some(Arc::new(info));
+                break;
+            }
+        }
+        let Some(new_arc) = updated_info else { return };
+
+        for val in exact.values_mut() {
+            if val.name == site_name {
+                *val = Arc::clone(&new_arc);
+            }
+        }
+        for val in wildcard.values_mut() {
+            if val.name == site_name {
+                *val = Arc::clone(&new_arc);
+            }
+        }
+        let fallback = if fallback.as_ref().map(|f| f.name == site_name).unwrap_or(false) {
+            Some(Arc::clone(&new_arc))
+        } else {
+            fallback
+        };
         self.inner.store(Arc::new(VHostInner { exact, wildcard, fallback }));
     }
 

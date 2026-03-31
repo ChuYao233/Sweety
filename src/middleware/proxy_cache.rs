@@ -73,6 +73,7 @@ impl CacheEntry {
 }
 
 /// 反向代理缓存（线程安全，可跨 worker 共享）
+#[derive(Debug)]
 pub struct ProxyCache {
     mem: Arc<DashMap<CacheKey, CacheEntry>>,
     max_entries: usize,

@@ -51,6 +51,7 @@ pub struct AccessLogEntry {
 ///
 /// 请求侧 `try_send` 非阻塞投递；独立系统线程负责写文件，不占 tokio worker。
 /// 可在 tokio runtime 启动前安全调用 `file_sync`。
+#[derive(Debug)]
 pub struct AccessLogger {
     tx: Option<std_mpsc::SyncSender<AccessLogEntry>>,
 }

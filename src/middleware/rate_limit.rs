@@ -6,12 +6,78 @@
 //! - nodelay 模式：burst 内请求立即放行（等价 Nginx limit_req nodelay）
 //! - IpPath 组合维度：IP + 路径联合限流
 //! - 过期桶定期清理（防内存泄漏）
+//! - IP 维度用 256 分片 Mutex 数组，减少锁竞争（对标 Nginx ip_hash 分片策略）
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tracing::debug;
+
+// IP 限流分片数：256 个分片，每个分片独立 Mutex
+// 1000 并发时平均每分片 ~4 个并发请求，锁竞争近于零
+const IP_SHARDS: usize = 256;
+
+/// IP 维度限流分片结构（替代 DashMap）
+struct IpBucketShards {
+    shards: Box<[Mutex<HashMap<u32, TokenBucket>>; IP_SHARDS]>,
+}
+
+impl IpBucketShards {
+    fn new() -> Self {
+        let shards: Vec<Mutex<HashMap<u32, TokenBucket>>> = (0..IP_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
+        // SAFETY: 已确保长度为 IP_SHARDS=256
+        let boxed: Box<[Mutex<HashMap<u32, TokenBucket>>; IP_SHARDS]> =
+            shards.into_boxed_slice().try_into()
+                .unwrap_or_else(|_| unreachable!("IP_SHARDS 长度匹配"));
+        Self { shards: boxed }
+    }
+
+    /// 将 IPv4 数字映射到分片下标（用最低一字节分片）
+    #[inline(always)]
+    fn shard_idx(ip_int: u32) -> usize {
+        (ip_int & 0xFF) as usize
+    }
+
+    fn check(&self, ip_str: &str, rate: u64, burst: u64, nodelay: bool) -> Result<(), f64> {
+        let ip_int = ip_to_u32(ip_str);
+        let idx = Self::shard_idx(ip_int);
+        let mut shard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
+        let bucket = shard.entry(ip_int).or_insert_with(|| TokenBucket::new(rate, burst));
+        bucket.try_acquire_nodelay(nodelay)
+    }
+
+    fn cleanup(&self, idle_secs: u64) {
+        let threshold = Duration::from_secs(idle_secs);
+        for shard in self.shards.iter() {
+            let mut map = shard.lock().unwrap_or_else(|e| e.into_inner());
+            map.retain(|_, b| b.last_refill.elapsed() < threshold);
+        }
+    }
+}
+
+/// IPv4 字符串转 u32（失败时用 hash 模拟）
+#[inline]
+fn ip_to_u32(ip: &str) -> u32 {
+    if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+        match addr {
+            std::net::IpAddr::V4(v4) => u32::from(v4),
+            std::net::IpAddr::V6(v6) => {
+                // IPv6：取最后 4 字节作为索引
+                let octets = v6.octets();
+                u32::from_be_bytes([octets[12], octets[13], octets[14], octets[15]])
+            }
+        }
+    } else {
+        // 非标准 IP（如 Unix socket 地址）：简单哈希
+        let mut h: u32 = 2166136261;
+        for b in ip.bytes() { h = h.wrapping_mul(16777619) ^ (b as u32); }
+        h
+    }
+}
 
 use crate::config::model::{RateLimitDimension, RateLimitRule};
 
@@ -91,13 +157,14 @@ pub struct RateLimiter {
     pub rule: RateLimitRule,
     /// 预编译的路径正则（仅 Path/IpPath 维度且配置了 path_pattern 时有值）
     path_regex: Option<regex::Regex>,
-    /// 令牌桶映射表：限流 key → TokenBucket
+    /// IP 维度专用分片 Mutex（256 片，低竞争）
+    ip_shards: Option<Arc<IpBucketShards>>,
+    /// 其他维度令牌桶（DashMap）
     buckets: Arc<DashMap<String, TokenBucket>>,
 }
 
 impl RateLimiter {
     pub fn new(rule: RateLimitRule) -> Self {
-        // 路径正则预编译
         let path_regex = rule.path_pattern.as_deref()
             .and_then(|p| match regex::Regex::new(p) {
                 Ok(re) => Some(re),
@@ -106,7 +173,13 @@ impl RateLimiter {
                     None
                 }
             });
-        Self { rule, path_regex, buckets: Arc::new(DashMap::new()) }
+        // IP 维度使用分片 Mutex，其他维度用 DashMap
+        let ip_shards = if matches!(rule.dimension, RateLimitDimension::Ip) {
+            Some(Arc::new(IpBucketShards::new()))
+        } else {
+            None
+        };
+        Self { rule, path_regex, ip_shards, buckets: Arc::new(DashMap::new()) }
     }
 
     /// 检查请求是否允许通过
@@ -117,6 +190,16 @@ impl RateLimiter {
         headers: &std::collections::HashMap<String, String>,
         user_agent: &str,
     ) -> RateLimitResult {
+        // IP 维度：走低竞争分片 Mutex，不经过 DashMap
+        if let Some(shards) = &self.ip_shards {
+            return match shards.check(client_ip, self.rule.rate, self.rule.burst, self.rule.nodelay) {
+                Ok(()) => RateLimitResult::Allow,
+                Err(wait_secs) => RateLimitResult::Deny {
+                    retry_after_secs: (wait_secs.ceil() as u64).max(1)
+                },
+            };
+        }
+
         let key = match self.build_key(client_ip, path, headers, user_agent) {
             Some(k) => k,
             None => return RateLimitResult::Allow,
@@ -128,7 +211,6 @@ impl RateLimiter {
         match bucket.try_acquire_nodelay(self.rule.nodelay) {
             Ok(()) => RateLimitResult::Allow,
             Err(wait_secs) => {
-                // retry_after 至少 1 秒（HTTP Retry-After 头为整数秒）
                 let retry = (wait_secs.ceil() as u64).max(1);
                 RateLimitResult::Deny { retry_after_secs: retry }
             }
@@ -195,6 +277,9 @@ impl RateLimiter {
     /// 清理长时间未使用的令牌桶（防内存泄漏，建议每分钟调用一次）
     pub fn cleanup_expired(&self, idle_secs: u64) {
         let threshold = Duration::from_secs(idle_secs);
+        if let Some(shards) = &self.ip_shards {
+            shards.cleanup(idle_secs);
+        }
         self.buckets.retain(|_, b| b.last_refill.elapsed() < threshold);
         debug!("限流桶清理完成，剩余 {} 个活跃桶", self.buckets.len());
     }

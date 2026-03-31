@@ -10,7 +10,6 @@
 //! 零拷贝：tokio 读写操作底层使用内核缓冲区，性能与 Nginx 接近
 
 use std::{
-    cell::RefCell,
     io,
     pin::Pin,
     task::{Context as TaskContext, Poll},
@@ -35,30 +34,29 @@ use crate::server::http::AppState;
 
 /// 双向 WebSocket 转发 Stream
 ///
-/// 持有 &'a RefCell<RequestBody>（而非 owned body），每次 poll_next 时临时
-/// borrow_mut() 读一帧，**读完立即 drop RefMut，不跨 await 持有**。
-/// 这样 dispatcher 的 RequestBodySender 端始终存活，body_reader 正常驱动客户端数据。
+/// 框架 poll 响应 body 时，同时驱动两个方向：
+/// - client → upstream：从 RequestBody 读帧写 upstream write half
+/// - upstream → client：从 upstream read half 读帧，输出给框架
 ///
-/// 与 Nginx 单 worker 事件循环等价：一次 poll 同时检查两个方向的 ready 状态。
-struct BiDirStream<'a, R, W> {
+/// 与 Nginx 单 worker 事件循环等价：一次 poll 同时检查两个 fd 的 ready 状态。
+struct BiDirStream<R, W> {
     upstream_read:  R,
     upstream_write: W,
-    /// 借用 ctx.body，不 take，dispatcher body_reader 正常工作
-    client_body:    &'a RefCell<RequestBody>,
-    /// 从上游读取的缓冲区（64KB BytesMut，freeze() 零拷贝转 Bytes）
+    client_body:    RequestBody,
+    /// 从上游读取的缓冲区（80KB BytesMut， freeze() 零拷贝转 Bytes）
     read_buf:       bytes::BytesMut,
-    /// 暂存已从 client body 拿到但尚未写完上游的数据（Bytes 引用计数，clone O(1)）
+    /// 暂存已从 client body 拿到但尚未写完上游的数据
     pending_write:  Option<Bytes>,
     /// client body 是否已结束
     client_done:    bool,
 }
 
-impl<'a, R, W> BiDirStream<'a, R, W>
+impl<R, W> BiDirStream<R, W>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    fn new(upstream_read: R, upstream_write: W, client_body: &'a RefCell<RequestBody>) -> Self {
+    fn new(upstream_read: R, upstream_write: W, client_body: RequestBody) -> Self {
         let mut read_buf = bytes::BytesMut::with_capacity(65536);
         read_buf.resize(65536, 0);
         Self {
@@ -72,7 +70,7 @@ where
     }
 }
 
-impl<'a, R, W> Stream for BiDirStream<'a, R, W>
+impl<R, W> Stream for BiDirStream<R, W>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -82,25 +80,21 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Result<Bytes, io::Error>>> {
         let this = self.get_mut();
 
-        // ── 方向 A：client → upstream ──────────────────────────────────────
-        // 先把上次未写完的数据继续写完
-        if let Some(data) = this.pending_write.clone() {
+        // ── 方向 A：client → upstream ──────────────────────────────
+        // 先把上次未写完的数据继续写
+        if let Some(ref data) = this.pending_write.as_ref() {
             match Pin::new(&mut this.upstream_write).poll_write(cx, data.as_ref()) {
                 Poll::Ready(Ok(n)) if n == data.len() => { this.pending_write = None; }
                 Poll::Ready(Ok(n)) => { this.pending_write = Some(data.slice(n..)); }
                 Poll::Ready(Err(_)) => { this.client_done = true; this.pending_write = None; }
-                Poll::Pending => {}
+                Poll::Pending => {} // 写缓冲满，稍后继续
             }
         }
-        // 从 client body 读下一帧（borrow_mut 仅在此同步块内，不跨 await）
+        // 从 client body 读下一帧
         if !this.client_done && this.pending_write.is_none() {
-            let poll_result = {
-                // SAFETY: borrow_mut 在这里立即 drop，不跨越任何 await 点
-                let mut body = this.client_body.borrow_mut();
-                Pin::new(&mut *body).poll_next(cx)
-            };
-            match poll_result {
+            match Pin::new(&mut this.client_body).poll_next(cx) {
                 Poll::Ready(Some(Ok(b))) => {
+                    // 尝试立即写上游
                     match Pin::new(&mut this.upstream_write).poll_write(cx, b.as_ref()) {
                         Poll::Ready(Ok(n)) if n == b.len() => {}
                         Poll::Ready(Ok(n)) => { this.pending_write = Some(b.slice(n..)); }
@@ -113,14 +107,18 @@ where
             }
         }
 
-        // ── 方向 B：upstream → client ──────────────────────────────────────
-        // BytesMut 读入后 split_to().freeze() 零拷贝转 Bytes
+        // ── 方向 B：upstream → client ───────────────────────────────
+        // 读入 BytesMut 后 split_to().freeze() 零拷贝转 Bytes，与 Nginx sendfile 语义相同
         this.read_buf.resize(65536, 0);
         let mut rb = TokioReadBuf::new(&mut this.read_buf);
         match Pin::new(&mut this.upstream_read).poll_read(cx, &mut rb) {
             Poll::Ready(Ok(())) => {
                 let n = rb.filled().len();
-                if n == 0 { return Poll::Ready(None); }
+                if n == 0 {
+                    // 上游关闭连接，结束 stream
+                    return Poll::Ready(None);
+                }
+                // freeze() 零拷贝：内部将 BytesMut 的内存所有权转移给 Bytes，不复制
                 let chunk = this.read_buf.split_to(n).freeze();
                 Poll::Ready(Some(Ok(chunk)))
             }
@@ -270,24 +268,19 @@ where
 
     debug!("WS 上游握手成功（101），建立双向管道");
 
-    // 构造 101 响应头
+    // 构造 101 响应头（需借用 ctx.req()，在 take_body_ref 之前完成）
     let resp_builder = http_ws::handshake(ctx.req().method(), ctx.req().headers())
         .map_err(|e| anyhow::anyhow!("客户端 WS 握手验证失败: {:?}", e))?;
     let http_resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("构建 101 响应失败: {}", e))?;
 
-    // 拆分上游连接
+    // take_body_ref：RefCell 内部可变性拿走 owned RequestBody
+    let client_body = ctx.take_body_ref();
+
+    // 拆分上游连接，构造双向 stream
     let (upstream_read, upstream_write) = tokio::io::split(upstream);
-
-    // 直接借用 ctx.body，不 take，保持 dispatcher body_reader 正常工作
-    // ResponseBody::box_stream 需要 'static，用 unsafe transmute 延长生命周期。
-    // Safety: 框架在同一个 task 里 poll bidir，实际导致 ctx.body 生命周期结束前 bidir 不会被 drop。
-    let body_ref: &RefCell<RequestBody> = ctx.body_cell();
-    let body_ref_static: &'static RefCell<RequestBody> =
-        unsafe { std::mem::transmute(body_ref) };
-
-    let bidir = BiDirStream::new(upstream_read, upstream_write, body_ref_static);
+    let bidir = BiDirStream::new(upstream_read, upstream_write, client_body);
 
     // 立即返回 101，框架持续 poll bidir stream 驱动双向转发
     let mut final_resp = WebResponse::new(ResponseBody::box_stream(bidir));

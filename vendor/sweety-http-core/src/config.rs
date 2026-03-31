@@ -40,8 +40,9 @@ impl HttpServiceConfig {
             keep_alive_timeout: Duration::from_secs(75),
             // Nginx 默认 client_header_timeout 60s
             request_head_timeout: Duration::from_secs(60),
-            // TLS 握手超时对标实际网络延迟，10s 更安全
-            tls_accept_timeout: Duration::from_secs(10),
+            // TLS 握手超时 30s：低端 CPU（J4125 等）1000 并发冷启动握手需要更多时间
+            // Nginx ssl_handshake_timeout 默认 60s，此处取中间值
+            tls_accept_timeout: Duration::from_secs(30),
             peek_protocol: false,
         }
     }

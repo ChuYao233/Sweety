@@ -21,13 +21,13 @@ use sweety_lib::{config::loader::load_config, server::http::SweetyServer};
 
 /// Sweety —— 高性能多站点 Web 服务器
 ///
-/// HTTP/1.1 + HTTP/2 + HTTP/3 + TLS + WebSocket + 反向代理 + 静态文件
-///
 /// 快速开始：
-///   sweety run
-///   sweety run --config /etc/sweety.toml
-///   sweety validate
-///   sweety api-doc
+///   sweety start             # 后台启动（daemon）
+///   sweety run               # 前台启动
+///   sweety stop              # 停止后台进程
+///   sweety restart           # 重启
+///   sweety reload            # 热重载配置（不断连）
+///   sweety validate          # 验证配置 + 证书
 #[derive(Parser, Debug)]
 #[command(
     name    = "sweety",
@@ -39,57 +39,66 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// 配置文件路径（支持 .toml）
-    #[arg(short, long, default_value = "config/sweety.toml", global = true)]
+    /// 配置文件路径
+    #[arg(short = 'c', long, default_value = "config/sweety.toml", global = true)]
     config: PathBuf,
+
+    /// 输出版本信息（-v / --ver）
+    #[arg(short = 'v', long = "ver", action = clap::ArgAction::Version, global = true)]
+    _version: (),
+
+    /// PID 文件路径（daemon 模式用）
+    #[arg(long, default_value = "/var/run/sweety.pid", global = true)]
+    pid_file: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// 在前台启动 Sweety 并持续运行（推荐用于生产环境）
-    ///
-    /// 示例：
-    ///   sweety run
-    ///   sweety run --config /etc/sweety/sweety.toml
+    /// 前台运行（不进入后台，推荐 systemd / supervisord 下使用）
     Run,
 
-    /// 验证配置文件语法和 TLS 证书（不启动服务，等价 nginx -t）
+    /// 后台启动（daemon，写 PID 文件，对标 Caddy start）
     ///
     /// 示例：
-    ///   sweety validate
-    ///   sweety validate --config /etc/sweety/sweety.toml
-    Validate,
+    ///   sweety start
+    ///   sweety start --config /etc/sweety/sweety.toml
+    ///   sweety start --pid-file /var/run/sweety.pid
+    Start,
 
-    /// 向运行中的 Sweety 发送热重载信号（配置不断连应用）
-    ///
-    /// 需要 global.admin_listen 已配置。
-    ///
-    /// 示例：
-    ///   sweety reload
-    ///   sweety reload --config /etc/sweety/sweety.toml
+    /// 停止后台运行的 Sweety（读取 PID 文件发送 SIGTERM）
+    Stop,
+
+    /// 重启：stop + start
+    Restart,
+
+    /// 热重载配置（不断开现有连接）——需要 global.admin_listen 已配置
     Reload,
 
-    /// 输出 Admin REST API 所有接口的 JSON 文档（面板对接用）
-    ///
-    /// 示例：
-    ///   sweety api-doc
-    ///   sweety api-doc | jq '.endpoints[] | .path'
+    /// 验证配置文件语法和 TLS 证书（等价 nginx -t）
+    Validate,
+
+    /// 输出 Admin REST API 文档 JSON
     #[command(name = "api-doc")]
     ApiDoc,
 
-    /// 输出当前版本信息
+    /// 输出版本信息
     Version,
 }
 
 fn main() {
     let cli = Cli::parse();
+    let config = &cli.config;
+    let pid_file = &cli.pid_file;
 
     match cli.command.unwrap_or(Commands::Run) {
-        Commands::ApiDoc => cmd_api_doc(),
-        Commands::Version => cmd_version(),
-        Commands::Validate => cmd_validate(&cli.config),
-        Commands::Reload => cmd_reload(&cli.config),
-        Commands::Run => cmd_run(&cli.config),
+        Commands::ApiDoc   => cmd_api_doc(),
+        Commands::Version  => cmd_version(),
+        Commands::Validate => cmd_validate(config),
+        Commands::Reload   => cmd_reload(config),
+        Commands::Run      => cmd_run(config),
+        Commands::Start    => cmd_start(config, pid_file),
+        Commands::Stop     => cmd_stop(pid_file),
+        Commands::Restart  => { cmd_stop(pid_file); cmd_start(config, pid_file); },
     }
 }
 
@@ -197,6 +206,135 @@ fn cmd_run(config: &PathBuf) {
     if let Err(e) = SweetyServer::new(cfg).with_config_path(config.clone()).run() {
         error!("服务器启动失败: {:#}", e);
         std::process::exit(1);
+    }
+}
+
+/// 后台启动（daemon 模式）
+///
+/// Unix: fork 子进程，父进程退出，子进程继续运行并写 PID 文件
+/// Windows: 直接 spawn 一个新进程（detached），写 PID 文件
+fn cmd_start(config: &PathBuf, pid_file: &PathBuf) {
+    // 先验证配置，失败直接退出
+    init_stderr_log();
+    let _cfg = load_cfg_or_exit(config);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // 用 setsid 创建新会话，脱离终端
+        let exe = std::env::current_exe().unwrap_or_else(|_| "sweety".into());
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("run")
+           .arg("--config").arg(config)
+           .arg("--pid-file").arg(pid_file);
+        // 关闭标准输入，重定向输出到 /dev/null
+        cmd.stdin(std::process::Stdio::null())
+           .stdout(std::process::Stdio::null())
+           .stderr(std::process::Stdio::null());
+        unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                if let Some(parent) = pid_file.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(pid_file, pid.to_string()) {
+                    eprintln!("[WARN] 写 PID 文件失败 {}: {}", pid_file.display(), e);
+                }
+                println!("Sweety started (PID {})", pid);
+                println!("PID file: {}", pid_file.display());
+            }
+            Err(e) => {
+                eprintln!("[ERROR] 启动失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        let exe = std::env::current_exe().unwrap_or_else(|_| "sweety.exe".into());
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("run")
+           .arg("--config").arg(config)
+           .arg("--pid-file").arg(pid_file)
+           .stdin(std::process::Stdio::null())
+           .stdout(std::process::Stdio::null())
+           .stderr(std::process::Stdio::null())
+           .creation_flags(DETACHED_PROCESS);
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                if let Err(e) = std::fs::write(pid_file, pid.to_string()) {
+                    eprintln!("[WARN] 写 PID 文件失败: {}", e);
+                }
+                println!("Sweety started (PID {})", pid);
+            }
+            Err(e) => {
+                eprintln!("[ERROR] 启动失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// 停止后台运行的 Sweety（读取 PID 文件，发送 SIGTERM）
+fn cmd_stop(pid_file: &PathBuf) {
+    let pid_str = match std::fs::read_to_string(pid_file) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => {
+            eprintln!("[ERROR] 找不到 PID 文件: {}，Sweety 可能未在运行", pid_file.display());
+            std::process::exit(1);
+        }
+    };
+    let pid: u32 = match pid_str.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("[ERROR] PID 文件内容无效: {}", pid_str);
+            std::process::exit(1);
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if ret == 0 {
+            let _ = std::fs::remove_file(pid_file);
+            println!("Sweety stopped (PID {})", pid);
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                eprintln!("[WARN] 进程 {} 不存在，可能已停止", pid);
+                let _ = std::fs::remove_file(pid_file);
+            } else {
+                eprintln!("[ERROR] 发送 SIGTERM 失败: {}", err);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows 没有 SIGTERM，用 taskkill /F /PID
+        let status = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                let _ = std::fs::remove_file(pid_file);
+                println!("Sweety stopped (PID {})", pid);
+            }
+            Ok(_) => {
+                eprintln!("[WARN] 进程 {} 可能已停止", pid);
+                let _ = std::fs::remove_file(pid_file);
+            }
+            Err(e) => {
+                eprintln!("[ERROR] taskkill 失败: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 

@@ -310,8 +310,8 @@ fn load_pem_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig> {
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("构建 Rustls ServerConfig 失败")?;
-    // TLS 1.2 session cache：缓存 10240 个 session，减少重复握手开销
-    config.session_storage = rustls::server::ServerSessionMemoryCache::new(10240);
+    // session cache 65536：高并发时大量客户端复用 TLS session，避免重复握手
+    config.session_storage = rustls::server::ServerSessionMemoryCache::new(65536);
 
     info!("TLS 证书加载成功: {}", cert_path.display());
     Ok(config)

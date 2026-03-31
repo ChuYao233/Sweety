@@ -20,6 +20,21 @@ pub enum LogFormat {
     Json,
     /// Apache Combined 格式（兼容传统日志分析工具）
     Combined,
+    /// 自定义模板格式（等价 Nginx log_format）
+    /// 支持变量：$remote_addr $method $uri $http_version $status
+    ///          $bytes_sent $http_referer $http_user_agent $duration_ms $time_local $site
+    Custom(String),
+}
+
+impl LogFormat {
+    /// 从配置字符串解析格式（"combined" / "json" / 自定义模板）
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "combined" => LogFormat::Combined,
+            "json"     => LogFormat::Json,
+            other      => LogFormat::Custom(other.to_string()),
+        }
+    }
 }
 
 /// 单条访问日志记录
@@ -128,40 +143,53 @@ fn writer_thread(
 /// 将日志记录格式化为字符串
 fn format_entry(e: &AccessLogEntry, format: &LogFormat) -> String {
     match format {
-            LogFormat::Json => {
-                // JSON 格式
-                serde_json::json!({
-                    "time":       Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%z").to_string(),
-                    "site":       e.site,
-                    "client":     e.client_ip,
-                    "method":     e.method,
-                    "uri":        e.uri,
-                    "proto":      e.http_version,
-                    "status":     e.status,
-                    "bytes":      e.bytes_sent,
-                    "referer":    e.referer,
-                    "ua":         e.user_agent,
-                    "duration_ms": e.duration_ms,
-                })
-                .to_string()
-            }
-            LogFormat::Combined => {
-                // Apache Combined 格式：
-                // client - - [time] "METHOD uri PROTO" status bytes "referer" "ua" duration_ms
-                format!(
-                    r#"{} - - [{}] "{} {} {}" {} {} "{}" "{}" {}ms"#,
-                    e.client_ip,
-                    Local::now().format("%d/%b/%Y:%H:%M:%S %z"),
-                    e.method,
-                    e.uri,
-                    e.http_version,
-                    e.status,
-                    e.bytes_sent,
-                    e.referer,
-                    e.user_agent,
-                    e.duration_ms,
-                )
-            }
+        LogFormat::Json => {
+            serde_json::json!({
+                "time":        Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%z").to_string(),
+                "site":        e.site,
+                "client":      e.client_ip,
+                "method":      e.method,
+                "uri":         e.uri,
+                "proto":       e.http_version,
+                "status":      e.status,
+                "bytes":       e.bytes_sent,
+                "referer":     e.referer,
+                "ua":          e.user_agent,
+                "duration_ms": e.duration_ms,
+            })
+            .to_string()
+        }
+        LogFormat::Combined => {
+            format!(
+                r#"{} - - [{}] "{} {} {}" {} {} "{}" "{}" {}ms"#,
+                e.client_ip,
+                Local::now().format("%d/%b/%Y:%H:%M:%S %z"),
+                e.method,
+                e.uri,
+                e.http_version,
+                e.status,
+                e.bytes_sent,
+                e.referer,
+                e.user_agent,
+                e.duration_ms,
+            )
+        }
+        LogFormat::Custom(tmpl) => {
+            // 变量插值：替换 $variable 为实际值
+            let time_local = Local::now().format("%d/%b/%Y:%H:%M:%S %z").to_string();
+            tmpl
+                .replace("$remote_addr",    &e.client_ip)
+                .replace("$method",         &e.method)
+                .replace("$uri",            &e.uri)
+                .replace("$http_version",   &e.http_version)
+                .replace("$status",         &e.status.to_string())
+                .replace("$bytes_sent",     &e.bytes_sent.to_string())
+                .replace("$http_referer",   &e.referer)
+                .replace("$http_user_agent",&e.user_agent)
+                .replace("$duration_ms",    &e.duration_ms.to_string())
+                .replace("$time_local",     &time_local)
+                .replace("$site",           &e.site)
+        }
     }
 }
 

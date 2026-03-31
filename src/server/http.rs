@@ -97,7 +97,11 @@ impl SweetyServer {
             // 访问日志
             let access_logger: Option<Arc<AccessLogger>> = if let Some(log_path) = &site.access_log {
                 any_access_log = true;
-                match AccessLogger::file_sync(log_path, LogFormat::Combined) {
+                let fmt = match &site.access_log_format {
+                    Some(f) => LogFormat::from_str(f),
+                    None    => LogFormat::Combined,
+                };
+                match AccessLogger::file_sync(log_path, fmt) {
                     Ok(l) => {
                         info!("站点 '{}' 访问日志: {}", site.name, log_path.display());
                         Some(Arc::new(l))
@@ -473,13 +477,14 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
 
     let effective_path = rewritten.as_deref().unwrap_or(&path);
 
-    let location = match crate::dispatcher::location::match_location(&site.locations, effective_path) {
+    let compiled_loc = match crate::dispatcher::location::match_location(&site.locations, effective_path) {
         Some(loc) => loc,
         None => {
             state.metrics.record_status(404);
             return make_error_resp(StatusCode::NOT_FOUND);
         }
     };
+    let location = &compiled_loc.config;
 
     // 请求体大小限制（Content-Length 超过 client_max_body_size 时拒绝）
     let max_body_bytes = state.max_body_bytes;
@@ -504,6 +509,22 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         return make_redirect_resp(&url, StatusCode::from_u16(code).unwrap_or(StatusCode::MOVED_PERMANENTLY));
     }
 
+    // return_body：直接返回文本内容体（等价 Caddy respond / Nginx return 200 "text"）
+    if let Some(ref body_text) = location.return_body {
+        let code = location.return_code.unwrap_or(200);
+        let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+        let ct = location.return_content_type.as_deref()
+            .unwrap_or("text/plain; charset=utf-8");
+        state.metrics.record_status(code);
+        let mut resp = WebResponse::new(ResponseBody::from(body_text.clone()));
+        *resp.status_mut() = status;
+        resp.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_str(ct).unwrap_or_else(|_| HeaderValue::from_static("text/plain; charset=utf-8")),
+        );
+        return resp;
+    }
+
     // return_code：直接返回状态码（健康检查）
     if let Some(code) = location.return_code {
         let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
@@ -512,6 +533,19 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         *resp.status_mut() = status;
         return resp;
     }
+
+    // per-location limit_conn：并发连接数限制（等价 Nginx limit_conn）
+    let _loc_conn_guard: Option<ConnGuard> = if compiled_loc.limit_conn > 0 {
+        let cur = compiled_loc.conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cur >= compiled_loc.limit_conn {
+            compiled_loc.conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            state.metrics.record_status(503);
+            return make_error_resp(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Some(ConnGuard(Arc::clone(&compiled_loc.conn_count)))
+    } else {
+        None
+    };
 
     // auth_request 前置鉴权（等价 Nginx auth_request）
     // 直接传 HeaderMap，零中间 Vec 堆分配

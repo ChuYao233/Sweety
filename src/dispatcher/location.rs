@@ -4,6 +4,9 @@
 //!
 //! 性能关键点：正则对象在站点初始化时预编译，请求时直接匹配，避免每请求 Regex::new()
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+
 use regex::Regex;
 
 use crate::config::model::LocationConfig;
@@ -29,6 +32,10 @@ pub struct CompiledLocation {
     pub kind: LocationKind,
     /// 兼容旧接口，保留 regex 字段（仅正则类型有值）
     pub regex: Option<Regex>,
+    /// per-location 并发连接计数器（limit_conn 功能用）
+    pub conn_count: Arc<AtomicUsize>,
+    /// per-location 并发连接上限（从 config.limit_conn 拷贝过来，错误时不再访问 config）
+    pub limit_conn: usize,
 }
 
 impl Clone for CompiledLocation {
@@ -37,6 +44,8 @@ impl Clone for CompiledLocation {
             config: self.config.clone(),
             kind: self.kind.clone(),
             regex: self.regex.clone(),
+            conn_count: Arc::clone(&self.conn_count),
+            limit_conn: self.limit_conn,
         }
     }
 }
@@ -68,7 +77,8 @@ impl CompiledLocation {
         } else {
             (LocationKind::Prefix, None)
         };
-        Self { config: cfg, kind, regex }
+        let limit_conn = cfg.limit_conn;
+        Self { config: cfg, kind, regex, conn_count: Arc::new(AtomicUsize::new(0)), limit_conn }
     }
 }
 
@@ -78,12 +88,12 @@ impl CompiledLocation {
 pub fn match_location<'a>(
     locations: &'a [CompiledLocation],
     path: &str,
-) -> Option<&'a LocationConfig> {
+) -> Option<&'a CompiledLocation> {
     // 第一轮：精确匹配和前缀优先（用预计算的 kind，零字符串扫描）
     for cl in locations {
         match &cl.kind {
-            LocationKind::Exact(p) if p == path => return Some(&cl.config),
-            LocationKind::PrefixPriority(p) if path.starts_with(p.as_str()) => return Some(&cl.config),
+            LocationKind::Exact(p) if p == path => return Some(cl),
+            LocationKind::PrefixPriority(p) if path.starts_with(p.as_str()) => return Some(cl),
             _ => {}
         }
     }
@@ -92,25 +102,25 @@ pub fn match_location<'a>(
     for cl in locations {
         if let LocationKind::Regex(re) = &cl.kind {
             if re.is_match(path) {
-                return Some(&cl.config);
+                return Some(cl);
             }
         }
     }
 
     // 第三轮：普通前缀匹配，找最长前缀
-    let mut best: Option<(&LocationConfig, usize)> = None;
+    let mut best: Option<(&CompiledLocation, usize)> = None;
     for cl in locations {
         if !matches!(cl.kind, LocationKind::Prefix) { continue; }
         let p = &cl.config.path;
         if path.starts_with(p.as_str()) {
             let len = p.len();
             if best.map_or(true, |(_, bl)| len > bl) {
-                best = Some((&cl.config, len));
+                best = Some((cl, len));
             }
         }
     }
 
-    best.map(|(loc, _)| loc)
+    best.map(|(cl, _)| cl)
 }
 
 // ─────────────────────────────────────────────
@@ -134,21 +144,21 @@ mod tests {
     fn test_exact_match_wins() {
         let locations = vec![cloc("/"), cloc("= /exact")];
         let result = match_location(&locations, "/exact");
-        assert_eq!(result.unwrap().path, "= /exact");
+        assert_eq!(result.unwrap().config.path, "= /exact");
     }
 
     #[test]
     fn test_prefix_priority_wins_over_regex() {
         let locations = vec![cloc("~ /static"), cloc("^~ /static/")];
         let result = match_location(&locations, "/static/logo.png");
-        assert_eq!(result.unwrap().path, "^~ /static/");
+        assert_eq!(result.unwrap().config.path, "^~ /static/");
     }
 
     #[test]
     fn test_regex_match() {
         let locations = vec![cloc("/"), cloc("~ \\.php$")];
         let result = match_location(&locations, "/index.php");
-        assert_eq!(result.unwrap().path, "~ \\.php$");
+        assert_eq!(result.unwrap().config.path, "~ \\.php$");
     }
 
     #[test]
@@ -162,7 +172,7 @@ mod tests {
     fn test_longest_prefix_wins() {
         let locations = vec![cloc("/"), cloc("/api/"), cloc("/api/v1/")];
         let result = match_location(&locations, "/api/v1/users");
-        assert_eq!(result.unwrap().path, "/api/v1/");
+        assert_eq!(result.unwrap().config.path, "/api/v1/");
     }
 
     #[test]
@@ -176,6 +186,6 @@ mod tests {
     fn test_root_prefix_match() {
         let locations = vec![cloc("/")];
         let result = match_location(&locations, "/anything");
-        assert_eq!(result.unwrap().path, "/");
+        assert_eq!(result.unwrap().config.path, "/");
     }
 }

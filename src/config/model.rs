@@ -172,6 +172,15 @@ pub struct SiteConfig {
     #[serde(default)]
     pub access_log: Option<PathBuf>,
 
+    /// 访问日志格式（等价 Nginx log_format）
+    /// 不设则使用 access_log_format 指定的格式，再不设则 combined
+    /// 支持变量：$remote_addr $method $uri $http_version $status
+    ///           $bytes_sent $http_referer $http_user_agent $duration_ms $time_local $site
+    /// 特殊格式名："combined"（默认）、"json"
+    /// 自定义格式示例: "$remote_addr [$time_local] \"$method $uri\" $status $bytes_sent"
+    #[serde(default)]
+    pub access_log_format: Option<String>,
+
     /// 错误日志路径（空则使用全局）
     #[serde(default)]
     pub error_log: Option<PathBuf>,
@@ -468,6 +477,27 @@ pub struct LocationConfig {
     #[serde(default)]
     pub return_url: Option<String>,
 
+    /// 直接返回文本内容体（等价 Caddy respond / Nginx return 200 "text"）
+    /// 与 return_code 配合使用，不设 return_code 时默认 200
+    /// 示例: return_body = "OK"
+    #[serde(default)]
+    pub return_body: Option<String>,
+
+    /// return_body 的 Content-Type（默认 "text/plain; charset=utf-8"）
+    #[serde(default)]
+    pub return_content_type: Option<String>,
+
+    /// per-location 并发连接数限制（等价 Nginx limit_conn）
+    /// 超出返回 503，0 = 不限制
+    #[serde(default)]
+    pub limit_conn: usize,
+
+    /// 反代缓冲控制（等价 Nginx proxy_buffering）
+    /// true（默认）= 缓冲上游响应后再发给客户端（减少上游连接占用时间）
+    /// false = 流式转发，适合 SSE / 大文件下载
+    #[serde(default = "default_true")]
+    pub proxy_buffering: bool,
+
     /// 尝试文件列表（等价 Nginx try_files $uri $uri/ /index.html）
     /// 支持: $uri、$uri/、/fallback.html、=404 等
     #[serde(default)]
@@ -512,10 +542,14 @@ impl Default for LocationConfig {
             add_headers: vec![],
             cache_rules: vec![],
             return_url: None,
+            return_body: None,
+            return_content_type: None,
+            limit_conn: 0,
+            proxy_buffering: true,
             try_files: vec![],
             sub_filter: vec![],
             auth_request: None,
-            auth_failure_status: 401,  // 与 serde default 保持一致
+            auth_failure_status: 401,
             auth_request_headers: vec![],
         }
     }
@@ -649,6 +683,21 @@ pub struct UpstreamConfig {
 
     /// 节点列表
     pub nodes: Vec<UpstreamNode>,
+
+    /// Keepalive 空闲连接池大小（等价 Nginx keepalive N）
+    /// 每个 worker 保持的最大空闲连接数，0 = 32（默认）
+    #[serde(default)]
+    pub keepalive: usize,
+
+    /// 单个连接最大复用请求数（等价 Nginx keepalive_requests）
+    /// 达到此数后关闭连接重建，0 = 不限制
+    #[serde(default)]
+    pub keepalive_requests: u64,
+
+    /// 连接最大复用时间（秒，等价 Nginx keepalive_time）
+    /// 超过此时间后关闭连接重建，0 = 不限制
+    #[serde(default)]
+    pub keepalive_time: u64,
 }
 
 /// 负载均衡策略

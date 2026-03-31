@@ -16,7 +16,7 @@ Sweety 是一款以 Rust 编写、基于 [Xitca-Web](https://github.com/HFQR/xit
 | 功能分类 | 支持内容 |
 |---|---|
 | **协议** | HTTP/1.1、HTTP/2、HTTP/3（QUIC） |
-| **TLS** | Rustls 纯 Rust TLS、多证书（ECDSA + RSA + Ed25519 + SM2）、ACME 自动证书（Let's Encrypt / ZeroSSL / Buypass）、TLS 版本控制 |
+| **TLS** | Rustls 纯 Rust TLS、多证书（ECDSA + RSA + Ed25519）、ACME 自动证书（Let's Encrypt / ZeroSSL / Buypass）、TLS 版本控制 |
 | **多站点** | 虚拟主机 SNI 隔离、HTTPS 跨站防护（421）、`fallback` 兜底站点 |
 | **静态文件** | 流式传输（ReaderStream）、Range 分块、**Brotli + gzip** 双压缩（优先 br）、ETag/Last-Modified 缓存、`try_files` |
 | **PHP/FastCGI** | 高并发连接池、死连接自动剔除、`fastcgi_cache`（内存+磁盘双层） |
@@ -27,10 +27,10 @@ Sweety 是一款以 Rust 编写、基于 [Xitca-Web](https://github.com/HFQR/xit
 | **限流** | 按 IP / 路径 / IP+路径 / Header / User-Agent 五维度令牌桶；`nodelay` 模式（等价 Nginx limit_req nodelay） |
 | **鉴权** | `auth_request` 子请求鉴权（等价 Nginx auth_request），支持完整 URL 或相对路径 |
 | **安全** | 敏感文件拦截、HTTPS 跨站隔离、请求体大小限制（413）、HSTS、`force_https` |
-| **响应处理** | `sub_filter` 内容替换（字符串/正则）、`add_headers` 注入、`proxy_set_headers` 覆盖、`cache_rules` 按扩展名缓存 |
+| **响应处理** | `sub_filter` 内容替换（字符串/正则）、`add_headers` 注入、`proxy_set_headers` 覆盖、`cache_rules` 按扩展名缓存、`return_body` 直接返回内容体 |
 | **缓存** | 静态文件 ETag/Last-Modified、`proxy_cache`、`fastcgi_cache`、按扩展名 `Cache-Control` |
 | **压缩** | Brotli（优先，压缩率高 20-30%）+ gzip（降级），全局/站点级覆盖，可配等级和最小文件大小 |
-| **日志** | 访问日志异步写文件（Nginx combined / JSON 格式）、错误日志、日志级别动态配置 |
+| **日志** | 访问日志异步写文件（Nginx combined / JSON / 自定义 log_format 格式）、错误日志、日志级别动态配置 |
 | **监控** | 实时统计（QPS、带宽）、Prometheus 导出 |
 | **管理 API** | HTTP + WebSocket 双协议，动态增删站点 |
 | **热重载** | 配置/证书文件变更后自动 diff 更新，不断开现有连接 |
@@ -167,7 +167,6 @@ sweety/
 | WebSocket 代理 | ✅ | ✅ | ✅ |
 | 单文件无依赖 | ✅ | ❌ | ✅ |
 | 内存安全 | ✅ Rust | ❌ C | ✅ Go |
-| SM2 国密证书 | ✅ | ❌ | ❌ |
 | Windows 多线程 | ✅ IOCP | ❌ 单线程 select | ⚠️ |
 | TCP/UDP 四层代理 | ❌ | ✅ stream 模块 | ✅ layer4 插件 |
 | Lua 脚本扩展 | ❌ | ✅ OpenResty | ❌ |
@@ -202,7 +201,7 @@ log_level = "sweety_lib=info,xitca_server=warn,xitca_web=warn,xitca_http=off"
 ## 路线图
 
 - [x] HTTP/1.1 + HTTP/2 静态文件服务（流式、Range、ETag）
-- [x] TLS（Rustls）——多证书 ECDSA/Ed25519/RSA/SM2、SNI Resolver、TLS 版本控制
+- [x] TLS（Rustls）——多证书 ECDSA/Ed25519/RSA、SNI Resolver、TLS 版本控制
 - [x] ACME 自动证书（HTTP-01，支持 Let's Encrypt / ZeroSSL / Buypass）
 - [x] HTTP/3（QUIC）集成
 - [x] FastCGI 连接池（死连接剔除、超时重试、流式响应）
@@ -225,11 +224,21 @@ log_level = "sweety_lib=info,xitca_server=warn,xitca_web=warn,xitca_http=off"
 - [x] `return` 指令（带 URL，支持 `$request_uri` 变量）
 - [x] `try_files`（支持 `$uri`/`$uri/`/固定路径/`=404`）
 - [x] `error_page` 自定义错误页（按状态码匹配）
-- [x] 访问日志异步写文件（Nginx combined / JSON 格式）
+- [x] 访问日志异步写文件（Nginx combined / JSON / 自定义 log_format 格式）
 - [x] `proxy_cache`（内存+磁盘双层，TTL/可缓存状态码/bypass 头配置）
 - [x] `sub_filter`（响应体内容替换，支持字符串和正则）
 - [x] `force_https`（HTTP 自动跳转 HTTPS）
 - [x] `proxy_set_headers` / `add_headers` / `cache_rules` / `strip_cookie_secure`
+- [x] `return_body` / `return_text` 直接返回内容体（不只是状态码）
+- [x] per-location `limit_conn`（并发连接限制）
+- [x] 访问日志 `log_format` 自定义格式（变量插值）
+- [x] upstream `keepalive_requests` / `keepalive_time` 精细控制
+- [x] `proxy_buffering` 控制（缓冲/流式两种模式）
+- [x] 文件缓存 notify 自动失效（文件修改时实时淘汰内存缓存）
+- [x] 错误页预构建 Bytes 缓存（零 format! 分配）
+- [ ] ACME DNS-01 验证（通配符证书，支持 Cloudflare / 阿里云等 provider）
+- [ ] 自动 HTTPS（零配置，detect server_name 自动申请 ACME）
+- [ ] templates 模板渲染（Tera 集成）
 - [ ] TCP/UDP 四层代理（stream 模块）
 - [ ] 流式 gzip/brotli（大文件 > 4MB 在线压缩）
 - [ ] HTTP/2 Server Push

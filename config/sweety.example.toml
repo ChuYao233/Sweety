@@ -95,6 +95,12 @@ root        = "/var/www/example"
 index       = ["index.html", "index.htm"]
 # 访问日志路径（留空则不记录）
 access_log  = "/var/log/sweety/example_access.log"
+# 访问日志格式（等价 Nginx log_format）
+# 特殊值："combined"（默认，Apache Combined 格式）、"json"（结构化 JSON）
+# 自定义模板：支持变量 $remote_addr $method $uri $http_version $status
+#                       $bytes_sent $http_referer $http_user_agent $duration_ms $time_local $site
+# 示例：access_log_format = "$remote_addr [$time_local] \"$method $uri\" $status $bytes_sent"
+access_log_format = "combined"
 # 站点级错误日志（不设则继承全局 error_log）
 error_log   = "/var/log/sweety/example_error.log"
 # 强制 HTTP → HTTPS 301 跳转
@@ -151,11 +157,27 @@ preload             = false
 "500" = "/500.html"
 "503" = "/503.html"
 
-# ── Location：精确匹配健康检查 ────────────────────────────────────────────────
+# ── Location：精确匹配健康检查（return_code 直接返回状态码）────────────────
 [[sites.locations]]
 path        = "= /health"
 handler     = "static"
 return_code = 200   # 直接返回状态码，不读文件
+
+# ── Location：respond 直接返回内容体（等价 Caddy respond）────────────────────
+# 与 return_code 配合使用；不设 return_code 时默认 200
+[[sites.locations]]
+path                 = "= /version"
+handler              = "static"
+return_body          = '{"version":"1.0","status":"ok"}'
+return_content_type  = "application/json; charset=utf-8"
+# return_code        = 200   # 可选，不填默认 200
+
+# ── Location：带并发连接限制（等价 Nginx limit_conn）────────────────────────
+# limit_conn = 100  每个 location 最多 100 个并发连接，超出返回 503
+[[sites.locations]]
+path       = "= /download"
+handler    = "static"
+limit_conn = 100   # 0 = 不限制（默认）
 
 # ── Location：前缀优先匹配静态资源 ───────────────────────────────────────────
 [[sites.locations]]
@@ -181,6 +203,7 @@ return_url = "301 https://example.com/new-path$request_uri"
 path      = "/"
 handler   = "static"
 try_files = ["$uri", "$uri/", "/index.html"]
+# proxy_buffering = true  # 反代缓冲（true=缓冲后发送，false=流式转发 SSE/大文件）
 
 # ── 限流配置 ──────────────────────────────────────────────────────────────────
 [sites.rate_limit]
@@ -373,6 +396,12 @@ bypass_headers     = ["Authorization", "Cookie", "X-No-Cache"]
 name = "backend"
 # 负载均衡策略：round_robin / weighted / least_conn / ip_hash
 strategy = "least_conn"
+# Keepalive 空闲连接池（等价 Nginx keepalive N）
+keepalive          = 32   # 每 worker 保持最多 32 个空闲连接，0 = 默认 32
+# 单连接最大复用请求数（等价 Nginx keepalive_requests）
+keepalive_requests = 1000 # 达到后关闭重建，0 = 不限制
+# 单连接最大复用时间（秒，等价 Nginx keepalive_time）
+keepalive_time     = 300  # 超过后关闭重建，0 = 不限制
 
 # 主动健康检查
 [sites.upstreams.health_check]

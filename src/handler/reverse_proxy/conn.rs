@@ -38,10 +38,13 @@ pub async fn forward_request(
     sub_filter: &[crate::config::model::SubFilter],
     proxy_cache: Option<(&std::sync::Arc<ProxyCache>, &CacheKey)>,
     client_proto: &str,
-    // upstream keepalive 精细控制参数（0 = 不限制/用默认）
     keepalive_requests: u64,
     keepalive_time: u64,
     keepalive_max_idle: usize,
+    // 超时控制（0 = 用默认）
+    connect_timeout_secs: u64,
+    read_timeout_secs: u64,
+    write_timeout_secs: u64,
 ) -> Result<WebResponse> {
     debug!("转发 {} {} → {} (tls={}, body={}B)",
         method, path, upstream_addr, use_tls, body.len());
@@ -55,19 +58,20 @@ pub async fn forward_request(
             match pool.acquire(&key) {
                 Some((c, ca, rc)) => { debug!("复用 idle 连接: {}", upstream_addr); (c, ca, rc) }
                 None => {
-                    let c = new_conn(upstream_addr, use_tls, tls_sni, tls_insecure).await?;
+                    let c = new_conn(upstream_addr, use_tls, tls_sni, tls_insecure, connect_timeout_secs).await?;
                     (c, Instant::now(), 0u64)
                 }
             }
         } else {
             debug!("重试新建连接: {}", upstream_addr);
-            let c = new_conn(upstream_addr, use_tls, tls_sni, tls_insecure).await?;
+            let c = new_conn(upstream_addr, use_tls, tls_sni, tls_insecure, connect_timeout_secs).await?;
             (c, Instant::now(), 0u64)
         };
 
         match send_recv_pooled(conn, method, path, host, extra_headers, client_ip, body,
             strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
-            sub_filter, proxy_cache, client_proto).await
+            sub_filter, proxy_cache, client_proto,
+            read_timeout_secs, write_timeout_secs).await
         {
             Ok((resp, maybe_conn)) => {
                 if let Some(c) = maybe_conn {
@@ -95,12 +99,14 @@ async fn new_conn(
     use_tls: bool,
     tls_sni: &str,
     tls_insecure: bool,
+    connect_timeout_secs: u64,
 ) -> Result<PooledConn> {
+    let timeout = if connect_timeout_secs > 0 { connect_timeout_secs } else { 10 };
     let tcp = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(timeout),
         TcpStream::connect(upstream_addr),
     ).await
-    .map_err(|_| anyhow::anyhow!("连接上游超时: {}", upstream_addr))??;
+    .map_err(|_| anyhow::anyhow!("连接上游超时 ({}s): {}", timeout, upstream_addr))??;
 
     if use_tls {
         let tls = tls_connect(tcp, tls_sni, tls_insecure).await?;
@@ -128,7 +134,11 @@ async fn send_recv_pooled(
     sub_filter: &[crate::config::model::SubFilter],
     proxy_cache: Option<(&std::sync::Arc<ProxyCache>, &CacheKey)>,
     client_proto: &str,
+    read_timeout_secs: u64,
+    write_timeout_secs: u64,
 ) -> Result<(WebResponse, Option<PooledConn>)> {
+    let read_timeout  = Duration::from_secs(if read_timeout_secs  > 0 { read_timeout_secs  } else { 60 });
+    let write_timeout = Duration::from_secs(if write_timeout_secs > 0 { write_timeout_secs } else { 60 });
     // ── 构造请求头（keep-alive）──────────────────────────────────────────────
     // 预分配容量：请求行 + host + 过滤后的头 + 4 个固定头 + \r\n
     let mut req = String::with_capacity(
@@ -150,17 +160,20 @@ async fn send_recv_pooled(
 
     // HTTP/1.1 串行：先写请求，再读响应，不需要 split
     let mut conn = conn;
-    conn.write_all(req.as_bytes()).await?;
+    // 写入请求头（带 write_timeout）
+    tokio::time::timeout(write_timeout, conn.write_all(req.as_bytes())).await
+        .map_err(|_| anyhow::anyhow!("写入请求头超时 ({}s)", write_timeout.as_secs()))??;
     if !req_body.is_empty() {
-        conn.write_all(req_body).await?;
+        tokio::time::timeout(write_timeout, conn.write_all(req_body)).await
+            .map_err(|_| anyhow::anyhow!("写入请求体超时 ({}s)", write_timeout.as_secs()))??;
     }
     conn.flush().await?;
 
-    // ── 读取响应头 ──────────────────────────────────────────────────────────
+    // ── 读取响应头 ──────────────────────────────────────────────────────
     let mut buf = BufReader::new(&mut conn);
 
     let mut status_line = String::new();
-    match tokio::time::timeout(Duration::from_secs(60), buf.read_line(&mut status_line)).await {
+    match tokio::time::timeout(read_timeout, buf.read_line(&mut status_line)).await {
         Err(_) => return Err(anyhow::anyhow!("等待上游响应超时")),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof && !status_line.is_empty() => {}
         Ok(Err(e)) => return Err(e.into()),

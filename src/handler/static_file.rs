@@ -14,7 +14,6 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
 use tracing::debug;
 use xitca_web::{
     body::ResponseBody,
@@ -36,8 +35,6 @@ use crate::server::http::AppState;
 
 /// gzip 压缩的文件大小上限（4 MB）——超过此值直接流式传输，不做内存压缩
 const GZIP_MAX_INLINE: u64 = 4 * 1024 * 1024;
-/// ReaderStream 块大小（256 KiB）
-const STREAM_CHUNK: usize = 256 * 1024;
 /// 内存文件缓存大小上限：只缓存 ≤ 256KB 的小文件
 const FILE_CACHE_MAX_BYTES: u64 = 256 * 1024;
 /// 最多缓存条数
@@ -347,8 +344,9 @@ pub async fn handle_xitca(
         if file.seek(SeekFrom::Start(range_start)).await.is_err() {
             return make_error(StatusCode::RANGE_NOT_SATISFIABLE, "");
         }
+        // Range 请求也用背压 stream，防止 H2 flow control buffer 溢出
         let limited = file.take(range_len);
-        let stream = ReaderStream::with_capacity(limited, STREAM_CHUNK);
+        let stream = crate::handler::sendfile::file_stream_backpressure(limited, range_len);
         let body = ResponseBody::box_stream(stream);
         let mut resp = WebResponse::new(body);
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
@@ -443,7 +441,9 @@ pub async fn handle_xitca(
 
 /// 把打开的文件包装为流式 ResponseBody
 ///
-/// 使用 `ReaderStream`：连接断开时 Stream drop，读取立即停止，CPU 立即回落。
+/// - 使用带背压的 bounded channel stream（容量 = 2）
+/// - 生产者每发一个 256KB chunk 就 await，等消费者（H2 framer）拉取后才继续读
+/// - 内存恒定 ≤ 2 × 256KB = 512KB，无论文件多大，H2 flow control buffer 不溢出
 fn stream_file_response(
     file: tokio::fs::File,
     file_path: &Path,
@@ -452,7 +452,7 @@ fn stream_file_response(
     modified_secs: u64,
     location: &LocationConfig,
 ) -> WebResponse {
-    let stream = ReaderStream::with_capacity(file, STREAM_CHUNK);
+    let stream = crate::handler::sendfile::file_stream_backpressure(file, file_size);
     let body = ResponseBody::box_stream(stream);
     let mut resp = WebResponse::new(body);
     set_file_headers(resp.headers_mut(), file_path, file_size, etag_val, modified_secs, location);

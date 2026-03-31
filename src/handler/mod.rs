@@ -6,6 +6,8 @@ pub mod error_page;
 pub mod fastcgi;
 pub mod fastcgi_pool;
 pub mod grpc;
+pub mod plugin;
 pub mod reverse_proxy;
+pub mod sendfile;
 pub mod static_file;
 pub mod websocket;

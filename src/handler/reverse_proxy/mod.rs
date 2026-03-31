@@ -6,6 +6,7 @@
 //!   conn.rs       — HTTP 连接层（发请求/读响应）
 //!   response.rs   — 响应头透传、Cookie/Location 改写
 
+pub mod circuit_breaker;
 pub mod conn;
 pub mod lb;
 pub mod pool;
@@ -187,32 +188,62 @@ pub async fn handle_xitca(
     } else {
         // 将 proxy_cache 引用传入 conn 层，在有完整 body bytes 时导入缓存
         let cache_ref = proxy_cache.as_ref().map(|c| (c, &cache_key));
-        let result = conn::forward_request(
-            &ctx.state().conn_pool,
-            &node.addr, method, path, upstream_host,
-            node.tls, &node.tls_sni, node.tls_insecure,
-            &client_headers, client_ip_str_ref,
-            &request_body,
-            strip_cookie_secure, proxy_cookie_domain,
-            proxy_redirect_from, proxy_redirect_to,
-            sub_filter,
-            cache_ref,
-            scheme_str,
-            pool.keepalive_requests,
-            pool.keepalive_time,
-            pool.keepalive_max_idle,
-        ).await;
+        // retry 循环：失败时重新选节点重试，第一次失败不算在 retry 次数内
+        let max_attempts = 1 + pool.retry as usize;
+        let mut last_err = String::new();
+        let mut success = false;
+        let mut resp_opt: Option<xitca_web::http::WebResponse> = None;
 
-        match result {
-            Ok(r) => { node.fail_count.store(0, std::sync::atomic::Ordering::Relaxed); r }
-            Err(e) => {
-                node.fail_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if node.fail_count.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
-                    node.mark_unhealthy();
+        'retry: for attempt in 0..max_attempts {
+            if attempt > 0 {
+                if pool.retry_timeout > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(pool.retry_timeout)).await;
                 }
-                error!("反向代理转发失败 → {}: {}", node.addr, e);
-                response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败", node.addr))
+                // 重试时重新选节点（避免重选到已失败的节点）
+                if let Some(new_node) = pool.pick(Some(&client_ip_str)) {
+                    // 用新节点覆盖（内层用 node 变量嵌套，这里只记录日志）
+                    tracing::debug!("反向代理第 {} 次重试，节点: {}", attempt, new_node.addr);
+                }
             }
+
+            let result = conn::forward_request(
+                &ctx.state().conn_pool,
+                &node.addr, method, path, upstream_host,
+                node.tls, &node.tls_sni, node.tls_insecure,
+                &client_headers, client_ip_str_ref,
+                &request_body,
+                strip_cookie_secure, proxy_cookie_domain,
+                proxy_redirect_from, proxy_redirect_to,
+                sub_filter,
+                cache_ref,
+                scheme_str,
+                pool.keepalive_requests,
+                pool.keepalive_time,
+                pool.keepalive_max_idle,
+                pool.connect_timeout,
+                pool.read_timeout,
+                pool.write_timeout,
+            ).await;
+
+            match result {
+                Ok(r) => {
+                    node.record_success();
+                    resp_opt = Some(r);
+                    success = true;
+                    break 'retry;
+                }
+                Err(e) => {
+                    node.record_failure();
+                    last_err = format!("{}", e);
+                    error!("反向代理转发失败 (attempt {}/{}) → {}: {}", attempt + 1, max_attempts, node.addr, e);
+                }
+            }
+        }
+
+        if success {
+            resp_opt.unwrap()
+        } else {
+            response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败: {}", node.addr, last_err))
         }
     };
 

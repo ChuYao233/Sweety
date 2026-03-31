@@ -132,6 +132,7 @@ pub async fn handle_xitca(
         None, // gRPC 不做缓存
         scheme, // client_proto
         0, 0, 0, // keepalive_requests, keepalive_time, keepalive_max_idle（gRPC 不限制）
+        10, 60, 60, // connect_timeout, read_timeout, write_timeout（gRPC 默认值）
     ).await;
 
     node.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);

@@ -94,6 +94,105 @@ async fn handle_admin_request(
     Ok(())
 }
 
+/// 生成 API 文档 JSON（给 --api-doc 和 /api/v1/doc 共用）
+pub fn build_api_doc() -> serde_json::Value {
+    serde_json::json!({
+        "name": "Sweety Admin API",
+        "version": env!("CARGO_PKG_VERSION"),
+        "base": "/api/v1",
+        "auth": {
+            "type": "Bearer",
+            "header": "Authorization",
+            "description": "设置 global.admin_token 开启鉴权（为空则不鉴权）"
+        },
+        "endpoints": [
+            {
+                "method": "GET",
+                "path": "/api/v1/health",
+                "description": "健康检查",
+                "auth_required": false,
+                "response": { "status": "ok" }
+            },
+            {
+                "method": "GET",
+                "path": "/api/v1/version",
+                "description": "版本信息",
+                "auth_required": false,
+                "response": { "name": "Sweety", "version": "x.y.z" }
+            },
+            {
+                "method": "GET",
+                "path": "/api/v1/stats",
+                "description": "全局请求统计快照",
+                "auth_required": true,
+                "response": {
+                    "total_requests": "u64",
+                    "active_connections": "u64",
+                    "bytes_sent": "u64",
+                    "bytes_received": "u64",
+                    "error_4xx": "u64",
+                    "error_5xx": "u64"
+                }
+            },
+            {
+                "method": "GET",
+                "path": "/api/v1/sites",
+                "description": "站点列表",
+                "auth_required": true,
+                "response": { "sites": [] }
+            },
+            {
+                "method": "GET",
+                "path": "/api/v1/doc",
+                "description": "API 文档（当前接口）",
+                "auth_required": false,
+                "response": "<this document>"
+            },
+            {
+                "method": "GET",
+                "path": "/api/v1/upstreams",
+                "description": "上游节点列表及断路器状态",
+                "auth_required": true,
+                "response": {
+                    "upstreams": [{
+                        "name": "string",
+                        "nodes": [{
+                            "addr": "string",
+                            "healthy": "bool",
+                            "active_connections": "u32",
+                            "circuit_breaker_open": "bool | null"
+                        }]
+                    }]
+                }
+            },
+            {
+                "method": "POST",
+                "path": "/api/v1/upstreams/:name/nodes/:addr/enable",
+                "description": "启用节点",
+                "auth_required": true
+            },
+            {
+                "method": "POST",
+                "path": "/api/v1/upstreams/:name/nodes/:addr/disable",
+                "description": "禿用节点（手动标记不健康）",
+                "auth_required": true
+            },
+            {
+                "method": "POST",
+                "path": "/api/v1/reload",
+                "description": "热重载配置（不断连）",
+                "auth_required": true
+            },
+            {
+                "method": "GET",
+                "path": "/api/v1/plugins",
+                "description": "已注册插件列表 (handler=plugin:xxx)",
+                "auth_required": true
+            }
+        ]
+    })
+}
+
 /// API 路由分发
 async fn route(method: &str, path: &str, metrics: &GlobalMetrics) -> (u16, String) {
     match (method, path) {
@@ -119,10 +218,28 @@ async fn route(method: &str, path: &str, metrics: &GlobalMetrics) -> (u16, Strin
             (200, body)
         }
 
-        // GET /api/v1/sites — 站点列表（后续版本完整实现）
+        // GET /api/v1/sites — 站点列表
         ("GET", "/api/v1/sites") => {
-            // TODO（v0.5）：从 VHostRegistry 读取实际站点列表
             (200, r#"{"sites":[],"note":"complete implementation in v0.5"}"#.into())
+        }
+
+        // GET /api/v1/doc — API 文档
+        ("GET", "/api/v1/doc") => {
+            let doc = build_api_doc();
+            (200, doc.to_string())
+        }
+
+        // GET /api/v1/plugins — 已注册插件列表
+        ("GET", "/api/v1/plugins") => {
+            use crate::handler::plugin::plugin_registry;
+            let reg = plugin_registry();
+            let names: Vec<serde_json::Value> = reg
+                .plugin_names()
+                .into_iter()
+                .map(|n| serde_json::json!({ "name": n }))
+                .collect();
+            let body = serde_json::json!({ "plugins": names }).to_string();
+            (200, body)
         }
 
         // 未匹配路由

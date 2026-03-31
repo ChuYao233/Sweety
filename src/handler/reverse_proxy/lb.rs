@@ -10,13 +10,13 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::config::model::{LoadBalanceStrategy, UpstreamConfig, UpstreamNode};
+use super::circuit_breaker::CircuitBreaker;
 
 // ─────────────────────────────────────────────
 // 节点状态
 // ─────────────────────────────────────────────
 
 /// 单个上游节点运行时状态
-#[derive(Debug)]
 pub struct NodeState {
     pub addr: String,
     pub weight: u32,
@@ -24,7 +24,7 @@ pub struct NodeState {
     pub healthy: AtomicU32,
     /// 当前活跃连接数（least_conn 策略使用）
     pub active_connections: AtomicU32,
-    /// 连续失败次数（超过阈值标记不健康）
+    /// 连续失败次数（超过阈値标记不健康）
     pub fail_count: AtomicU32,
     /// 是否用 TLS 连接上游
     pub tls: bool,
@@ -34,12 +34,28 @@ pub struct NodeState {
     pub tls_insecure: bool,
     /// 发给上游的 Host 头（不设则透传客户端 Host）
     pub upstream_host: Option<String>,
+    /// 断路器（None = 未配置，则全程无概履开销）
+    pub circuit_breaker: Option<CircuitBreaker>,
+}
+
+impl std::fmt::Debug for NodeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeState")
+            .field("addr", &self.addr)
+            .field("healthy", &self.healthy.load(Ordering::Relaxed))
+            .field("active_connections", &self.active_connections.load(Ordering::Relaxed))
+            .field("circuit_breaker_open", &self.circuit_breaker.as_ref().map(|cb| cb.is_open()))
+            .finish()
+    }
 }
 
 impl NodeState {
-    pub fn new(node: &UpstreamNode) -> Self {
+    pub fn new(node: &UpstreamNode, cb_cfg: Option<&crate::config::model::CircuitBreakerConfig>) -> Self {
         let host_part = node.addr.split(':').next().unwrap_or(&node.addr).to_string();
         let sni = node.tls_sni.clone().unwrap_or_else(|| host_part.clone());
+        let circuit_breaker = cb_cfg.map(|c| {
+            CircuitBreaker::new(c.max_failures, c.window_secs, c.fail_timeout)
+        });
         Self {
             addr: node.addr.clone(),
             weight: node.weight,
@@ -50,11 +66,22 @@ impl NodeState {
             tls_sni: sni,
             tls_insecure: node.tls_insecure,
             upstream_host: node.upstream_host.clone(),
+            circuit_breaker,
         }
     }
 
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Relaxed) == 1
+    }
+
+    /// 可用 = 健康 + 断路器允许通过
+    #[inline(always)]
+    pub fn is_available(&self) -> bool {
+        if !self.is_healthy() { return false; }
+        match &self.circuit_breaker {
+            None     => true,
+            Some(cb) => cb.allow(),
+        }
     }
 
     pub fn mark_unhealthy(&self) {
@@ -66,6 +93,27 @@ impl NodeState {
         self.healthy.store(1, Ordering::Relaxed);
         self.fail_count.store(0, Ordering::Relaxed);
         debug!("上游节点 {} 恢复健康", self.addr);
+    }
+
+    /// 记录一次成功（含断路器）
+    #[inline(always)]
+    pub fn record_success(&self) {
+        self.fail_count.store(0, Ordering::Relaxed);
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
+    }
+
+    /// 记录一次失败（含断路器）
+    #[inline(always)]
+    pub fn record_failure(&self) {
+        let count = self.fail_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count >= 3 {
+            self.mark_unhealthy();
+        }
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_failure();
+        }
     }
 }
 
@@ -85,12 +133,23 @@ pub struct UpstreamPool {
     pub keepalive_time: u64,
     /// 每节点最大空闲连接数（0 = 用全局默认 32）
     pub keepalive_max_idle: usize,
+    /// 连接上游超时（秒）
+    pub connect_timeout: u64,
+    /// 读取上游响应超时（秒）
+    pub read_timeout: u64,
+    /// 向上游写入超时（秒）
+    pub write_timeout: u64,
+    /// 失败重试次数
+    pub retry: u32,
+    /// 重试等待时间（秒）
+    pub retry_timeout: u64,
 }
 
 impl UpstreamPool {
     /// 从配置构建上游池
     pub fn from_config(cfg: &UpstreamConfig) -> Self {
-        let nodes = cfg.nodes.iter().map(|n| Arc::new(NodeState::new(n))).collect();
+        let cb_cfg = cfg.circuit_breaker.as_ref();
+        let nodes = cfg.nodes.iter().map(|n| Arc::new(NodeState::new(n, cb_cfg))).collect();
         Self {
             nodes,
             strategy: cfg.strategy.clone(),
@@ -98,49 +157,52 @@ impl UpstreamPool {
             keepalive_requests: cfg.keepalive_requests,
             keepalive_time: cfg.keepalive_time,
             keepalive_max_idle: cfg.keepalive,
+            connect_timeout: cfg.connect_timeout,
+            read_timeout: cfg.read_timeout,
+            write_timeout: cfg.write_timeout,
+            retry: cfg.retry,
+            retry_timeout: cfg.retry_timeout,
         }
     }
 
-    /// 根据策略选出一个健康节点
-    /// 直接遍历 nodes，跳过不健康节点，零堆分配（不再收集 healthy Vec）
+    /// 根据策略选出一个可用节点（健康 + 断路器未开路）
     pub fn pick(&self, client_ip: Option<&str>) -> Option<Arc<NodeState>> {
-        let healthy_count = self.nodes.iter().filter(|n| n.is_healthy()).count();
-        if healthy_count == 0 {
-            return None;
+        let avail_count = self.nodes.iter().filter(|n| n.is_available()).count();
+        if avail_count == 0 {
+            // 全部断路 → 降级：允许选健康节点（让断路器进入 HalfOpen 探测）
+            let healthy_count = self.nodes.iter().filter(|n| n.is_healthy()).count();
+            if healthy_count == 0 { return None; }
+            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_count;
+            return self.nodes.iter().filter(|n| n.is_healthy()).nth(idx).cloned();
         }
 
         match self.strategy {
             LoadBalanceStrategy::RoundRobin => {
-                // 轮询：在 nodes 里选第 N 个健康节点
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_count;
-                self.nodes.iter().filter(|n| n.is_healthy()).nth(idx).cloned()
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % avail_count;
+                self.nodes.iter().filter(|n| n.is_available()).nth(idx).cloned()
             }
             LoadBalanceStrategy::Weighted => {
                 let total_weight: u32 = self.nodes.iter()
-                    .filter(|n| n.is_healthy())
-                    .map(|n| n.weight)
-                    .sum();
+                    .filter(|n| n.is_available()).map(|n| n.weight).sum();
                 if total_weight == 0 {
-                    return self.nodes.iter().find(|n| n.is_healthy()).cloned();
+                    return self.nodes.iter().find(|n| n.is_available()).cloned();
                 }
                 let target = (self.rr_counter.fetch_add(1, Ordering::Relaxed) as u32) % total_weight;
                 let mut cumulative = 0u32;
-                for node in self.nodes.iter().filter(|n| n.is_healthy()) {
+                for node in self.nodes.iter().filter(|n| n.is_available()) {
                     cumulative += node.weight;
-                    if target < cumulative {
-                        return Some(node.clone());
-                    }
+                    if target < cumulative { return Some(node.clone()); }
                 }
-                self.nodes.iter().filter(|n| n.is_healthy()).last().cloned()
+                self.nodes.iter().filter(|n| n.is_available()).last().cloned()
             }
             LoadBalanceStrategy::LeastConn => self.nodes.iter()
-                .filter(|n| n.is_healthy())
+                .filter(|n| n.is_available())
                 .min_by_key(|n| n.active_connections.load(Ordering::Relaxed))
                 .cloned(),
             LoadBalanceStrategy::IpHash => {
                 let hash = simple_hash(client_ip.unwrap_or("0.0.0.0"));
-                let idx = hash % healthy_count;
-                self.nodes.iter().filter(|n| n.is_healthy()).nth(idx).cloned()
+                let idx = hash % avail_count;
+                self.nodes.iter().filter(|n| n.is_available()).nth(idx).cloned()
             }
         }
     }

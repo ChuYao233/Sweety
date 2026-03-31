@@ -733,10 +733,49 @@ pub struct UpstreamConfig {
     #[serde(default)]
     pub keepalive_requests: u64,
 
-    /// 连接最大复用时间（秒，等价 Nginx keepalive_time）
-    /// 超过此时间后关闭连接重建，0 = 不限制
+    /// 连接最大复用时间（秒，0 = 不限制）
     #[serde(default)]
     pub keepalive_time: u64,
+
+    /// 连接上游超时（秒，等价 Nginx proxy_connect_timeout，默认 10）
+    #[serde(default = "default_proxy_connect_timeout")]
+    pub connect_timeout: u64,
+
+    /// 读取上游响应超时（秒，等价 Nginx proxy_read_timeout，默认 60）
+    #[serde(default = "default_proxy_read_timeout")]
+    pub read_timeout: u64,
+
+    /// 向上游写入超时（秒，等价 Nginx proxy_send_timeout，默认 60）
+    #[serde(default = "default_proxy_write_timeout")]
+    pub write_timeout: u64,
+
+    /// 失败重试次数（0 = 不重试）
+    #[serde(default)]
+    pub retry: u32,
+
+    /// 重试前等待时间（秒，0 = 立即重试）
+    #[serde(default)]
+    pub retry_timeout: u64,
+
+    /// 断路器配置
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
+}
+
+/// 断路器配置（相比 Nginx max_fails/fail_timeout 增加全局开关能力）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CircuitBreakerConfig {
+    /// 时间窗口内最大失败次数（超过后开路）
+    #[serde(default = "default_cb_max_failures")]
+    pub max_failures: u32,
+
+    /// 时间窗口大小（秒），其内计算失败次数
+    #[serde(default = "default_cb_window")]
+    pub window_secs: u64,
+
+    /// 开路后尝试恢复的等待时间（秒，等价 Nginx fail_timeout）
+    #[serde(default = "default_cb_fail_timeout")]
+    pub fail_timeout: u64,
 }
 
 /// 负载均衡策略
@@ -896,6 +935,12 @@ fn default_cache_statuses() -> Vec<u16> { vec![200, 301, 302] }
 fn default_cache_methods() -> Vec<String> { vec!["GET".into(), "HEAD".into()] }
 fn default_no_cache_headers() -> Vec<String> { vec!["Authorization".into(), "Cookie".into()] }
 fn default_auth_failure_status() -> u16 { 401 }
+fn default_proxy_connect_timeout() -> u64 { 10 }
+fn default_proxy_read_timeout() -> u64 { 60 }
+fn default_proxy_write_timeout() -> u64 { 60 }
+fn default_cb_max_failures() -> u32 { 5 }
+fn default_cb_window() -> u64 { 60 }
+fn default_cb_fail_timeout() -> u64 { 30 }
 
 // ─────────────────────────────────────────────
 // 单元测试

@@ -57,14 +57,44 @@ cargo build --release
 # 二进制：target/release/sweety
 ```
 
-### 运行
+### 子命令（类 Caddy 风格）
+
+```
+Usage: sweety [OPTIONS] [COMMAND]
+
+Commands:
+  run       在前台启动 Sweety 并持续运行（推荐生产使用）
+  validate  验证配置文件语法和 TLS 证书（不启动服务，等价 nginx -t）
+  reload    向运行中的 Sweety 热重载配置（不断连应用）
+  api-doc   输出 Admin REST API 接口文档 JSON（面板对接用）
+  version   输出版本信息
+
+Options:
+  -c, --config <FILE>  配置文件路径 [default: config/sweety.toml]
+  -h, --help           Print help
+  -V, --version        Print version
+```
 
 ```bash
-# 启动
-./sweety --config config/sweety.toml
+# 启动（默认读 config/sweety.toml）
+sweety run
 
-# 测试配置（不启动服务器）
-./sweety --config config/sweety.toml --test
+# 指定配置文件
+sweety run --config /etc/sweety/sweety.toml
+
+# 验证配置 + TLS 证书（部署前必用）
+sweety validate
+sweety validate --config /etc/sweety/sweety.toml
+
+# 热重载（不断开现有连接）
+sweety reload
+
+# 查看 Admin API 文档
+sweety api-doc
+sweety api-doc | jq '.endpoints[] | {method,path,description}'
+
+# 版本
+sweety version
 ```
 
 ### 最简静态站点
@@ -122,7 +152,7 @@ handler   = "fastcgi"
 try_files = ["$uri", "$uri/", "/index.php"]
 ```
 
-### 反向代理
+### 反向代理（含超时/重试/断路器）
 
 ```toml
 [[sites]]
@@ -140,6 +170,21 @@ acme_email = "admin@example.com"
 name     = "backend"
 strategy = "least_conn"  # round_robin / weighted / least_conn / ip_hash
 
+# 超时控制（秒）
+connect_timeout = 5   # 连接上游超时（默认 10）
+read_timeout    = 30  # 读取响应超时（默认 60）
+write_timeout   = 30  # 写入请求超时（默认 60）
+
+# 失败重试
+retry         = 2  # 失败后最多重试 2 次（默认 0）
+retry_timeout = 1  # 重试前等待 1 秒（默认 0 = 立即）
+
+# 断路器（类 Nginx max_fails/fail_timeout，支持全局开关）
+[sites.upstreams.circuit_breaker]
+max_failures = 5   # 60 秒窗口内失败 5 次则开路
+window_secs  = 60
+fail_timeout = 30  # 开路后 30 秒尝试半开探测
+
 [[sites.upstreams.nodes]]
 addr = "127.0.0.1:8001"
 
@@ -153,7 +198,146 @@ handler  = "reverse_proxy"
 upstream = "backend"
 ```
 
+### 插件系统（`handler = "plugin:xxx"`）
+
+Sweety 内置插件接入能力，可在请求/响应两个阶段挂载自定义逻辑（WAF、自定义认证、限流扩展等）：
+
+```toml
+[[sites.locations]]
+path    = "/api/"
+handler = "plugin:my_waf"   # 格式：plugin:<name>
+```
+
+**实现插件（Rust）：**
+
+```rust
+use sweety_lib::handler::plugin::{Plugin, PluginRequest, PluginResult, plugin_registry};
+use std::sync::Arc;
+
+struct MyWaf;
+
+impl Plugin for MyWaf {
+    fn name(&self) -> &'static str { "my_waf" }
+
+    fn on_request(&self, req: &PluginRequest<'_>) -> PluginResult {
+        if req.headers.get("x-bad-header").is_some() {
+            return PluginResult::Stop(forbidden_response());
+        }
+        PluginResult::Continue
+    }
+}
+
+// main.rs 启动时注册
+plugin_registry().register("my_waf", Arc::new(MyWaf));
+```
+
+**已注册插件查询：**
+```bash
+curl http://127.0.0.1:9000/api/v1/plugins
+```
+
 完整配置参考 [`config/sweety.example.toml`](config/sweety.example.toml)。
+
+---
+
+## Admin REST API
+
+Sweety 内置 HTTP 管理 API，用于面板对接、热重载、监控采集。
+
+### 配置
+
+```toml
+[global]
+admin_listen = "127.0.0.1:9000"  # 管理 API 监听地址（建议只绑定 lo）
+admin_token  = "your-secret"     # Bearer Token（为空则不鉴权）
+```
+
+### 认证
+
+所有标记 `auth_required: true` 的接口需要 Bearer Token：
+
+```bash
+curl -H "Authorization: Bearer your-secret" http://127.0.0.1:9000/api/v1/stats
+```
+
+### 接口列表
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|------|------|------|------|
+| `GET` | `/api/v1/health` | 否 | 健康检查 |
+| `GET` | `/api/v1/version` | 否 | 版本信息 |
+| `GET` | `/api/v1/doc` | 否 | 本 API 文档（JSON） |
+| `GET` | `/api/v1/stats` | 是 | 全局请求统计快照 |
+| `GET` | `/api/v1/sites` | 是 | 站点列表 |
+| `GET` | `/api/v1/upstreams` | 是 | 上游节点 + 断路器状态 |
+| `POST` | `/api/v1/upstreams/:name/nodes/:addr/enable` | 是 | 启用节点 |
+| `POST` | `/api/v1/upstreams/:name/nodes/:addr/disable` | 是 | 禁用节点（手动熔断） |
+| `POST` | `/api/v1/reload` | 是 | 热重载配置（不断连） |
+| `GET` | `/api/v1/plugins` | 是 | 已注册插件列表 |
+
+### 接口详情
+
+#### `GET /api/v1/health`
+```json
+{ "status": "ok" }
+```
+
+#### `GET /api/v1/version`
+```json
+{ "name": "Sweety", "version": "0.1.0" }
+```
+
+#### `GET /api/v1/stats`
+```json
+{
+  "total_requests":    12345,
+  "active_connections": 42,
+  "bytes_sent":        9876543,
+  "bytes_received":    1234567,
+  "error_4xx":         88,
+  "error_5xx":         3
+}
+```
+
+#### `GET /api/v1/upstreams`
+```json
+{
+  "upstreams": [{
+    "name": "backend",
+    "nodes": [{
+      "addr":                "127.0.0.1:8001",
+      "healthy":             true,
+      "active_connections":  5,
+      "circuit_breaker_open": false
+    }]
+  }]
+}
+```
+
+#### `POST /api/v1/reload`
+```bash
+curl -X POST -H "Authorization: Bearer your-secret" \
+  http://127.0.0.1:9000/api/v1/reload
+```
+```json
+{ "success": true }
+```
+
+#### `GET /api/v1/doc`
+返回本文档的机器可读 JSON 版本（同 `sweety api-doc` 输出）。
+
+### 命令行快速查看文档
+
+```bash
+# 输出完整 API 文档 JSON
+sweety api-doc
+
+# 只看所有接口路径
+sweety api-doc | jq '.endpoints[] | "\(.method) \(.path)"'
+
+# 只看需要鉴权的接口
+sweety api-doc | jq '.endpoints[] | select(.auth_required) | .path'
+```
 
 ---
 
@@ -162,10 +346,11 @@ upstream = "backend"
 ```
 sweety/
 ├─ src/
-│  ├─ main.rs              # CLI 入口（--config / --test）
+│  ├─ main.rs              # CLI 子命令入口（run/validate/reload/api-doc/version）
 │  ├─ server/
 │  │  ├─ http.rs           # xitca-web 应用构建、多站点分发、AppState
-│  │  ├─ tls.rs            # Rustls SNI Resolver、ACME 自动续期
+│  │  ├─ tls.rs            # Rustls SNI Resolver、ACME HTTP-01 自动续期
+│  │  ├─ dns01.rs          # ACME DNS-01（Cloudflare/Aliyun/Shell）通配符证书
 │  │  └─ quic.rs           # HTTP/3 Quinn 集成
 │  ├─ dispatcher/
 │  │  ├─ vhost.rs          # 虚拟主机注册表（ArcSwap 无锁热更新）
@@ -173,8 +358,19 @@ sweety/
 │  │  └─ rewrite.rs        # Rewrite 规则引擎
 │  ├─ handler/
 │  │  ├─ static_file.rs    # 静态文件（内存缓存 + notify 失效 + Range + br/gz）
+│  │  ├─ sendfile.rs       # Zero-copy 传输（Linux sendfile + H2 背压 stream）
 │  │  ├─ fastcgi.rs        # FastCGI 协议实现 + 连接池
-│  │  ├─ reverse_proxy/    # 反向代理（LB + 健康检查 + 连接池 + WS）
+│  │  ├─ reverse_proxy/
+│  │  │  ├─ mod.rs         # 反向代理主逻辑（retry 循环）
+│  │  │  ├─ lb.rs          # 负载均衡 + 节点状态 + 断路器集成
+│  │  │  ├─ circuit_breaker.rs  # 断路器（无锁原子三状态机）
+│  │  │  ├─ conn.rs        # HTTP 连接层（超时控制 + keepalive 池）
+│  │  │  ├─ pool.rs        # TCP/TLS 连接池
+│  │  │  ├─ response.rs    # 响应头透传、Cookie/Location 改写
+│  │  │  ├─ tls_client.rs  # 上游 TLS 客户端
+│  │  │  └─ ws_proxy.rs    # WebSocket 代理
+│  │  ├─ plugin/
+│  │  │  └─ mod.rs         # 插件系统（trait + 全局注册表 + 生命周期钩子）
 │  │  ├─ grpc.rs           # gRPC 代理
 │  │  ├─ auth_request.rs   # 子请求鉴权
 │  │  ├─ websocket.rs      # WebSocket 升级代理
@@ -205,14 +401,14 @@ sweety/
 |---|---|
 | `[global]` | `worker_threads` `worker_connections` `max_connections` `keepalive_timeout` `client_max_body_size` `gzip` `gzip_comp_level` `admin_listen` `admin_token` `log_level` |
 | `[[sites]]` | `name` `server_name` `listen` `listen_tls` `root` `index` `access_log` `access_log_format` `force_https` `fallback` `gzip` `websocket` `error_pages` |
-| `[sites.tls]` | `acme` `acme_email` `acme_provider` `acme_renew_days_before` `cert` `key` `certs[]` `min_version` `max_version` |
+| `[sites.tls]` | `acme` `acme_email` `acme_provider` `acme_challenge`(`http01`/`dns01`) `acme_renew_days_before` `cert` `key` `certs[]` `min_version` `max_version` |
 | `[sites.hsts]` | `max_age` `include_sub_domains` `preload` |
 | `[sites.fastcgi]` | `socket` `host` `port` `pool_size` `connect_timeout` `read_timeout` `cache{}` |
 | `[sites.proxy_cache]` | `path` `max_entries` `ttl` `cacheable_statuses` `cacheable_methods` `bypass_headers` |
-| `[[sites.upstreams]]` | `name` `strategy` `keepalive` `keepalive_requests` `keepalive_time` `health_check{}` `nodes[]{addr,weight,tls,tls_sni,upstream_host}` |
+| `[[sites.upstreams]]` | `name` `strategy` `keepalive` `keepalive_requests` `keepalive_time` `connect_timeout` `read_timeout` `write_timeout` `retry` `retry_timeout` `circuit_breaker{max_failures,window_secs,fail_timeout}` `health_check{}` `nodes[]{addr,weight,tls,tls_sni,upstream_host}` |
 | `[[sites.rewrites]]` | `pattern` `target` `flag`（last/break/redirect/permanent）`condition`（!-f/!-d）|
 | `[sites.rate_limit]` | `rules[]{dimension,rate,burst,nodelay,path_pattern,header_name}` |
-| `[[sites.locations]]` | `path` `handler` `upstream` `root` `try_files` `return_code` `return_url` `return_body` `return_content_type` `limit_conn` `proxy_buffering` `cache_control` `auth_request` `auth_failure_status` `proxy_set_headers[]` `add_headers[]` `sub_filter[]` `cache_rules[]` |
+| `[[sites.locations]]` | `path` `handler`(`static`/`reverse_proxy`/`fastcgi`/`grpc`/`plugin:xxx`) `upstream` `root` `try_files` `return_code` `return_url` `return_body` `return_content_type` `limit_conn` `proxy_buffering` `cache_control` `auth_request` `auth_failure_status` `proxy_set_headers[]` `add_headers[]` `sub_filter[]` `cache_rules[]` |
 
 ### 访问日志格式（`access_log_format`）
 
@@ -229,22 +425,26 @@ sweety/
 | 功能 | Sweety | Nginx | Caddy |
 |---|---|---|---|
 | HTTP/3 内置 | ✅ | ❌ 需重新编译 | ✅ |
-| ACME 自动证书 | ✅ HTTP-01 | ❌ 需 certbot | ✅ 零配置 |
+| ACME 自动证书 HTTP-01 | ✅ | ❌ 需 certbot | ✅ |
+| ACME DNS-01 / 通配符证书 | ✅ Cloudflare/Aliyun/Shell | ❌ 需 certbot | ✅ |
 | Brotli 压缩内置 | ✅ | ❌ 第三方模块 | ✅ |
 | FastCGI 连接池 | ✅ | ✅ | ✅ |
 | auth_request | ✅ | ✅ | ❌ 需插件 |
 | gRPC 代理 | ✅ | ✅ | ✅ |
 | WebSocket 代理 | ✅ | ✅ | ✅ |
 | respond 直接返回内容 | ✅ | ❌ 仅状态码 | ✅ |
+| 反向代理超时/重试 | ✅ | ✅ | ✅ |
+| 断路器 circuit breaker | ✅ 三状态机 | ⚠️ max_fails 仅计数 | ❌ |
+| 零拷贝大文件传输 | ✅ sendfile / H2 背压 | ✅ sendfile | ⚠️ |
+| 插件系统 | ✅ `plugin:xxx` | ✅ C 模块 | ✅ Go 模块 |
+| 子命令 CLI | ✅ run/validate/reload/api-doc | ⚠️ nginx -t/-s | ✅ |
+| Admin REST API | ✅ | ❌ | ✅ |
 | 配置热重载不断连 | ✅ | ✅ reload | ✅ |
 | 单文件无依赖 | ✅ | ❌ | ✅ |
 | 内存安全 | ✅ Rust | ❌ C | ✅ Go |
 | GC 暂停 | ✅ 无 | ✅ 无 | ⚠️ Go GC |
-| Windows 多线程 | ✅ IOCP | ❌ 单线程 select | ⚠️ |
-| ACME DNS-01 / 通配符证书 | ❌ 规划中 | ❌ 需 certbot | ✅ |
 | `if` 条件块 / `map` 变量 | ❌ | ✅ | ✅ |
 | TCP/UDP 四层代理 | ❌ | ✅ stream | ✅ layer4 |
-| Lua/插件扩展 | ❌ | ✅ OpenResty | ✅ 插件生态 |
 
 ---
 

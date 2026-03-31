@@ -88,7 +88,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # ── 通用工具 ────────────────────────────────
 futures-util  = "0.3"
 tokio-util    = { version = "0.7", features = ["io"] }
-tokio-stream  = "0.1"
+tokio-stream  = { version = "0.1", features = ["sync"] }
 h2            = "0.4"
 bytes        = "1"
 flate2       = "1"
@@ -112,6 +112,8 @@ reqwest      = { version = "0.12", default-features = false, features = ["json",
 # HMAC-SHA1（阿里云 DNS 签名）
 hmac         = "0.12"
 sha1         = "0.10"
+# sendfile(2) syscall（Linux/macOS 零拷贝静态文件传输）
+libc         = "0.2"
 
 # ─────────────────────────────────────────────
 # 平台特定依赖

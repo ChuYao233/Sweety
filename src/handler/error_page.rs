@@ -3,6 +3,31 @@
 
 use std::path::PathBuf;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use bytes::Bytes;
+
+/// 预构建的错误页缓存（常用状态码，启动时一次生成，请求时直接 clone 引用计数）
+static ERROR_PAGE_CACHE: OnceLock<HashMap<u16, Bytes>> = OnceLock::new();
+
+/// 获取预构建错误页缓存（首次调用时初始化）
+fn error_cache() -> &'static HashMap<u16, Bytes> {
+    ERROR_PAGE_CACHE.get_or_init(|| {
+        let codes = [400u16, 401, 403, 404, 405, 408, 413, 421, 429, 500, 502, 503, 504];
+        codes.iter().map(|&code| {
+            (code, Bytes::from(build_default_html(code)))
+        }).collect()
+    })
+}
+
+/// 获取错误页 Bytes（缓存命中时零分配 clone，未命中时动态生成）
+pub fn get_error_bytes(code: u16) -> Bytes {
+    if let Some(b) = error_cache().get(&code) {
+        b.clone()  // 只增引用计数，零堆分配
+    } else {
+        Bytes::from(build_default_html(code))
+    }
+}
 
 /// 错误页面配置（每站点维护一份）
 #[derive(Debug, Clone, Default)]

@@ -649,8 +649,10 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
 
 
 /// 构造 HTML 错误响应（不依赖 ctx）
+/// 使用预构建 Bytes 缓存，clone 只增引用计数，零堆分配
+#[inline(always)]
 fn make_error_resp(status: StatusCode) -> WebResponse {
-    let body = crate::handler::error_page::build_default_html(status.as_u16());
+    let body = crate::handler::error_page::get_error_bytes(status.as_u16());
     let mut resp = WebResponse::new(ResponseBody::from(body));
     *resp.status_mut() = status;
     resp.headers_mut().insert(

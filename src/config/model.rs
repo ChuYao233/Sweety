@@ -601,9 +601,10 @@ pub struct LocationConfig {
     pub limit_conn: usize,
 
     /// 反代缓冲控制（等价 Nginx proxy_buffering）
-    /// true（默认）= 缓冲上游响应后再发给客户端（减少上游连接占用时间）
-    /// false = 流式转发，适合 SSE / 大文件下载
-    #[serde(default = "default_true")]
+    /// false（默认）= 流式转发，不把响应体读入内存，高并发安全
+    /// true = 缓冲模式，仅当需要 sub_filter / proxy_cache / URL 替换时才设为 true
+    /// 注意：true 时 1000 并发× 1MB 响应 = 1GB 内存，容易 OOM
+    #[serde(default)]
     pub proxy_buffering: bool,
 
     /// 尝试文件列表（等价 Nginx try_files $uri $uri/ /index.html）
@@ -653,7 +654,7 @@ impl Default for LocationConfig {
             return_body: None,
             return_content_type: None,
             limit_conn: 0,
-            proxy_buffering: true,
+            proxy_buffering: false,
             try_files: vec![],
             sub_filter: vec![],
             auth_request: None,

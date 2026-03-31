@@ -231,6 +231,30 @@ impl SweetyServer {
             info!("HTTP/3 QUIC 监听: {}", addr);
         }
 
+        // 启动上游健康检查后台任务（独立 tokio::spawn，不依赖请求触发）
+        // 通过 registry lookup 到 SiteInfo，再取其中的 upstream_pools（共享 Arc，零额外开销）
+        for site_cfg in &cfg.sites {
+            for upstream_cfg in &site_cfg.upstreams {
+                let Some(hc) = &upstream_cfg.health_check else { continue };
+                if !hc.enabled || upstream_cfg.nodes.is_empty() { continue }
+
+                // 通过 server_name 找到已构建好的 SiteInfo，取其 upstream_pools
+                let pool_arc = site_cfg.server_name.iter()
+                    .find_map(|sn| registry.lookup(sn))
+                    .and_then(|si| si.upstream_pools.get(&upstream_cfg.name).cloned());
+
+                if let Some(pool) = pool_arc {
+                    let path = hc.path.clone();
+                    let interval = hc.interval;
+                    tokio::spawn(
+                        crate::handler::reverse_proxy::health_check_task(pool, path, interval)
+                    );
+                    info!("上游 '{}' 健康检查已启动（间隔 {}s，路径 {}）",
+                        upstream_cfg.name, interval, hc.path);
+                }
+            }
+        }
+
         // 启动 ACME 自动续期后台任务
         if cfg.sites.iter().any(|s| s.tls.as_ref().map(|t| t.acme).unwrap_or(false)) {
             let cfg_clone = cfg.clone();

@@ -204,6 +204,39 @@ impl TlsManager {
                         }
                         Err(e) => {
                             error!("ACME 证书申请失败 ({}): {}", domain, e);
+                            // 指数退避重试：1min → 5min → 30min → 2h → 12h
+                            // 防止被 CA 限速封退（Let's Encrypt 限制：5 次/小时/域名）
+                            let backoff_steps: &[u64] = &[60, 300, 1800, 7200];
+                            let mut last_err = e;
+                            let mut succeeded = false;
+                            for &wait_secs in backoff_steps {
+                                warn!("ACME 将在 {}s 后重试申请证书: {}", wait_secs, domain);
+                                tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                                let retry_result = if use_dns01 {
+                                    match &tls.dns_provider {
+                                        Some(provider) => request_acme_cert_dns01(domain, &email, &tls.acme_provider, provider).await,
+                                        None => break,
+                                    }
+                                } else {
+                                    request_acme_cert(domain, &email, &tls.acme_provider).await
+                                };
+                                match retry_result {
+                                    Ok((cert_pem, key_pem)) => {
+                                        if let Err(e) = save_cert_files(&cert_path, &key_path, &cert_pem, &key_pem) {
+                                            error!("ACME 证书保存失败 ({}): {}", domain, e);
+                                        } else {
+                                            info!("ACME 证书重试申请成功: {}", domain);
+                                            reload_acme_cert_in_resolvers(&cert_path, &key_path, &site.server_name, &sni_resolvers);
+                                        }
+                                        succeeded = true;
+                                        break;
+                                    }
+                                    Err(e) => { last_err = e; }
+                                }
+                            }
+                            if !succeeded {
+                                error!("ACME 证书申请多次重试均失败 ({})，等待12h后再次尝试: {}", domain, last_err);
+                            }
                         }
                     }
                 }

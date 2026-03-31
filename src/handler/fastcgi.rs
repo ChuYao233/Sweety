@@ -324,10 +324,11 @@ pub async fn handle_sweety(
         crate::middleware::proxy_cache::CacheKey::new(method_str, host_str, req_path)
     });
 
-    // 最多重试一次：第一次用 idle 连接，失败后清空 idle 并强制新建
+    // FastCGI I/O 是异步的：等待 PHP-FPM 响应时 tokio 会让出 worker 给其他请求
+    // 慢 PHP 请求不会"占死" worker，只是 task 在等待，其他 task 正常调度
+    // 真正危险的 CPU 密集操作（gzip 大文件）已通过 spawn_blocking 隔离
     for attempt in 0u8..2 {
         if attempt == 1 {
-            // idle 连接已失效，清空该地址全部 idle，下次 acquire 强制新建
             pool.evict(&addr_str);
         }
         let conn = match pool.acquire(&addr_str, is_unix).await {

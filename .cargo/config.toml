@@ -1,0 +1,11 @@
+# CPU 指令集优化
+# x86-64-v2：SSE4.2 + AES-NI + POPCNT，兼容所有 2012 年后的 x86 服务器
+# 比 native 少了 AVX2/AVX-512，但二进制可在任意服务器运行，不会 Illegal instruction
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]

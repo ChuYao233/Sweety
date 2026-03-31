@@ -23,10 +23,10 @@ pub async fn load_error_page(code: u16, cfg: Option<&ErrorPageConfig>) -> String
     build_default_html(code)
 }
 
-/// 构建内置默认错误 HTML 页面（供所有模块调用）
+/// 构建内置默认错误 HTML 页面（中英双语）
 pub fn build_default_html(code: u16) -> String {
-    let text = status_text(code);
-    let description = error_description(code);
+    let (text, desc_zh, desc_en) = status_info(code);
+    let color = if code >= 500 { "#e74c3c" } else if code >= 400 { "#e67e22" } else { "#3498db" };
     format!(
         r#"<!DOCTYPE html>
 <html lang="zh-CN">
@@ -35,65 +35,83 @@ pub fn build_default_html(code: u16) -> String {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{code} {text}</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
            display: flex; align-items: center; justify-content: center;
-           min-height: 100vh; margin: 0; background: #f5f5f5; }}
-    .container {{ text-align: center; padding: 40px; background: white;
-                  border-radius: 12px; box-shadow: 0 2px 20px rgba(0,0,0,0.1); }}
-    h1 {{ font-size: 6rem; margin: 0; color: #333; font-weight: 800; }}
-    h2 {{ font-size: 1.5rem; color: #666; margin: 10px 0; }}
-    p  {{ color: #999; margin: 20px 0 0; font-size: 0.9rem; }}
-    hr {{ border: none; border-top: 1px solid #eee; margin: 20px 0; }}
+           min-height: 100vh; margin: 0; background: #f0f2f5; }}
+    .box {{ text-align: center; padding: 48px 56px; background: #fff;
+            border-radius: 16px; box-shadow: 0 4px 32px rgba(0,0,0,.08); max-width: 480px; }}
+    .code {{ font-size: 5.5rem; font-weight: 900; color: {color}; line-height: 1; margin: 0 0 8px; }}
+    .title {{ font-size: 1.4rem; font-weight: 600; color: #333; margin: 0 0 20px; }}
+    hr {{ border: none; border-top: 1px solid #eee; margin: 0 0 20px; }}
+    .zh {{ color: #555; font-size: .95rem; margin: 0 0 8px; }}
+    .en {{ color: #999; font-size: .85rem; margin: 0 0 24px; }}
+    .foot {{ font-size: .72rem; color: #bbb; margin: 0; }}
   </style>
 </head>
 <body>
-  <div class="container">
-    <h1>{code}</h1>
-    <h2>{text}</h2>
+  <div class="box">
+    <div class="code">{code}</div>
+    <div class="title">{text}</div>
     <hr>
-    <p>{description}</p>
-    <p style="font-size:0.75rem;color:#ccc">Sweety Web Server</p>
+    <p class="zh">{desc_zh}</p>
+    <p class="en">{desc_en}</p>
+    <p class="foot">Sweety Web Server</p>
   </div>
 </body>
 </html>"#
     )
 }
 
-/// HTTP 状态码标准文本
-fn status_text(code: u16) -> &'static str {
+/// 返回 (English status, 中文描述, English description)
+fn status_info(code: u16) -> (&'static str, &'static str, &'static str) {
     match code {
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        413 => "Payload Too Large",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "Error",
-    }
-}
-
-/// 错误描述文字（展示在错误页面中）
-fn error_description(code: u16) -> &'static str {
-    match code {
-        400 => "请求格式有误，服务器无法理解该请求。",
-        401 => "访问此资源需要身份验证。",
-        403 => "您没有权限访问此资源。",
-        404 => "您请求的页面不存在或已被移除。",
-        405 => "请求方法不被允许。",
-        408 => "请求超时，请重试。",
-        413 => "请求体积过大。",
-        429 => "请求过于频繁，请稍后再试。",
-        500 => "服务器内部发生错误，请联系管理员。",
-        502 => "上游服务器返回无效响应。",
-        503 => "服务暂时不可用，请稍后重试。",
-        504 => "等待上游服务器响应超时。",
-        _ => "发生了一个错误。",
+        // 4xx 客户端错误
+        400 => ("Bad Request",
+                "请求格式有误，服务器无法解析该请求。",
+                "The server could not understand the request due to invalid syntax."),
+        401 => ("Unauthorized",
+                "访问此资源需要身份验证，请登录后重试。",
+                "Authentication is required. Please log in and try again."),
+        403 => ("Forbidden",
+                "您没有权限访问此资源。",
+                "You don't have permission to access this resource."),
+        404 => ("Not Found",
+                "您请求的页面不存在或已被移除。",
+                "The page you requested could not be found."),
+        405 => ("Method Not Allowed",
+                "不支持该请求方法。",
+                "The request method is not supported for this resource."),
+        408 => ("Request Timeout",
+                "请求超时，请检查网络后重试。",
+                "The server timed out waiting for the request."),
+        413 => ("Payload Too Large",
+                "请求体过大，超出服务器限制。",
+                "The request body exceeds the server's size limit."),
+        418 => ("I'm a Teapot",
+                "服务器是一个茶壶，拒绝冲咖啡。",
+                "The server refuses to brew coffee because it is, permanently, a teapot."),
+        421 => ("Misdirected Request",
+                "请求被发到了无法响应的服务器，请检查域名配置。",
+                "The request was directed at a server that is not able to produce a response."),
+        429 => ("Too Many Requests",
+                "请求过于频繁，请稍后再试。",
+                "Too many requests in a given amount of time. Please slow down."),
+        // 5xx 服务器错误
+        500 => ("Internal Server Error",
+                "服务器内部发生错误，请稍后重试或联系管理员。",
+                "An unexpected error occurred on the server. Please try again later."),
+        502 => ("Bad Gateway",
+                "上游服务器返回了无效响应。",
+                "The upstream server received an invalid response."),
+        503 => ("Service Unavailable",
+                "服务暂时不可用，可能正在维护中，请稍后重试。",
+                "The service is temporarily unavailable. Please try again later."),
+        504 => ("Gateway Timeout",
+                "等待上游服务器响应超时。",
+                "The upstream server did not respond in time."),
+        _ => ("Error",
+              "发生了一个未知错误。",
+              "An unexpected error occurred."),
     }
 }
 

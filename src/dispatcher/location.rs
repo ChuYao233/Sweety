@@ -8,19 +8,34 @@ use regex::Regex;
 
 use crate::config::model::LocationConfig;
 
+/// Location 类型（在构建时一次解析，请求时直接匹配不再扫描字符串）
+#[derive(Debug, Clone)]
+pub enum LocationKind {
+    /// 精确匹配：`= /path`
+    Exact(String),
+    /// 前缀优先：`^~ /prefix`
+    PrefixPriority(String),
+    /// 正则（已预编译）
+    Regex(Regex),
+    /// 普通前缀
+    Prefix,
+}
+
 /// 预编译后的 Location（所有正则在站点启动时一次编译）
 pub struct CompiledLocation {
     /// 原始配置
     pub config: LocationConfig,
-    /// 预编译的正则（只有正则类型的 location 才有）
+    /// 类型标记（请求时直接匹配，不再扫描 path 字段）
+    pub kind: LocationKind,
+    /// 兼容旧接口，保留 regex 字段（仅正则类型有值）
     pub regex: Option<Regex>,
 }
 
 impl Clone for CompiledLocation {
     fn clone(&self) -> Self {
-        // Regex 支持 Clone
         Self {
             config: self.config.clone(),
+            kind: self.kind.clone(),
             regex: self.regex.clone(),
         }
     }
@@ -36,16 +51,24 @@ impl std::fmt::Debug for CompiledLocation {
 }
 
 impl CompiledLocation {
-    /// 从 LocationConfig 构建，预编译正则
+    /// 从 LocationConfig 构建，预编译正则并确定类型
     pub fn new(cfg: LocationConfig) -> Self {
-        let regex = if let Some(p) = cfg.path.strip_prefix("~* ") {
-            Regex::new(&format!("(?i){}", p)).ok()
+        let (kind, regex) = if let Some(p) = cfg.path.strip_prefix("~* ") {
+            let re = Regex::new(&format!("(?i){}", p)).ok();
+            let k = re.clone().map(LocationKind::Regex).unwrap_or(LocationKind::Prefix);
+            (k, re)
         } else if let Some(p) = cfg.path.strip_prefix("~ ") {
-            Regex::new(p).ok()
+            let re = Regex::new(p).ok();
+            let k = re.clone().map(LocationKind::Regex).unwrap_or(LocationKind::Prefix);
+            (k, re)
+        } else if let Some(p) = cfg.path.strip_prefix("= ") {
+            (LocationKind::Exact(p.to_string()), None)
+        } else if let Some(p) = cfg.path.strip_prefix("^~ ") {
+            (LocationKind::PrefixPriority(p.to_string()), None)
         } else {
-            None
+            (LocationKind::Prefix, None)
         };
-        Self { config: cfg, regex }
+        Self { config: cfg, kind, regex }
     }
 }
 
@@ -56,22 +79,18 @@ pub fn match_location<'a>(
     locations: &'a [CompiledLocation],
     path: &str,
 ) -> Option<&'a LocationConfig> {
-    // 第一轮：精确匹配 (`= /path`) 和 前缀优先 (`^~ /prefix`)
+    // 第一轮：精确匹配和前缀优先（用预计算的 kind，零字符串扫描）
     for cl in locations {
-        if let Some(stripped) = cl.config.path.strip_prefix("= ") {
-            if stripped == path {
-                return Some(&cl.config);
-            }
-        } else if let Some(stripped) = cl.config.path.strip_prefix("^~ ") {
-            if path.starts_with(stripped) {
-                return Some(&cl.config);
-            }
+        match &cl.kind {
+            LocationKind::Exact(p) if p == path => return Some(&cl.config),
+            LocationKind::PrefixPriority(p) if path.starts_with(p.as_str()) => return Some(&cl.config),
+            _ => {}
         }
     }
 
-    // 第二轮：正则匹配（直接用预编译的 Regex）
+    // 第二轮：正则匹配
     for cl in locations {
-        if let Some(re) = &cl.regex {
+        if let LocationKind::Regex(re) = &cl.kind {
             if re.is_match(path) {
                 return Some(&cl.config);
             }
@@ -81,10 +100,8 @@ pub fn match_location<'a>(
     // 第三轮：普通前缀匹配，找最长前缀
     let mut best: Option<(&LocationConfig, usize)> = None;
     for cl in locations {
+        if !matches!(cl.kind, LocationKind::Prefix) { continue; }
         let p = &cl.config.path;
-        if p.starts_with("= ") || p.starts_with("^~ ") || cl.regex.is_some() {
-            continue;
-        }
         if path.starts_with(p.as_str()) {
             let len = p.len();
             if best.map_or(true, |(_, bl)| len > bl) {
@@ -109,11 +126,7 @@ mod tests {
         CompiledLocation::new(LocationConfig {
             path: path.to_string(),
             handler: HandlerType::Static,
-            root: None,
-            upstream: None,
-            cache_control: None,
-            return_code: None,
-            max_connections: None,
+            ..Default::default()
         })
     }
 

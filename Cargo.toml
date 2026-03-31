@@ -77,6 +77,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # ── 并发数据结构 ──────────────────────────────
 dashmap = "6"
+arc-swap = "1"
 
 # ── CLI 参数 ──────────────────────────────────
 clap = { version = "4", features = ["derive"] }
@@ -91,8 +92,13 @@ tokio-stream  = "0.1"
 h2            = "0.4"
 bytes        = "1"
 flate2       = "1"
+async-compression = { version = "0.4", features = ["brotli", "tokio"] }
 x509-parser  = { version = "0.16", default-features = false }
 anyhow       = "1"
+itoa         = "1"
+# 完美哈希表（编译期生成，MIME 类型查找 O(1)）
+phf          = { version = "0.11", features = ["macros"] }
+# jemalloc 通过 [target] 条件依赖引入（见下方）
 base64       = "0.22"
 thiserror    = "1"
 url          = "2"
@@ -103,12 +109,22 @@ httpdate     = "1"
 dirs-next    = "2"
 
 # ─────────────────────────────────────────────
+# 平台特定依赖
+# ─────────────────────────────────────────────
+# jemalloc 仅在非 Windows 平台启用（Windows 无法编译其 C 代码）
+[target.'cfg(not(windows))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
+# ─────────────────────────────────────────────
 # Features
 # ─────────────────────────────────────────────
 [features]
-default = []
+# jemalloc 默认开启（Linux/macOS）；Windows 上此 feature 存在但依赖不引入
+default = ["jemalloc"]
 # HTTP/3 支持（由 xitca-web http3 feature 提供，此处仅作开关标志）
 http3 = []
+# 高性能内存分配器（Linux/macOS 有效，Windows 自动跳过）
+jemalloc = ["dep:tikv-jemallocator"]
 
 # ─────────────────────────────────────────────
 # 测试依赖
@@ -121,7 +137,9 @@ tempfile = "3"
 # 编译优化
 # ─────────────────────────────────────────────
 [profile.release]
-opt-level     = 3
-lto           = "thin"
-codegen-units = 1
-strip         = true
+opt-level       = 3
+lto             = "fat"
+codegen-units   = 1
+panic           = "abort"
+strip           = true
+overflow-checks = false   # release 构建禁用整数溢出检查，等价 C 发布模式

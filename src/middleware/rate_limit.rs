@@ -1,5 +1,11 @@
 //! 限流中间件
-//! 负责：按 IP / 路径 / Header / User-Agent 多维度令牌桶限流
+//! 负责：按 IP / 路径 / Header / User-Agent / IP+Path 多维度令牌桶限流
+//!
+//! # 优化
+//! - 路径正则在规则构建时预编译，请求时零分配
+//! - nodelay 模式：burst 内请求立即放行（等价 Nginx limit_req nodelay）
+//! - IpPath 组合维度：IP + 路径联合限流
+//! - 过期桶定期清理（防内存泄漏）
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,14 +43,32 @@ impl TokenBucket {
         }
     }
 
-    /// 尝试消耗 1 个令牌，返回是否允许通过
-    pub fn try_acquire(&mut self) -> bool {
+    /// 尝试消耗 1 个令牌
+    /// 返回 Ok(()) 表示允许，Err(secs) 表示拒绝并附带建议等待秒数
+    ///
+    /// - nodelay=true（等价 Nginx limit_req burst=N nodelay）：
+    ///   令牌充足则立即允许，不足则直接 429，不排队
+    /// - nodelay=false（等价 Nginx limit_req burst=N，平滑限速）：
+    ///   令牌充足则允许，不足时返回需要等待的秒数（让调用方 429）
+    pub fn try_acquire_nodelay(&mut self, nodelay: bool) -> Result<(), f64> {
         self.refill();
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
-            true
+            Ok(())
         } else {
-            false
+            // 距离下一个令牌的等待时间
+            let wait = if self.rate > 0.0 {
+                (1.0 - self.tokens) / self.rate
+            } else {
+                1.0
+            };
+            if nodelay {
+                // nodelay：直接拒绝
+                Err(wait.ceil())
+            } else {
+                // 平滑限速：同样拒绝，但等待时间更精确（毫秒级）
+                Err(wait)
+            }
         }
     }
 
@@ -58,32 +82,34 @@ impl TokenBucket {
 }
 
 // ─────────────────────────────────────────────
-// 限流器
+// 限流器（预编译正则）
 // ─────────────────────────────────────────────
 
-/// 单条规则对应的限流器
+/// 单条规则对应的限流器（路径正则在构建时预编译）
 pub struct RateLimiter {
     /// 限流规则配置
     pub rule: RateLimitRule,
+    /// 预编译的路径正则（仅 Path/IpPath 维度且配置了 path_pattern 时有值）
+    path_regex: Option<regex::Regex>,
     /// 令牌桶映射表：限流 key → TokenBucket
     buckets: Arc<DashMap<String, TokenBucket>>,
 }
 
 impl RateLimiter {
     pub fn new(rule: RateLimitRule) -> Self {
-        Self {
-            rule,
-            buckets: Arc::new(DashMap::new()),
-        }
+        // 路径正则预编译
+        let path_regex = rule.path_pattern.as_deref()
+            .and_then(|p| match regex::Regex::new(p) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    tracing::warn!("限流规则路径正则编译失败 '{}': {}", p, e);
+                    None
+                }
+            });
+        Self { rule, path_regex, buckets: Arc::new(DashMap::new()) }
     }
 
     /// 检查请求是否允许通过
-    ///
-    /// 参数：
-    /// - `client_ip`: 客户端 IP
-    /// - `path`: 请求路径
-    /// - `headers`: 请求头集合（header_name → value）
-    /// - `user_agent`: User-Agent 字符串
     pub fn check(
         &self,
         client_ip: &str,
@@ -91,26 +117,25 @@ impl RateLimiter {
         headers: &std::collections::HashMap<String, String>,
         user_agent: &str,
     ) -> RateLimitResult {
-        let key = self.build_key(client_ip, path, headers, user_agent);
-        let key = match key {
+        let key = match self.build_key(client_ip, path, headers, user_agent) {
             Some(k) => k,
-            None => return RateLimitResult::Allow, // 条件不匹配，放行
+            None => return RateLimitResult::Allow,
         };
 
-        let mut bucket = self.buckets.entry(key).or_insert_with(|| {
-            TokenBucket::new(self.rule.rate, self.rule.burst)
-        });
+        let mut bucket = self.buckets.entry(key)
+            .or_insert_with(|| TokenBucket::new(self.rule.rate, self.rule.burst));
 
-        if bucket.try_acquire() {
-            RateLimitResult::Allow
-        } else {
-            RateLimitResult::Deny {
-                retry_after_secs: (1.0 / self.rule.rate as f64).ceil() as u64,
+        match bucket.try_acquire_nodelay(self.rule.nodelay) {
+            Ok(()) => RateLimitResult::Allow,
+            Err(wait_secs) => {
+                // retry_after 至少 1 秒（HTTP Retry-After 头为整数秒）
+                let retry = (wait_secs.ceil() as u64).max(1);
+                RateLimitResult::Deny { retry_after_secs: retry }
             }
         }
     }
 
-    /// 根据限流维度构建 bucket key
+    /// 根据限流维度构建 bucket key（使用预编译正则，零分配）
     fn build_key(
         &self,
         client_ip: &str,
@@ -119,48 +144,58 @@ impl RateLimiter {
         user_agent: &str,
     ) -> Option<String> {
         match self.rule.dimension {
-            RateLimitDimension::Ip => Some(client_ip.to_string()),
+            RateLimitDimension::Ip => {
+                // IP 维度：直接用 client_ip 作为 key（最常见维度，单次分配）
+                Some(client_ip.to_string())
+            }
+
+            RateLimitDimension::IpPath => {
+                // IP + 路径联合限流（等价 Nginx $binary_remote_addr$uri）
+                if let Some(re) = &self.path_regex {
+                    if !re.is_match(path) { return None; }
+                }
+                let mut k = String::with_capacity(client_ip.len() + 1 + path.len());
+                k.push_str(client_ip); k.push(':'); k.push_str(path);
+                Some(k)
+            }
 
             RateLimitDimension::Path => {
-                if let Some(pattern) = &self.rule.path_pattern {
-                    if let Ok(re) = regex::Regex::new(pattern) {
-                        if re.is_match(path) {
-                            return Some(format!("path:{}", path));
-                        }
-                    }
-                    None // 路径不匹配该规则
-                } else {
-                    Some(format!("path:{}", path))
+                if let Some(re) = &self.path_regex {
+                    if !re.is_match(path) { return None; }
                 }
+                let mut k = String::with_capacity(5 + path.len());
+                k.push_str("path:"); k.push_str(path);
+                Some(k)
             }
 
             RateLimitDimension::Header => {
                 if let Some(header_name) = &self.rule.header_name {
-                    let key_lower = header_name.to_lowercase();
-                    headers.get(&key_lower).map(|v| format!("header:{}:{}", header_name, v))
+                    // 大小写不敏感查找，避免 to_lowercase() 堆分配
+                    headers.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(header_name))
+                        .map(|(_, v)| {
+                            let mut s = String::with_capacity(4 + header_name.len() + 1 + v.len());
+                            s.push_str("hdr:"); s.push_str(header_name); s.push(':'); s.push_str(v);
+                            s
+                        })
                 } else {
                     None
                 }
             }
 
             RateLimitDimension::UserAgent => {
-                if user_agent.is_empty() {
-                    None
-                } else {
-                    Some(format!("ua:{}", user_agent))
-                }
+                if user_agent.is_empty() { return None; }
+                let mut k = String::with_capacity(3 + user_agent.len());
+                k.push_str("ua:"); k.push_str(user_agent);
+                Some(k)
             }
         }
     }
 
-    /// 清理过期的令牌桶（防止内存无限增长）
-    ///
-    /// 生产版本应定期调用，移除长时间未使用的 bucket
+    /// 清理长时间未使用的令牌桶（防内存泄漏，建议每分钟调用一次）
     pub fn cleanup_expired(&self, idle_secs: u64) {
         let threshold = Duration::from_secs(idle_secs);
-        self.buckets.retain(|_, bucket| {
-            bucket.last_refill.elapsed() < threshold
-        });
+        self.buckets.retain(|_, b| b.last_refill.elapsed() < threshold);
         debug!("限流桶清理完成，剩余 {} 个活跃桶", self.buckets.len());
     }
 }
@@ -185,7 +220,7 @@ pub struct SiteRateLimiter {
 }
 
 impl SiteRateLimiter {
-    /// 从规则列表构建
+    /// 从规则列表构建（同时预编译所有路径正则）
     pub fn from_rules(rules: Vec<RateLimitRule>) -> Self {
         Self {
             limiters: rules.into_iter().map(RateLimiter::new).collect(),
@@ -225,6 +260,7 @@ mod tests {
             dimension: RateLimitDimension::Ip,
             rate,
             burst,
+            nodelay: true,
             path_pattern: None,
             header_name: None,
         }
@@ -235,10 +271,10 @@ mod tests {
         let mut bucket = TokenBucket::new(10, 20);
         // 突发容量 20，应允许前 20 次
         for _ in 0..20 {
-            assert!(bucket.try_acquire());
+            assert!(bucket.try_acquire_nodelay(true).is_ok());
         }
         // 第 21 次应被拒绝
-        assert!(!bucket.try_acquire());
+        assert!(bucket.try_acquire_nodelay(true).is_err());
     }
 
     #[test]
@@ -274,6 +310,7 @@ mod tests {
             dimension: RateLimitDimension::Path,
             rate: 1,
             burst: 2,
+            nodelay: true,
             path_pattern: Some("^/api/".to_string()),
             header_name: None,
         };

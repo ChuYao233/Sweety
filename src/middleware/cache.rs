@@ -3,9 +3,58 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 根据文件元数据生成 ETag（基于 inode + mtime + size 的弱 ETag）
+/// 编译期 MIME 类型表（phf 完美哈希，O(1) 查找）
+static MIME_MAP: phf::Map<&'static str, &'static str> = phf::phf_map! {
+    "html"  => "text/html; charset=utf-8",
+    "htm"   => "text/html; charset=utf-8",
+    "css"   => "text/css; charset=utf-8",
+    "js"    => "application/javascript; charset=utf-8",
+    "mjs"   => "application/javascript; charset=utf-8",
+    "json"  => "application/json; charset=utf-8",
+    "xml"   => "application/xml; charset=utf-8",
+    "txt"   => "text/plain; charset=utf-8",
+    "png"   => "image/png",
+    "jpg"   => "image/jpeg",
+    "jpeg"  => "image/jpeg",
+    "gif"   => "image/gif",
+    "webp"  => "image/webp",
+    "svg"   => "image/svg+xml",
+    "ico"   => "image/x-icon",
+    "woff"  => "font/woff",
+    "woff2" => "font/woff2",
+    "ttf"   => "font/ttf",
+    "otf"   => "font/otf",
+    "mp4"   => "video/mp4",
+    "webm"  => "video/webm",
+    "pdf"   => "application/pdf",
+    "zip"   => "application/zip",
+    "wasm"  => "application/wasm",
+    "avif"  => "image/avif",
+    "mp3"   => "audio/mpeg",
+    "ogg"   => "audio/ogg",
+    "flac"  => "audio/flac",
+    "ts"    => "application/typescript; charset=utf-8",
+};
+
+/// 编译期缓存策略表（长缓存扩展名）
+static LONG_CACHE: phf::Set<&'static str> = phf::phf_set! {
+    "js", "mjs", "css", "woff", "woff2", "ttf", "otf",
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "ico",
+    "wasm", "avif", "mp3", "ogg", "flac", "mp4", "webm",
+};
+
+/// 不缓存扩展名（HTML 每次验证）
+static NO_CACHE: phf::Set<&'static str> = phf::phf_set! {
+    "html", "htm",
+};
+
+/// 根据文件元数据生成 ETag（基于 mtime + size 的弱 ETag）
+/// 使用栈上 buffer 避免 format! 堆分配
 pub fn generate_etag(size: u64, modified_secs: u64) -> String {
-    format!("W/\"{:x}-{:x}\"", size, modified_secs)
+    use std::fmt::Write;
+    let mut s = String::with_capacity(32);
+    let _ = write!(s, "W/\"{:x}-{:x}\"", size, modified_secs);
+    s
 }
 
 /// 将 SystemTime 转换为 Unix 时间戳（秒）
@@ -39,48 +88,38 @@ pub fn is_cache_valid(
     false
 }
 
-/// 根据文件扩展名推断 MIME 类型
+/// 根据文件扩展名推断 MIME 类型（phf 完美哈希表，O(1) 查找）
 pub fn mime_type_for(extension: &str) -> &'static str {
-    match extension.to_lowercase().as_str() {
-        "html" | "htm"  => "text/html; charset=utf-8",
-        "css"           => "text/css; charset=utf-8",
-        "js" | "mjs"    => "application/javascript; charset=utf-8",
-        "json"          => "application/json; charset=utf-8",
-        "xml"           => "application/xml; charset=utf-8",
-        "txt"           => "text/plain; charset=utf-8",
-        "png"           => "image/png",
-        "jpg" | "jpeg"  => "image/jpeg",
-        "gif"           => "image/gif",
-        "webp"          => "image/webp",
-        "svg"           => "image/svg+xml",
-        "ico"           => "image/x-icon",
-        "woff"          => "font/woff",
-        "woff2"         => "font/woff2",
-        "ttf"           => "font/ttf",
-        "otf"           => "font/otf",
-        "mp4"           => "video/mp4",
-        "webm"          => "video/webm",
-        "pdf"           => "application/pdf",
-        "zip"           => "application/zip",
-        "wasm"          => "application/wasm",
-        _               => "application/octet-stream",
+    // 扩展名一般很短（≤ 5 字节），用栈分配避免堆分配
+    let mut buf = [0u8; 8];
+    let ext = extension.as_bytes();
+    if ext.len() <= 8 {
+        for (i, &b) in ext.iter().enumerate() {
+            buf[i] = b.to_ascii_lowercase();
+        }
+        let lower = std::str::from_utf8(&buf[..ext.len()]).unwrap_or("");
+        if let Some(&mime) = MIME_MAP.get(lower) { return mime; }
     }
+    "application/octet-stream"
 }
 
-/// 为静态资源生成默认 Cache-Control 头
+/// 为静态资源生成默认 Cache-Control 头（phf 完美哈希表，O(1) 查找）
 ///
 /// - 图片、字体、JS、CSS → 长缓存（7天）
 /// - HTML → 不缓存（no-cache，让浏览器每次验证）
 /// - 其他 → 短缓存（1小时）
 pub fn default_cache_control(extension: &str) -> &'static str {
-    match extension.to_lowercase().as_str() {
-        "js" | "mjs" | "css" | "woff" | "woff2" | "ttf" | "otf"
-        | "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" | "wasm" => {
-            "public, max-age=604800, immutable"
+    let mut buf = [0u8; 8];
+    let ext = extension.as_bytes();
+    if ext.len() <= 8 {
+        for (i, &b) in ext.iter().enumerate() {
+            buf[i] = b.to_ascii_lowercase();
         }
-        "html" | "htm" => "no-cache, must-revalidate",
-        _ => "public, max-age=3600",
+        let lower = std::str::from_utf8(&buf[..ext.len()]).unwrap_or("");
+        if LONG_CACHE.contains(lower) { return "public, max-age=604800, immutable"; }
+        if NO_CACHE.contains(lower)   { return "no-cache, must-revalidate"; }
     }
+    "public, max-age=3600"
 }
 
 // ─────────────────────────────────────────────

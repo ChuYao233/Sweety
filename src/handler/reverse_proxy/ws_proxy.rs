@@ -98,15 +98,19 @@ async fn do_ws_proxy(
     .map_err(|_| anyhow::anyhow!("连接上游超时: {}", upstream_addr))??;
 
     // ── Step 2：构造并发送 HTTP Upgrade 请求 ─────────────────────────────
-    let mut upgrade_req = format!("GET {path} HTTP/1.1\r\nHost: {upstream_host}\r\n");
-    for (k, v) in extra_headers {
-        upgrade_req.push_str(&format!("{k}: {v}\r\n"));
-    }
-    upgrade_req.push_str(&format!("X-Real-IP: {client_ip}\r\n"));
-    upgrade_req.push_str(&format!("X-Forwarded-For: {client_ip}\r\n"));
-    upgrade_req.push_str("X-Forwarded-Proto: https\r\n");
-    upgrade_req.push_str("Connection: upgrade\r\n");
+    // 预分配容量，用 push_str 替代 format! 减少堆分配
+    let mut upgrade_req = String::with_capacity(
+        path.len() + upstream_host.len() + extra_headers.len() * 32 + 128
+    );
+    upgrade_req.push_str("GET "); upgrade_req.push_str(path);
+    upgrade_req.push_str(" HTTP/1.1\r\nHost: "); upgrade_req.push_str(upstream_host);
     upgrade_req.push_str("\r\n");
+    for (k, v) in extra_headers {
+        upgrade_req.push_str(k); upgrade_req.push_str(": "); upgrade_req.push_str(v); upgrade_req.push_str("\r\n");
+    }
+    upgrade_req.push_str("X-Real-IP: "); upgrade_req.push_str(client_ip); upgrade_req.push_str("\r\n");
+    upgrade_req.push_str("X-Forwarded-For: "); upgrade_req.push_str(client_ip); upgrade_req.push_str("\r\n");
+    upgrade_req.push_str("X-Forwarded-Proto: https\r\nConnection: upgrade\r\n\r\n");
 
     // 根据是否需要 TLS 分支处理
     if use_tls {

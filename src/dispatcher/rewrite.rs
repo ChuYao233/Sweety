@@ -42,8 +42,10 @@ impl std::fmt::Debug for CompiledRewrite {
 ///
 /// 返回值：
 /// - `Some(new_path)` 表示路径被重写
-/// - `None` 表示没有规则匹配
+/// - `None` 表示没有规则匹配（包括规则列表为空）
 pub fn apply_rewrites(rules: &[CompiledRewrite], path: &str) -> Option<String> {
+    if rules.is_empty() { return None; } // 热路径：绝大多数静态站点无 rewrite 规则
+
     let mut current = path.to_string();
     let mut changed = false;
 

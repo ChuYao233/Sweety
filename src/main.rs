@@ -1,6 +1,12 @@
 //! Sweety Web 服务器 —— 程序入口
 //! 负责：CLI 参数解析、日志初始化、配置加载、启动服务器
 
+// jemalloc：低碎片、低竞争内存分配器，高并发场景比 glibc malloc 快 10-20%
+// Windows 不支持（MSVC + GNU 均无法编译其 C 代码），通过 cfg(not(windows)) 跳过
+#[cfg(all(not(windows), feature = "jemalloc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::{error, info};
@@ -45,6 +51,48 @@ fn main() {
 
     if cli.test {
         info!("配置文件语法正确，共 {} 个站点", cfg.sites.len());
+        // 验证所有站点的 TLS 证书（等价 nginx -t 的证书检查）
+        let mut cert_ok = true;
+        for site in &cfg.sites {
+            if let Some(tls) = &site.tls {
+                if !tls.acme {
+                    // 验证单证书模式
+                    if let (Some(cert), Some(key)) = (&tls.cert, &tls.key) {
+                        if let Err(e) = sweety_lib::server::tls::TlsManager::build_server_config(tls) {
+                            eprintln!("[ERROR] 站点 '{}' TLS 证书验证失败: {:#}", site.name, e);
+                            eprintln!("  cert: {}", cert.display());
+                            eprintln!("  key:  {}", key.display());
+                            cert_ok = false;
+                        } else {
+                            info!("站点 '{}' TLS 证书验证通过: {}", site.name, cert.display());
+                        }
+                    }
+                    // 验证多证书列表模式
+                    for (i, c) in tls.certs.iter().enumerate() {
+                        let single_tls = sweety_lib::config::model::TlsConfig {
+                            cert: Some(c.cert.clone()),
+                            key:  Some(c.key.clone()),
+                            certs: vec![],
+                            acme: false,
+                            ..tls.clone()
+                        };
+                        if let Err(e) = sweety_lib::server::tls::TlsManager::build_server_config(&single_tls) {
+                            eprintln!("[ERROR] 站点 '{}' 第 {} 张证书验证失败: {:#}", site.name, i + 1, e);
+                            eprintln!("  cert: {}", c.cert.display());
+                            eprintln!("  key:  {}", c.key.display());
+                            cert_ok = false;
+                        } else {
+                            info!("站点 '{}' 第 {} 张证书验证通过: {}", site.name, i + 1, c.cert.display());
+                        }
+                    }
+                }
+            }
+        }
+        if !cert_ok {
+            eprintln!("[ERROR] 配置测试失败：存在无效证书");
+            std::process::exit(1);
+        }
+        info!("配置测试通过 (configuration test is successful)");
         return;
     }
 

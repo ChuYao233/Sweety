@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
 
@@ -96,13 +97,23 @@ async fn watch_loop(
         while event_rx.try_recv().is_ok() {}
 
         match load_config(&config_path) {
-            Ok(new_cfg) => {
-                let new_arc = Arc::new(new_cfg);
-                apply_diff(&current_config, &new_arc, &ctx);
-                current_config = new_arc;
-            }
             Err(e) => {
-                error!("配置热重载失败，继续使用旧配置: {}", e);
+                error!("配置热重载失败（文件解析错误），继续使用旧配置: {:#}", e);
+            }
+            Ok(new_cfg) => {
+                // 热重载前全量验证：证书格式非法时拒绝加载，等价 nginx -t + nginx reload
+                match validate_config(&new_cfg) {
+                    Err(e) => {
+                        error!("配置验证失败，继续使用旧配置: {:#}", e);
+                        error!("  提示：运行 `sweety -t` 可详细检查配置和证书");
+                    }
+                    Ok(()) => {
+                        let new_arc = Arc::new(new_cfg);
+                        apply_diff(&current_config, &new_arc, &ctx);
+                        current_config = new_arc;
+                        info!("配置热重载成功");
+                    }
+                }
             }
         }
     }
@@ -201,6 +212,45 @@ fn tls_changed(old: &SiteConfig, new: &SiteConfig) -> bool {
     toml::to_string(&old.tls).ok() != toml::to_string(&new.tls).ok()
 }
 
+/// 全量验证新配置的合法性（等价 nginx -t）
+///
+/// 检查项：
+/// 1. 所有站点的 TLS 证书（非 ACME）能否正确加载
+/// 2. 证书和私钥格式是否匹配
+///
+/// 任一站点验证失败则返回 Err，调用方应保持旧配置继续服务。
+fn validate_config(cfg: &AppConfig) -> anyhow::Result<()> {
+    for site in &cfg.sites {
+        let Some(tls) = &site.tls else { continue };
+        if tls.acme { continue; } // ACME 证书由后台任务管理，跳过
+
+        // 验证单证书模式
+        if tls.cert.is_some() || tls.key.is_some() {
+            TlsManager::build_certified_keys_pub(tls)
+                .map_err(|e| anyhow::anyhow!(
+                    "站点 '{}' TLS 证书无效: {:#}", site.name, e
+                ))?;
+        }
+
+        // 验证多证书列表
+        for (i, c) in tls.certs.iter().enumerate() {
+            let single_tls = crate::config::model::TlsConfig {
+                cert: Some(c.cert.clone()),
+                key:  Some(c.key.clone()),
+                certs: vec![],
+                acme: false,
+                ..tls.clone()
+            };
+            TlsManager::build_certified_keys_pub(&single_tls)
+                .map_err(|e| anyhow::anyhow!(
+                    "站点 '{}' 第 {} 张证书无效 ({}): {:#}",
+                    site.name, i + 1, c.cert.display(), e
+                ))?;
+        }
+    }
+    Ok(())
+}
+
 
 // ─────────────────────────────────────────────
 // 单元测试
@@ -229,21 +279,7 @@ mod tests {
             locations: vec![LocationConfig {
                 path: "/".into(),
                 handler: HandlerType::Static,
-                root: None,
-                upstream: None,
-                cache_control: None,
-                return_code: None,
-                max_connections: None,
-                strip_cookie_secure: false,
-                proxy_cookie_domain: None,
-                proxy_redirect_from: None,
-                proxy_redirect_to: None,
-                proxy_set_headers: vec![],
-                add_headers: vec![],
-                cache_rules: vec![],
-                return_url: None,
-                try_files: vec![],
-                sub_filter: vec![],
+                ..Default::default()
             }],
             rewrites: vec![],
             rate_limit: None,

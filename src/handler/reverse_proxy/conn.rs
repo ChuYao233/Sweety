@@ -37,6 +37,7 @@ pub async fn forward_request(
     proxy_redirect_to: Option<&str>,
     sub_filter: &[crate::config::model::SubFilter],
     proxy_cache: Option<(&std::sync::Arc<ProxyCache>, &CacheKey)>,
+    client_proto: &str,   // 客户端连接的协议（"https" 或 "http"）
 ) -> Result<WebResponse> {
     debug!("转发 {} {} → {} (tls={}, body={}B)",
         method, path, upstream_addr, use_tls, body.len());
@@ -62,12 +63,12 @@ pub async fn forward_request(
 
         match send_recv_pooled(conn, method, path, host, extra_headers, client_ip, body,
             strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
-            sub_filter, proxy_cache).await
+            sub_filter, proxy_cache, client_proto).await
         {
             Ok((resp, maybe_conn)) => {
                 // 如果连接可复用，归还到池
                 if let Some(c) = maybe_conn {
-                    pool.release(key, c);
+                    pool.release(&key, c);
                 }
                 return Ok(resp);
             }
@@ -120,20 +121,24 @@ async fn send_recv_pooled(
     proxy_redirect_to: Option<&str>,
     sub_filter: &[crate::config::model::SubFilter],
     proxy_cache: Option<(&std::sync::Arc<ProxyCache>, &CacheKey)>,
+    client_proto: &str,
 ) -> Result<(WebResponse, Option<PooledConn>)> {
-    // ── 构造请求头（keep-alive）────────────────────────────────────────────
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
+    // ── 构造请求头（keep-alive）──────────────────────────────────────────────
+    // 预分配容量：请求行 + host + 过滤后的头 + 4 个固定头 + \r\n
+    let mut req = String::with_capacity(
+        method.len() + path.len() + host.len() + extra_headers.len() * 32 + 128
+    );
+    req.push_str(method); req.push(' '); req.push_str(path);
+    req.push_str(" HTTP/1.1\r\nHost: "); req.push_str(host); req.push_str("\r\n");
     for (k, v) in extra_headers {
         // content-length 由下方统一设置，避免与 extra_headers 里的重复
-        if k.to_lowercase() == "content-length" { continue; }
-        req.push_str(&format!("{k}: {v}\r\n"));
+        if k.eq_ignore_ascii_case("content-length") { continue; }
+        req.push_str(k); req.push_str(": "); req.push_str(v); req.push_str("\r\n");
     }
-    req.push_str(&format!("X-Real-IP: {client_ip}\r\n"));
-    req.push_str(&format!("X-Forwarded-For: {client_ip}\r\n"));
-    req.push_str("X-Forwarded-Proto: https\r\n");
-    req.push_str("Connection: keep-alive\r\n");
-    req.push_str(&format!("Content-Length: {}\r\n", req_body.len()));
-    req.push_str("\r\n");
+    req.push_str("X-Real-IP: "); req.push_str(client_ip); req.push_str("\r\n");
+    req.push_str("X-Forwarded-For: "); req.push_str(client_ip); req.push_str("\r\n");
+    req.push_str("X-Forwarded-Proto: "); req.push_str(client_proto); req.push_str("\r\nConnection: keep-alive\r\nContent-Length: ");
+    req.push_str(itoa::Buffer::new().format(req_body.len())); req.push_str("\r\n\r\n");
 
     debug!("→ {} {} Host:{} body={}B", method, path, host, req_body.len());
 
@@ -162,7 +167,7 @@ async fn send_recv_pooled(
     let mut resp_content_length: Option<usize> = None;
     let mut resp_is_chunked = false;
     let mut resp_conn_close = false;
-    let mut response_headers: Vec<(String, String)> = Vec::new();
+    let mut response_headers: Vec<(String, String)> = Vec::with_capacity(16);
 
     loop {
         let mut line = String::new();
@@ -176,16 +181,34 @@ async fn send_recv_pooled(
         if let Some(colon) = trimmed.find(':') {
             let k = trimmed[..colon].trim().to_string();
             let v = trimmed[colon + 1..].trim().to_string();
-            let kl = k.to_lowercase();
-            if kl == "content-length" { resp_content_length = v.parse().ok(); }
-            if kl == "transfer-encoding" && v.to_lowercase().contains("chunked") {
+            // 大小写不敏感比较，零堆分配
+            if k.eq_ignore_ascii_case("content-length") { resp_content_length = v.parse().ok(); }
+            if k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked") {
                 resp_is_chunked = true;
             }
             // 上游要求关闭连接时不归还
-            if kl == "connection" && v.to_lowercase().contains("close") {
+            if k.eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("close") {
                 resp_conn_close = true;
             }
             response_headers.push((k, v));
+        }
+    }
+
+    // ── 304/204/205/1xx：HTTP 规范不允许有 body，直接提前返回 ──────────────
+    {
+        let s = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
+        let no_body_status = s == StatusCode::NOT_MODIFIED
+            || s == StatusCode::NO_CONTENT
+            || s == StatusCode::RESET_CONTENT
+            || s.is_informational();
+        if no_body_status {
+            drop(buf);
+            let maybe_conn = if !resp_conn_close { Some(conn) } else { None };
+            let mut resp = WebResponse::new(ResponseBody::none());
+            *resp.status_mut() = s;
+            apply_response_headers(&mut resp, &response_headers,
+                strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
+            return Ok((resp, maybe_conn));
         }
     }
 
@@ -224,14 +247,26 @@ async fn send_recv_pooled(
         }
     }
 
-    let body_len = final_body.len();
     let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
-    let mut resp = WebResponse::new(ResponseBody::from(final_body));
+    // 304/204/205/1xx 不能带 body（HTTP 规范 + H2 dispatcher 要求）
+    let no_body = http_status == StatusCode::NOT_MODIFIED
+        || http_status == StatusCode::NO_CONTENT
+        || http_status == StatusCode::RESET_CONTENT
+        || http_status.is_informational();
+    let body_len = if no_body { 0 } else { final_body.len() };
+    let mut resp = if no_body {
+        WebResponse::new(ResponseBody::none())
+    } else {
+        WebResponse::new(ResponseBody::from(final_body))
+    };
     *resp.status_mut() = http_status;
     apply_response_headers(&mut resp, &response_headers,
         strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
-    if let Ok(v) = HeaderValue::from_str(&body_len.to_string()) {
-        resp.headers_mut().insert(CONTENT_LENGTH, v);
+    // 304/204 不设 Content-Length
+    if !no_body {
+        if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_len)) {
+            resp.headers_mut().insert(CONTENT_LENGTH, v);
+        }
     }
 
     Ok((resp, maybe_conn))
@@ -314,7 +349,7 @@ fn rewrite_body_urls(
     let (Some(from), Some(to)) = (from, to) else { return bytes; };
 
     let is_text = headers.iter().any(|(k, v)| {
-        k.to_lowercase() == "content-type" && (
+        k.eq_ignore_ascii_case("content-type") && (
             v.contains("json") || v.contains("html") ||
             v.contains("javascript") || v.contains("text")
         )

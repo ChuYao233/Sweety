@@ -1,404 +1,294 @@
 # Sweety 完整示例配置文件
 # 格式：TOML（同样支持 JSON / YAML，通过文件扩展名自动识别）
+# 版本：与当前代码库同步，涵盖全部配置项
 
-# ─────────────────────────────────────────────
-# 全局配置
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# 全局配置 [global]
+# 所有字段均有合理默认值，最简部署时整个 [global] 块可以省略
+# ═══════════════════════════════════════════════════════════════════════════════
 [global]
-# Worker 线程数，0 = CPU 核心数
+# Worker 线程数，0 = 自动（CPU 核心数）
+# 等价 Nginx worker_processes auto
 worker_threads = 0
+
+# 每个 Worker 最大并发连接数
+# 等价 Nginx worker_connections
+worker_connections = 51200
+
+# 全局最大并发 HTTP 连接数，0 = 不限制
+# 超出返回 503 Service Unavailable（防内存爆涨）
+max_connections = 0
+
+# Keep-Alive 超时（秒），0 = 禁用
+# 等价 Nginx keepalive_timeout
+keepalive_timeout = 60
+
+# FastCGI 连接超时（秒）
+# 等价 Nginx fastcgi_connect_timeout
+fastcgi_connect_timeout = 5
+
+# FastCGI 读取超时（秒）
+# 等价 Nginx fastcgi_read_timeout
+fastcgi_read_timeout = 60
+
+# 客户端最大请求体大小（MB）
+# 等价 Nginx client_max_body_size
+# WordPress 建议设为 64 或更大（对应 php.ini upload_max_filesize）
+client_max_body_size = 50
+
+# 客户端请求头缓冲区（KB）
+# 等价 Nginx client_header_buffer_size
+client_header_buffer_size = 32
+
+# 客户端请求体缓冲区（KB）
+# 等价 Nginx client_body_buffer_size
+client_body_buffer_size = 512
+
+# 是否全局开启 gzip 压缩
+# 站点级 gzip 字段可覆盖此值
+gzip = false
+
+# gzip 最小文件大小（KB），小于此值不压缩
+# 等价 Nginx gzip_min_length
+gzip_min_length = 1
+
+# gzip 压缩等级 1-9（1=快/低压缩率，9=慢/高压缩率）
+# 等价 Nginx gzip_comp_level
+gzip_comp_level = 5
+
 # 管理 API 监听地址（留空则禁用）
+# Prometheus 指标也挂载在此地址上
 admin_listen = "127.0.0.1:9000"
+
 # 管理 API Bearer Token（生产环境请换成随机强密码）
 admin_token = "change-me-in-production"
-# 全局默认错误日志路径
+
+# 全局默认错误日志路径（站点级 error_log 优先）
 error_log = "/var/log/sweety/error.log"
+
 # 是否启用 Prometheus 指标接口
 prometheus_enabled = true
-# Prometheus 指标路径（在 admin_listen 上暴露）
+
+# Prometheus 指标路径（挂载在 admin_listen 上）
 prometheus_path = "/metrics"
 
-# ─────────────────────────────────────────────
-# 站点 1：静态网站 + HTTPS + 自动 ACME 证书
-# ─────────────────────────────────────────────
+# 日志级别：error / warn / info / debug / trace
+# 也可通过环境变量 RUST_LOG 覆盖（环境变量优先）
+log_level = "info"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 站点 1：静态网站（HTTPS + ACME 自动证书 + Brotli/gzip 压缩）
+# 展示：TLS 所有子项、gzip/brotli、HSTS、force_https、error_page、try_files
+# ═══════════════════════════════════════════════════════════════════════════════
 [[sites]]
-# 站点唯一标识
-name = "example-static"
+# 站点唯一标识（用于日志、Admin API 引用）
+name        = "example-static"
 # 匹配的域名列表（支持通配符 *.example.com）
 server_name = ["example.com", "www.example.com"]
-# 监听端口（HTTP）
-listen = [80]
-# 监听端口（HTTPS）
-listen_tls = [443]
-# 网站根目录
-root = "/var/www/example"
-# 默认文档（按顺序查找）
-index = ["index.html", "index.htm"]
-# 访问日志路径
-access_log = "/var/log/sweety/example_access.log"
-# 错误日志路径（不设则使用全局）
-error_log = "/var/log/sweety/example_error.log"
-
-# TLS 配置
-[sites.tls]
-# 使用 ACME 自动申请证书（TLS-ALPN-01，无需开放 80 端口）
-acme = true
-acme_email = "admin@example.com"
-# 证书提供商（默认 letsencrypt）：
-#   letsencrypt         — Let's Encrypt 生产环境（90 天，最流行）
-#   letsencrypt_staging — Let's Encrypt 测试环境（不消耗配额，证书不受信任）
-#   zerossl             — ZeroSSL（90 天，可登录管理面板）
-#   buypass             — Buypass / LiteSSL（180 天，挪威 CA）
-#   https://...         — 自定义 ACME 目录 URL
-acme_provider = "letsencrypt"
-# 到期前多少天自动续期（默认 30 天）
-acme_renew_days_before = 30
-# 或手动指定证书（与 acme = true 二选一）
-# cert = "/etc/ssl/example.com.crt"
-# key  = "/etc/ssl/example.com.key"
-
-# Location 配置（按优先级从高到低排列）
-[[sites.locations]]
-# 路径精确匹配 /health
-path = "= /health"
-handler = "static"
-# 直接返回 200 OK（健康检查用）
-return_code = 200
-
-[[sites.locations]]
-# 前缀优先匹配 /static/
-path = "^~ /static/"
-handler = "static"
-# 强制缓存 7 天
-cache_control = "public, max-age=604800, immutable"
-
-[[sites.locations]]
-# 默认 location
-path = "/"
-handler = "static"
-
-# ─────────────────────────────────────────────
-# 站点 2：WordPress / PHP 站点（生产级配置）
-# ─────────────────────────────────────────────
-[[sites]]
-name        = "wordpress"
-server_name = ["www.example.com", "example.com"]
+# HTTP 明文监听端口
 listen      = [80]
+# HTTPS 监听端口
 listen_tls  = [443]
-root        = "/var/www/wordpress"
-index       = ["index.php", "index.html"]
-access_log  = "/var/log/sweety/wordpress_access.log"
-# 强制 HTTP → HTTPS（需配置 listen_tls）
+# 静态文件根目录
+root        = "/var/www/example"
+# 默认文档（按顺序查找）
+index       = ["index.html", "index.htm"]
+# 访问日志路径（留空则不记录）
+access_log  = "/var/log/sweety/example_access.log"
+# 站点级错误日志（不设则继承全局 error_log）
+error_log   = "/var/log/sweety/example_error.log"
+# 强制 HTTP → HTTPS 301 跳转
 force_https = true
-# WordPress 上传文件大小限制（需与 php.ini upload_max_filesize 一致）
-# client_max_body_size 在 [global] 里设置，这里继承
+# 是否作为 fallback 站点（Host 不匹配任何站点时兜底）
+fallback    = false
+# 站点级 gzip 覆盖（覆盖全局 global.gzip）
+gzip        = true
+# 站点级 gzip 压缩等级覆盖（1-9）
+gzip_comp_level = 6
+# 是否允许 WebSocket 升级（handler=reverse_proxy 时生效）
+websocket   = true
 
-# ACME 自动证书
+# ── TLS 配置（所有子项）──────────────────────────────────────────────────────
 [sites.tls]
+# 使用 ACME 自动申请证书（HTTP-01 验证，需要 80 端口可达）
 acme                   = true
 acme_email             = "admin@example.com"
-acme_provider          = "letsencrypt"   # 可选: letsencrypt / zerossl / letsencrypt_staging
+# 证书提供商：
+#   letsencrypt         — Let's Encrypt 生产环境（90 天）
+#   letsencrypt_staging — 测试环境（不消耗配额，证书不受信任）
+#   zerossl             — ZeroSSL（90 天）
+#   buypass             — Buypass（180 天）
+#   https://acme-v02...  — 自定义 ACME 目录 URL
+acme_provider          = "letsencrypt"
+# 到期前多少天自动续期
 acme_renew_days_before = 30
+# 最低 TLS 版本（tls1.2 / tls1.3）
+min_version            = "tls1.2"
+# 最高 TLS 版本
+max_version            = "tls1.3"
+# 手动指定证书（与 acme 二选一）
+# cert = "/etc/ssl/example.com.crt"
+# key  = "/etc/ssl/example.com.key"
+# 多证书（ECDSA + RSA 双证书，SNI 自动选最优）
+# [[sites.tls.certs]]
+# cert = "/etc/ssl/ecdsa.crt"
+# key  = "/etc/ssl/ecdsa.key"
+# [[sites.tls.certs]]
+# cert = "/etc/ssl/rsa.crt"
+# key  = "/etc/ssl/rsa.key"
 
-# 自定义错误页
+# ── HSTS（仅 HTTPS 有效）──────────────────────────────────────────────────────
+[sites.hsts]
+# max_age = 0 表示禁用 HSTS（从浏览器删除记录）
+max_age             = 31536000   # 1 年
+include_sub_domains = false
+preload             = false
+
+# ── 自定义错误页 ──────────────────────────────────────────────────────────────
+# key = HTTP 状态码（TOML 要求字符串写法），value = 相对于 root 的路径
 [sites.error_pages]
-404 = "/404.html"
-500 = "/500.html"
+"404" = "/404.html"
+"500" = "/500.html"
+"503" = "/503.html"
 
-# PHP-FPM 连接（优先用 Unix socket，性能优于 TCP）
-[sites.fastcgi]
-socket       = "/var/run/php/php8.2-fpm.sock"
-# 备选 TCP 模式（容器化部署时常用）：
-# host = "127.0.0.1"
-# port = 9000
-pool_size    = 32   # 连接池 idle 连接数
-connect_timeout = 5
-read_timeout = 60   # WordPress 后台操作可能耗时较长
-
-# ── Location 1：静态资源强缓存 ────────────────────────────────────────────
+# ── Location：精确匹配健康检查 ────────────────────────────────────────────────
 [[sites.locations]]
-path          = "^~ /wp-content/uploads/"
-handler       = "static"
-cache_control = "public, max-age=2592000"  # 30 天
+path        = "= /health"
+handler     = "static"
+return_code = 200   # 直接返回状态码，不读文件
 
+# ── Location：前缀优先匹配静态资源 ───────────────────────────────────────────
 [[sites.locations]]
-path          = "^~ /wp-content/"
+path          = "^~ /assets/"
 handler       = "static"
-cache_control = "public, max-age=604800"   # 7 天
+cache_control = "public, max-age=2592000, immutable"
 
-[[sites.locations]]
-path          = "^~ /wp-includes/"
-handler       = "static"
-cache_control = "public, max-age=604800"
-
-# ── Location 2：拒绝访问敏感文件 ─────────────────────────────────────────────
+# ── Location：正则匹配（禁止访问 .开头隐藏文件）────────────────────────────
 [[sites.locations]]
 path        = "~ /\\."
 handler     = "static"
 return_code = 403
 
+# ── Location：return 指令（等价 Nginx return 301 https://...）───────────────
 [[sites.locations]]
-# 禁止直接访问 xmlrpc.php（防 DDoS 攻击，WordPress 特有）
-path        = "= /xmlrpc.php"
-handler     = "static"
-return_code = 403
+path       = "= /old-path"
+handler    = "static"
+# 支持状态码前缀和 $request_uri 变量
+return_url = "301 https://example.com/new-path$request_uri"
 
-# ── Location 3：PHP 文件执行（等价 Nginx ~ \.php$ 块）───────────────────────
-# Sweety 的 FastCGI handler 会自动：
-#   - 检查 SCRIPT_FILENAME 文件是否存在（防 Primary script unknown）
-#   - 传递 HTTPS=on（WordPress is_ssl() 正常工作）
-#   - 传递所有 HTTP_* 头（Cookie、Authorization 等）
-#   - POST 请求体通过 STDIN 传给 PHP-FPM
-[[sites.locations]]
-path    = "~ \\.php$"
-handler = "fastcgi"
-
-# ── Location 4：WordPress 伪静态（等价 try_files 规则）─────────────────
-# 访问 /wp-admin/ 等非 .php 路径时：
-#   1. 先尝试静态文件（$uri）
-#   2. 再尝试目录（$uri/）
-#   3. 最后 fallback 到 index.php（WordPress 路由入口）
-# FastCGI handler 会检查 /var/www/wordpress/index.php 是否存在
+# ── Location：SPA 单页应用（try_files fallback 到 index.html）──────────────
 [[sites.locations]]
 path      = "/"
-handler   = "fastcgi"
-try_files = ["$uri", "$uri/", "/index.php"]
+handler   = "static"
+try_files = ["$uri", "$uri/", "/index.html"]
 
-# ── 限流配置（防爆破 wp-login.php）────────────────────────────────────────
+# ── 限流配置 ──────────────────────────────────────────────────────────────────
 [sites.rate_limit]
-[[sites.rate_limit.rules]]
-dimension    = "path"
-path_pattern = "^/wp-login\\.php"
-rate         = 5      # 每秒最多 5 次登录请求
-burst        = 10
 
+# 规则 1：按 IP 限流（全局托底）
 [[sites.rate_limit.rules]]
 dimension = "ip"
-rate      = 100
-burst     = 200
+rate      = 200    # 每秒稳定速率
+burst     = 400    # 令牌桶上限（突发容量）
+# nodelay=true（默认）：burst 内立即放行，超出直接 429（等价 Nginx limit_req nodelay）
+# nodelay=false：平滑限速，超出 burst 时返回精确等待时间
+nodelay   = true
 
-# ─────────────────────────────────────────────
-# 站点 3：反向代理站点（负载均衡）
-# ─────────────────────────────────────────────
+# 规则 2：按路径 + IP 组合限流（等价 Nginx $binary_remote_addr$uri）
+[[sites.rate_limit.rules]]
+dimension    = "ip_path"
+rate         = 30
+burst        = 60
+nodelay      = true
+path_pattern = "^/api/"   # 仅对 /api/ 前缀路径生效（正则）
+
+# 规则 3：按 Header 限流（如按 API Key）
+[[sites.rate_limit.rules]]
+dimension   = "header"
+rate        = 100
+burst       = 200
+header_name = "X-API-Key"
+
+# 规则 4：按 User-Agent 限流（防爬虫）
+[[sites.rate_limit.rules]]
+dimension = "user_agent"
+rate      = 10
+burst     = 20
+
+# 规则 5：按路径限流（仅路径维度，不区分 IP）
+[[sites.rate_limit.rules]]
+dimension    = "path"
+rate         = 50
+burst        = 100
+path_pattern = "^/search"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 站点 2：WordPress（PHP-FPM + FastCGI 缓存 + 防爆破限流）
+# 展示：fastcgi 所有子项、fastcgi_cache、Rewrite、多证书
+# ═══════════════════════════════════════════════════════════════════════════════
 [[sites]]
-name = "example-proxy"
-server_name = ["api.example.com"]
-listen = [80]
-listen_tls = [443]
-access_log = "/var/log/sweety/api_access.log"
-
-[sites.tls]
-acme = true
-acme_email = "admin@example.com"
-
-# 上游服务器组
-[[sites.upstreams]]
-name = "backend"
-# 负载均衡策略：round_robin / weighted / least_conn / ip_hash
-strategy = "least_conn"
-# 健康检查
-[sites.upstreams.health_check]
-enabled = true
-interval = 10       # 检查间隔（秒）
-timeout  = 3        # 超时（秒）
-path     = "/health"
-# 上游节点列表
-[[sites.upstreams.nodes]]
-addr   = "127.0.0.1:8001"
-weight = 1
-[[sites.upstreams.nodes]]
-addr   = "127.0.0.1:8002"
-weight = 2
-[[sites.upstreams.nodes]]
-addr   = "127.0.0.1:8003"
-weight = 1
-
-[[sites.locations]]
-path = "/"
-handler = "reverse_proxy"
-upstream = "backend"
-# 请求镜像（可选，调试用）
-# mirror = "http://127.0.0.1:9999"
-
-# ─────────────────────────────────────────────
-# 站点 4：WebSocket 站点
-# ─────────────────────────────────────────────
-[[sites]]
-name = "example-ws"
-server_name = ["ws.example.com"]
-listen = [80]
-listen_tls = [443]
-access_log = "/var/log/sweety/ws_access.log"
-
-[sites.tls]
-acme = true
-acme_email = "admin@example.com"
-
-[[sites.locations]]
-path = "/ws"
-handler = "websocket"
-# 最大并发连接数
-max_connections = 10000
-# 上游 WebSocket 后端（若需要转发）
-# upstream_ws = "ws://127.0.0.1:8080/ws"
-
-[[sites.locations]]
-path = "/"
-handler = "static"
-root = "/var/www/ws-site"
-
-# ─────────────────────────────────────────────
-# 站点 5：新功能综合示例
-# 展示：return/try_files/error_page/sub_filter/
-#       proxy_cache/访问日志/force_https
-# ─────────────────────────────────────────────
-[[sites]]
-name        = "example-full"
-server_name = ["full.example.com"]
+name        = "wordpress"
+server_name = ["blog.example.com", "www.blog.example.com"]
 listen      = [80]
 listen_tls  = [443]
-root        = "/var/www/full-site"
-access_log  = "/var/log/sweety/full_access.log"
-# HTTP → HTTPS 强制跳转（需配置 listen_tls 才生效）
+root        = "/var/www/wordpress"
+index       = ["index.php", "index.html"]
+access_log  = "/var/log/sweety/wordpress_access.log"
 force_https = true
-
-# 自定义错误页（等价 Nginx error_page 404 /404.html）
-# key = HTTP 状态码（字符串），value = 相对于 root 的路径
-[sites.error_pages]
-404 = "/404.html"
-500 = "/500.html"
-503 = "/503.html"
-
-# 反代响应缓存（等价 Nginx proxy_cache）
-[sites.proxy_cache]
-# 磁盘缓存目录（不设则仅用内存）
-path        = "/var/cache/sweety/full"
-# 内存最大缓存条数
-max_entries = 2000
-# 缓存 TTL（秒）
-ttl         = 300
-# 可缓存状态码
-cacheable_statuses = [200, 301, 302, 304]
-# 可缓存方法
-cacheable_methods  = ["GET", "HEAD"]
-# 有以下请求头时跳过缓存
-bypass_headers     = ["Authorization", "Cookie", "X-No-Cache"]
+gzip        = true
 
 [sites.tls]
 acme                   = true
 acme_email             = "admin@example.com"
 acme_provider          = "letsencrypt"
 acme_renew_days_before = 30
-min_version            = "tls1.2"
-max_version            = "tls1.3"
-
-# 上游
-[[sites.upstreams]]
-name     = "app-backend"
-strategy = "round_robin"
-[[sites.upstreams.nodes]]
-addr = "127.0.0.1:3000"
-
-# Location 1：return 指令（带 URL，等价 Nginx return 301 https://...）
-[[sites.locations]]
-path       = "= /old-page"
-handler    = "static"
-# 301 永久跳转，支持 $request_uri 变量
-return_url = "301 https://full.example.com/new-page"
-
-# Location 2：try_files（等价 Nginx try_files $uri $uri/ /index.html）
-# 场景：SPA 单页应用，所有路径都 fallback 到 index.html
-[[sites.locations]]
-path      = "/"
-handler   = "static"
-try_files = ["$uri", "$uri/", "/index.html"]
-
-# Location 3：反代 + sub_filter + cache_rules + proxy_set_header
-[[sites.locations]]
-path     = "/api/"
-handler  = "reverse_proxy"
-upstream = "app-backend"
-
-# 自定义转发请求头（等价 Nginx proxy_set_header）
-# 支持变量: $remote_addr / $host / $scheme / $request_uri
-[[sites.locations.proxy_set_headers]]
-name  = "X-Real-IP"
-value = "$remote_addr"
-
-[[sites.locations.proxy_set_headers]]
-name  = "X-Forwarded-For"
-value = "$remote_addr"
-
-[[sites.locations.proxy_set_headers]]
-name  = "X-Forwarded-Proto"
-value = "$scheme"
-
-[[sites.locations.proxy_set_headers]]
-name  = "Host"
-value = "$host"
-
-# 向客户端响应注入自定义头（等价 Nginx add_header）
-[[sites.locations.add_headers]]
-name  = "X-Frame-Options"
-value = "SAMEORIGIN"
-
-[[sites.locations.add_headers]]
-name  = "X-Content-Type-Options"
-value = "nosniff"
-
-[[sites.locations.add_headers]]
-name  = "X-Cache-Status"
-value = "$upstream_cache_status"
-
-# 响应体内容替换（等价 Nginx sub_filter）
-# pattern 以 ~ 开头表示正则，否则为字符串替换
-[[sites.locations.sub_filter]]
-pattern     = "http://internal-api.local"
-replacement = "https://full.example.com"
-
-[[sites.locations.sub_filter]]
-# 正则替换：去掉 HTML 注释
-pattern     = "~ <!--.*?-->"
-replacement = ""
-
-# 按扩展名设置缓存（等价 Nginx if $uri ~* ... { expires ... }）
-[[sites.locations.cache_rules]]
-pattern       = "\\.(gif|png|jpg|jpeg|webp|css|js|woff2?)$"
-cache_control = "public, max-age=2592000, immutable"
-
-[[sites.locations.cache_rules]]
-pattern       = "\\.html$"
-cache_control = "no-cache"
-
-# 多 PHP 版本示例
-# 不同站点使用不同 PHP 版本，互不干扰
-
-# ── 站点 A：WordPress（PHP 8.3）─────────────────────────────────────────────
-[[sites]]
-name        = "wordpress-php83"
-server_name = ["blog.example.com"]
-listen      = [80]
-listen_tls  = [443]
-root        = "/var/www/wordpress"
-index       = ["index.php", "index.html"]
-access_log  = "/var/log/sweety/wordpress_access.log"
-force_https = true
-
-[sites.tls]
-acme       = true
-acme_email = "admin@example.com"
 
 [sites.error_pages]
-404 = "/404.html"
+"404" = "/404.html"
+"500" = "/500.html"
 
-# PHP 8.3 socket
+# ── PHP-FPM FastCGI 配置（所有子项）─────────────────────────────────────────
 [sites.fastcgi]
-socket          = "/var/run/php/php8.3-fpm.sock"
+# Unix Socket 路径（与 host/port 二选一，优先使用 socket，性能更好）
+socket          = "/var/run/php/php8.2-fpm.sock"
+# TCP 模式（容器化部署时常用，与 socket 二选一）
+# host            = "127.0.0.1"
+# port            = 9000
+# 连接池 idle 连接数（建议 = PHP-FPM pm.max_children / 2）
 pool_size       = 32
+# 连接超时（秒）
 connect_timeout = 5
-read_timeout    = 120   # WordPress 后台导入/更新可能耗时
+# 读取超时（秒，WordPress 后台操作可能耗时较长）
+read_timeout    = 120
 
-# WordPress 静态资源强缓存
+# FastCGI 响应缓存（等价 Nginx fastcgi_cache）
+# 对 GET/HEAD 请求的 PHP 响应进行缓存，大幅降低 PHP-FPM 压力
+[sites.fastcgi.cache]
+# 磁盘缓存目录（不设则仅用内存）
+path               = "/var/cache/sweety/wordpress-fcgi"
+# 内存缓存最大条数
+max_entries        = 2000
+# 缓存有效期（秒）
+ttl                = 300
+# 可缓存的 HTTP 状态码
+cacheable_statuses = [200, 301, 302]
+# 可缓存的 HTTP 方法
+cacheable_methods  = ["GET", "HEAD"]
+# 有以下请求头时跳过缓存（已登录用户不缓存）
+bypass_headers     = ["Cookie", "Authorization"]
+
+# ── Rewrite 规则（WordPress 伪静态，等价 Nginx try_files + rewrite）──────────
+# Rewrite 规则在 Location 匹配之前执行
+[[sites.rewrites]]
+pattern   = "^/(.+)$"
+target    = "/index.php?$1"
+# flag: last（重新匹配 location）/ break（停止）/ redirect（302）/ permanent（301）
+flag      = "last"
+# 触发条件：!-f 文件不存在，!-d 目录不存在（两者都可用）
+condition = "!-f"
+
+# ── 静态资源缓存 location ────────────────────────────────────────────────────
 [[sites.locations]]
 path          = "^~ /wp-content/uploads/"
 handler       = "static"
@@ -414,7 +304,349 @@ path          = "^~ /wp-includes/"
 handler       = "static"
 cache_control = "public, max-age=604800"
 
-# 禁止访问隐藏文件和 xmlrpc.php
+# 禁止访问隐藏文件
+[[sites.locations]]
+path        = "~ /\\."
+handler     = "static"
+return_code = 403
+
+# 禁止 xmlrpc.php（防 DDoS）
+[[sites.locations]]
+path        = "= /xmlrpc.php"
+handler     = "static"
+return_code = 403
+
+# PHP 文件执行
+[[sites.locations]]
+path    = "~ \\.php$"
+handler = "fastcgi"
+
+# WordPress 伪静态入口
+[[sites.locations]]
+path      = "/"
+handler   = "fastcgi"
+try_files = ["$uri", "$uri/", "/index.php"]
+
+# 防爆破 wp-login.php：路径维度 5 req/s，IP 维度 100 req/s
+[sites.rate_limit]
+[[sites.rate_limit.rules]]
+dimension    = "path"
+rate         = 5
+burst        = 10
+nodelay      = true
+path_pattern = "^/wp-login\\.php"
+
+[[sites.rate_limit.rules]]
+dimension = "ip"
+rate      = 100
+burst     = 200
+nodelay   = true
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 站点 3：反向代理（负载均衡 + proxy_cache + sub_filter + 安全头）
+# 展示：upstreams 所有子项、proxy_cache、proxy_set_headers、add_headers、sub_filter
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "example-proxy"
+server_name = ["api.example.com"]
+listen      = [80]
+listen_tls  = [443]
+access_log  = "/var/log/sweety/api_access.log"
+force_https = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+
+# ── 反代响应缓存（等价 Nginx proxy_cache）────────────────────────────────────
+[sites.proxy_cache]
+path               = "/var/cache/sweety/api"
+max_entries        = 5000
+ttl                = 60
+cacheable_statuses = [200, 301, 302]
+cacheable_methods  = ["GET", "HEAD"]
+bypass_headers     = ["Authorization", "Cookie", "X-No-Cache"]
+
+# ── 上游服务器组（所有子项）──────────────────────────────────────────────────
+[[sites.upstreams]]
+name = "backend"
+# 负载均衡策略：round_robin / weighted / least_conn / ip_hash
+strategy = "least_conn"
+
+# 主动健康检查
+[sites.upstreams.health_check]
+enabled  = true
+interval = 10       # 检查间隔（秒）
+timeout  = 3        # 探活超时（秒）
+path     = "/health"
+
+# 节点 1（权重 1）
+[[sites.upstreams.nodes]]
+addr            = "127.0.0.1:8001"
+weight          = 1
+tls             = false    # 是否用 TLS 连接上游
+# tls_sni       = "backend.internal"  # TLS SNI（不设则用 addr 的主机名）
+# tls_insecure  = false               # 跳过上游证书验证（内网自签名时用）
+# upstream_host = "backend.internal"  # 发给上游的 Host 头
+
+# 节点 2（权重 2，HTTPS 上游示例）
+[[sites.upstreams.nodes]]
+addr         = "127.0.0.1:8002"
+weight       = 2
+tls          = true
+tls_sni      = "backend.internal"
+tls_insecure = true   # 内网自签名证书跳过验证
+
+# 节点 3（权重 1）
+[[sites.upstreams.nodes]]
+addr   = "127.0.0.1:8003"
+weight = 1
+
+# ── Location：API 反向代理（所有 location 子项）──────────────────────────────
+[[sites.locations]]
+path     = "/api/"
+handler  = "reverse_proxy"
+upstream = "backend"
+
+# 修改 Set-Cookie 里的 Secure 标志（HTTP 代理 HTTPS 上游时防浏览器拒绝存 Cookie）
+strip_cookie_secure  = false
+# 替换 Set-Cookie 里的 Domain 属性
+# proxy_cookie_domain = "backend.internal"
+# 上游 Location 响应头 URL 替换（等价 Nginx proxy_redirect）
+# proxy_redirect_from = "https://backend.internal"
+# proxy_redirect_to   = "https://api.example.com"
+
+# 自定义转发请求头（等价 Nginx proxy_set_header）
+# 支持变量：$remote_addr / $host / $scheme / $request_uri
+[[sites.locations.proxy_set_headers]]
+name  = "X-Real-IP"
+value = "$remote_addr"
+
+[[sites.locations.proxy_set_headers]]
+name  = "X-Forwarded-For"
+value = "$remote_addr"
+
+[[sites.locations.proxy_set_headers]]
+name  = "X-Forwarded-Proto"
+value = "$scheme"
+
+# 向客户端响应注入自定义头（等价 Nginx add_header）
+[[sites.locations.add_headers]]
+name  = "X-Frame-Options"
+value = "SAMEORIGIN"
+
+[[sites.locations.add_headers]]
+name  = "X-Content-Type-Options"
+value = "nosniff"
+
+[[sites.locations.add_headers]]
+name  = "Referrer-Policy"
+value = "strict-origin-when-cross-origin"
+
+# 响应体内容替换（等价 Nginx sub_filter）
+# pattern 以 ~ 开头表示正则，否则为字符串精确替换
+[[sites.locations.sub_filter]]
+pattern     = "http://internal-api.local"
+replacement = "https://api.example.com"
+
+[[sites.locations.sub_filter]]
+pattern     = "~ <!--.*?-->"
+replacement = ""
+
+# 按扩展名覆盖 Cache-Control（等价 Nginx if $uri ~* ... { expires ... }）
+[[sites.locations.cache_rules]]
+pattern       = "\\.(css|js|woff2?)$"
+cache_control = "public, max-age=2592000, immutable"
+
+[[sites.locations.cache_rules]]
+pattern       = "\\.html$"
+cache_control = "no-cache"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 站点 4：auth_request 子请求鉴权（等价 Nginx auth_request）
+# 展示：auth_request、auth_failure_status、auth_request_headers
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "example-auth"
+server_name = ["secure.example.com"]
+listen      = [80]
+listen_tls  = [443]
+access_log  = "/var/log/sweety/auth_access.log"
+force_https = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+
+[[sites.upstreams]]
+name     = "app"
+strategy = "round_robin"
+[[sites.upstreams.nodes]]
+addr = "127.0.0.1:3000"
+
+[[sites.upstreams]]
+name     = "auth-service"
+strategy = "round_robin"
+[[sites.upstreams.nodes]]
+addr = "127.0.0.1:8080"
+
+# ── 公开路径（无需鉴权）──────────────────────────────────────────────────────
+[[sites.locations]]
+path        = "= /health"
+handler     = "static"
+return_code = 200
+
+[[sites.locations]]
+path       = "= /login"
+handler    = "reverse_proxy"
+upstream   = "app"
+
+# ── 受保护路径（需要鉴权）────────────────────────────────────────────────────
+[[sites.locations]]
+path     = "/admin/"
+handler  = "reverse_proxy"
+upstream = "app"
+
+# auth_request：每个请求先向此 URL 发 GET 子请求
+# 鉴权服务返回 2xx → 继续，非 2xx → 返回 auth_failure_status
+# 支持完整 URL（http://... / https://...）或本机相对路径（/auth）
+auth_request        = "http://127.0.0.1:8080/auth/verify"
+# 鉴权失败返回的状态码（默认 401）
+auth_failure_status = 403
+
+# 向鉴权子请求额外注入的头（支持 $remote_addr 变量）
+[[sites.locations.auth_request_headers]]
+name  = "X-Original-URI"
+value = "$request_uri"
+
+[[sites.locations.auth_request_headers]]
+name  = "X-Client-IP"
+value = "$remote_addr"
+
+# ── API 路径（需要鉴权，401 未授权）─────────────────────────────────────────
+[[sites.locations]]
+path                = "/api/"
+handler             = "reverse_proxy"
+upstream            = "app"
+auth_request        = "http://127.0.0.1:8080/auth/verify"
+auth_failure_status = 401
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 站点 5：gRPC 反向代理
+# 展示：handler = "grpc"（gRPC 专用代理，自动处理 grpc-status Trailer）
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "example-grpc"
+server_name = ["grpc.example.com"]
+listen      = [80]
+listen_tls  = [443]
+access_log  = "/var/log/sweety/grpc_access.log"
+force_https = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+
+# gRPC 上游（支持 TLS gRPC over HTTP/2）
+[[sites.upstreams]]
+name     = "grpc-backend"
+strategy = "round_robin"
+
+[[sites.upstreams.nodes]]
+addr   = "127.0.0.1:50051"
+weight = 1
+# 若上游是 gRPC over TLS（grpcs://）
+# tls      = true
+# tls_sni  = "grpc-backend.internal"
+
+[[sites.upstreams.nodes]]
+addr   = "127.0.0.1:50052"
+weight = 1
+
+# gRPC 所有服务路由到后端
+# handler = "grpc" 会自动注入 Content-Type: application/grpc
+# 以及 grpc-status / grpc-message Trailer
+[[sites.locations]]
+path     = "/"
+handler  = "grpc"
+upstream = "grpc-backend"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 站点 6：WebSocket 站点
+# 展示：handler = "websocket"、max_connections
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "example-ws"
+server_name = ["ws.example.com"]
+listen      = [80]
+listen_tls  = [443]
+access_log  = "/var/log/sweety/ws_access.log"
+force_https = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+
+[[sites.locations]]
+path            = "/ws"
+handler         = "websocket"
+max_connections = 10000   # 该 location 最大并发连接数
+
+[[sites.locations]]
+path    = "/"
+handler = "static"
+root    = "/var/www/ws-site"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 站点 7：多 PHP 版本共存（生产实战）
+# 展示：多站点同主机不同 PHP socket、fastcgi TCP 模式
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── WordPress（PHP 8.3，Unix socket）────────────────────────────────────────
+[[sites]]
+name        = "wordpress-php83"
+server_name = ["blog.example.com"]
+listen      = [80]
+listen_tls  = [443]
+root        = "/var/www/wordpress"
+index       = ["index.php", "index.html"]
+access_log  = "/var/log/sweety/wp83_access.log"
+force_https = true
+gzip        = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+
+[sites.fastcgi]
+socket          = "/var/run/php/php8.3-fpm.sock"
+pool_size       = 32
+connect_timeout = 5
+read_timeout    = 120
+
+[sites.error_pages]
+"404" = "/404.html"
+
+[[sites.locations]]
+path          = "^~ /wp-content/uploads/"
+handler       = "static"
+cache_control = "public, max-age=2592000"
+
+[[sites.locations]]
+path          = "^~ /wp-content/"
+handler       = "static"
+cache_control = "public, max-age=604800"
+
+[[sites.locations]]
+path          = "^~ /wp-includes/"
+handler       = "static"
+cache_control = "public, max-age=604800"
+
 [[sites.locations]]
 path        = "~ /\\."
 handler     = "static"
@@ -425,61 +657,24 @@ path        = "= /xmlrpc.php"
 handler     = "static"
 return_code = 403
 
-# .php 文件由 PHP 8.3 执行
 [[sites.locations]]
 path    = "~ \\.php$"
 handler = "fastcgi"
 
-# WordPress 伪静态
 [[sites.locations]]
 path      = "/"
 handler   = "fastcgi"
 try_files = ["$uri", "$uri/", "/index.php"]
 
-# 防爆破 wp-login.php
 [sites.rate_limit]
 [[sites.rate_limit.rules]]
 dimension    = "path"
-path_pattern = "^/wp-login\\.php"
 rate         = 5
 burst        = 10
+nodelay      = true
+path_pattern = "^/wp-login\\.php"
 
-# ── 站点 B：旧系统（PHP 7.4）────────────────────────────────────────────────
-[[sites]]
-name        = "legacy-php74"
-server_name = ["old.example.com"]
-listen      = [80]
-listen_tls  = [443]
-root        = "/var/www/legacy"
-index       = ["index.php", "index.html"]
-access_log  = "/var/log/sweety/legacy_access.log"
-force_https = true
-
-[sites.tls]
-acme       = true
-acme_email = "admin@example.com"
-
-# PHP 7.4 socket（旧系统使用低版本 PHP，与其他站点完全隔离）
-[sites.fastcgi]
-socket          = "/var/run/php/php7.4-fpm.sock"
-pool_size       = 16
-connect_timeout = 5
-read_timeout    = 60
-
-[sites.error_pages]
-404 = "/404.html"
-500 = "/500.html"
-
-[[sites.locations]]
-path    = "~ \\.php$"
-handler = "fastcgi"
-
-[[sites.locations]]
-path      = "/"
-handler   = "fastcgi"
-try_files = ["$uri", "$uri/", "/index.php"]
-
-# ── 站点 C：Laravel（PHP 8.1，TCP 模式，容器化部署）─────────────────────────
+# ── Laravel（PHP 8.1，TCP 模式，Docker 容器）────────────────────────────────
 [[sites]]
 name        = "laravel-php81"
 server_name = ["app.example.com"]
@@ -494,8 +689,7 @@ force_https = true
 acme       = true
 acme_email = "admin@example.com"
 
-# PHP 8.1，TCP 模式（Docker 容器里 PHP-FPM 监听 9001 端口，与其他版本错开）
-# PHP 8.3 用 9000，PHP 8.1 用 9001，PHP 7.4 用 9002
+# TCP 模式（Docker 容器，PHP 8.1 监听 9001）
 [sites.fastcgi]
 host            = "127.0.0.1"
 port            = 9001
@@ -504,42 +698,44 @@ connect_timeout = 5
 read_timeout    = 60
 
 [sites.error_pages]
-404 = "/404.html"
-500 = "/500.html"
+"404" = "/404.html"
+"500" = "/500.html"
 
-# Laravel 只需要一条伪静态规则
-# try_files 找不到文件就 fallback 到 index.php（Laravel 路由入口）
 [[sites.locations]]
 path      = "/"
 handler   = "fastcgi"
 try_files = ["$uri", "$uri/", "/index.php"]
 
-# ── 站点 D：同域名不同路径用不同 PHP 版本（进阶）────────────────────────────
-# /shop/ 路径用 PHP 8.3（新商城），其他路径用 PHP 8.1（主站）
-# 通过配置两个独立站点 + 反代实现是最干净的方案
-# 如果必须同一站点，可用两个 fastcgi location + 不同 root 的方式：
+# ── 旧系统（PHP 7.4，TCP 模式）──────────────────────────────────────────────
 [[sites]]
-name        = "mixed-php"
-server_name = ["mixed.example.com"]
+name        = "legacy-php74"
+server_name = ["old.example.com"]
 listen      = [80]
 listen_tls  = [443]
-root        = "/var/www/main/public"
-index       = ["index.php"]
-access_log  = "/var/log/sweety/mixed_access.log"
+root        = "/var/www/legacy"
+index       = ["index.php", "index.html"]
+access_log  = "/var/log/sweety/legacy_access.log"
 force_https = true
 
 [sites.tls]
 acme       = true
 acme_email = "admin@example.com"
 
-# 默认用 PHP 8.1
 [sites.fastcgi]
-host     = "127.0.0.1"
-port     = 9001   # PHP 8.1
+host            = "127.0.0.1"
+port            = 9002   # PHP 7.4
+pool_size       = 16
+connect_timeout = 5
+read_timeout    = 60
 
-# /shop/ 目录用 PHP 8.3（覆盖 root + 使用独立 fastcgi socket）
-# 注意：当前 Sweety 的 fastcgi 配置是站点级别的，
-# 若需要 location 级别不同 PHP-FPM，建议拆分为两个站点 + 反代
+[sites.error_pages]
+"404" = "/404.html"
+"500" = "/500.html"
+
+[[sites.locations]]
+path    = "~ \\.php$"
+handler = "fastcgi"
+
 [[sites.locations]]
 path      = "/"
 handler   = "fastcgi"

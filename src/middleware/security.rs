@@ -1,43 +1,39 @@
 //! 安全策略中间件
 //! 负责：敏感文件路径拦截、自动注入安全响应头（HSTS/CSP/X-Frame-Options 等）
 
-/// 敏感路径规则：(pattern, pattern_with_slash)
-/// 开机时预构建，避免每请求 format! 堆分配
-static SENSITIVE_PATTERNS: &[(&str, &str)] = &[
-    ("/.git",             "/.git/"),
-    ("/.env",             "/.env/"),
-    ("/.htaccess",        "/.htaccess/"),
-    ("/.htpasswd",        "/.htpasswd/"),
-    ("/.DS_Store",        "/.DS_Store/"),
-    ("/composer.json",    "/composer.json/"),
-    ("/composer.lock",    "/composer.lock/"),
-    ("/package.json",     "/package.json/"),
-    ("/package-lock.json","/package-lock.json/"),
-    ("/yarn.lock",        "/yarn.lock/"),
-    ("/Makefile",         "/Makefile/"),
-    ("/Dockerfile",       "/Dockerfile/"),
-    ("/.dockerignore",    "/.dockerignore/"),
-    ("/wp-config.php",    "/wp-config.php/"),
-    ("/config.php",       "/config.php/"),
-    ("/.ssh",             "/.ssh/"),
-    ("/.aws",             "/.aws/"),
-];
+/// 敏感文件名 phf 完美哈希表（全小写 key，O(1) 查找）
+static SENSITIVE_SET: phf::Set<&'static str> = phf::phf_set! {
+    ".git", ".env", ".htaccess", ".htpasswd", ".ds_store",
+    "composer.json", "composer.lock", "package.json", "package-lock.json",
+    "yarn.lock", "makefile", "dockerfile", ".dockerignore",
+    "wp-config.php", "config.php", ".ssh", ".aws",
+};
 
 /// 检查请求路径是否命中敏感文件拦截规则。返回 `true` 表示应返回 403。
 pub fn is_sensitive_path(path: &str) -> bool {
-    let path_only = path.split('?').next().unwrap_or(path);
-    let last_slash = path_only.rfind('/');
+    // 去掉 query string（不含 '?'时直接用原字符串）
+    let path_only = match path.find('?') {
+        Some(i) => &path[..i],
+        None    => path,
+    };
 
-    for (pat, pat_slash) in SENSITIVE_PATTERNS {
-        // 精确匹配或前缀匹配（/pattern/...）
-        if path_only == *pat || path_only.starts_with(pat_slash) {
-            return true;
+    // 按 '/' 分段，每段转小写后查 phf
+    for segment in path_only.split('/') {
+        if segment.is_empty() { continue; }
+        // 首字符快速过滤：敏感名以 '.' / 'c' / 'd' / 'm' / 'p' / 'w' / 'y' 开头
+        let first = segment.as_bytes()[0].to_ascii_lowercase();
+        if !matches!(first, b'.' | b'c' | b'd' | b'm' | b'p' | b'w' | b'y') {
+            continue;
         }
-        // 文件名匹配（如 /any/dir/.git/config）
-        if let Some(pos) = last_slash {
-            let filename = &path_only[pos..];
-            if filename == *pat || filename.starts_with(pat_slash) {
-                return true;
+        // 小写转换（根段通常很短，用栈分配）
+        let mut buf = [0u8; 64];
+        let bytes = segment.as_bytes();
+        if bytes.len() <= 64 {
+            for (i, &b) in bytes.iter().enumerate() {
+                buf[i] = b.to_ascii_lowercase();
+            }
+            if let Ok(lower) = std::str::from_utf8(&buf[..bytes.len()]) {
+                if SENSITIVE_SET.contains(lower) { return true; }
             }
         }
     }

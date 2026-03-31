@@ -30,7 +30,7 @@ gzip = true
 gzip_min_length = 1
 # 压缩等级 1-9（等价 Nginx gzip_comp_level）
 gzip_comp_level = 5
-log_level = "sweety_lib=info,xitca_server=warn,xitca_web=warn,xitca_http=warn"
+log_level = "sweety_lib=info,xitca_server=warn,xitca_web=warn,xitca_http=off"
 
 [[sites]]
 name        = "static-test"

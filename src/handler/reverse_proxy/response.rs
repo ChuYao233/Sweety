@@ -9,6 +9,24 @@ use xitca_web::{
     },
 };
 
+/// 编译期 hop-by-hop 头完美哈希表（全小写 key，O(1) 查找）
+static HOP_BY_HOP_SET: phf::Set<&'static str> = phf::phf_set! {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade", "content-length",
+    "host", "proxy-connection",
+};
+
+/// 检查头名是否为 hop-by-hop（大小写不敏感，用栈 buffer 转小写）
+#[inline]
+pub fn is_hop_by_hop(name: &str) -> bool {
+    let mut buf = [0u8; 32];
+    let b = name.as_bytes();
+    if b.len() > 32 { return false; }
+    for (i, &c) in b.iter().enumerate() { buf[i] = c.to_ascii_lowercase(); }
+    let lower = unsafe { std::str::from_utf8_unchecked(&buf[..b.len()]) };
+    HOP_BY_HOP_SET.contains(lower)
+}
+
 /// 对响应体内容做 sub_filter 替换（等价 Nginx sub_filter）
 ///
 /// - pattern 以 `~` 开头：按正则替换（支持 $1 $2 捕获组）
@@ -23,7 +41,7 @@ pub fn apply_sub_filter(
 
     // 只处理文本类响应
     let is_text = headers.iter().any(|(k, v)| {
-        k.to_lowercase() == "content-type" && (
+        k.eq_ignore_ascii_case("content-type") && (
             v.contains("html") || v.contains("json") ||
             v.contains("javascript") || v.contains("text")
         )
@@ -35,8 +53,8 @@ pub fn apply_sub_filter(
 
     for f in filters {
         if let Some(pattern) = f.pattern.strip_prefix('~') {
-            // 正则替换
-            if let Ok(re) = regex::Regex::new(pattern.trim()) {
+            // 正则替换：用全局缓存避免每请求重建
+            if let Some(re) = sub_filter_regex(pattern.trim()) {
                 result = re.replace_all(&result, f.replacement.as_str()).into_owned();
             }
         } else {
@@ -46,6 +64,21 @@ pub fn apply_sub_filter(
     }
 
     result.into_bytes()
+}
+
+/// 全局 sub_filter 正则缓存（pattern → 预编译 Regex），避免每请求 Regex::new
+static SUB_FILTER_RE_CACHE: std::sync::OnceLock<dashmap::DashMap<String, regex::Regex>> =
+    std::sync::OnceLock::new();
+
+fn sub_filter_regex(pattern: &str) -> Option<regex::Regex> {
+    let map = SUB_FILTER_RE_CACHE.get_or_init(dashmap::DashMap::new);
+    if let Some(re) = map.get(pattern) {
+        return Some(re.clone());
+    }
+    match regex::Regex::new(pattern) {
+        Ok(re) => { map.insert(pattern.to_string(), re.clone()); Some(re) }
+        Err(_) => None,
+    }
 }
 
 /// 将上游响应头全量透传给客户端（Nginx proxy_pass 默认行为）
@@ -64,18 +97,12 @@ pub fn apply_response_headers(
 ) {
     use xitca_web::http::header::HeaderName;
 
-    // Hop-by-hop 头不传给客户端；content-length 由 Sweety 根据实际 body 重算
-    const HOP_BY_HOP: &[&str] = &[
-        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-        "te", "trailer", "transfer-encoding", "upgrade", "content-length",
-    ];
-
     for (k, v) in headers {
-        let kl = k.to_lowercase();
-        if HOP_BY_HOP.contains(&kl.as_str()) { continue; }
+        // hop-by-hop 头不透传给客户端，phf O(1) 查找
+        if is_hop_by_hop(k) { continue; }
 
         // Location：将上游 URL 前缀替换为客户端 URL（等价 Nginx proxy_redirect）
-        if kl == "location" {
+        if k.eq_ignore_ascii_case("location") {
             if let (Some(from), Some(to)) = (proxy_redirect_from, proxy_redirect_to) {
                 let rewritten = v.replacen(from, to, 1);
                 tracing::info!("重定向 Location: {} → {}", v, rewritten);
@@ -90,14 +117,15 @@ pub fn apply_response_headers(
         }
 
         // Set-Cookie：去 Secure、替换 Domain
-        let val_str = if kl == "set-cookie" && (strip_cookie_secure || proxy_cookie_domain.is_some()) {
+        let is_set_cookie = k.eq_ignore_ascii_case("set-cookie");
+        let val_str = if is_set_cookie && (strip_cookie_secure || proxy_cookie_domain.is_some()) {
             rewrite_set_cookie(v, strip_cookie_secure, proxy_cookie_domain)
         } else {
             v.clone()
         };
 
         if let Ok(name) = HeaderName::from_bytes(k.as_bytes()) {
-            if kl == "set-cookie" {
+            if is_set_cookie {
                 // Set-Cookie 可有多个，用 append
                 if let Ok(val) = HeaderValue::from_str(&val_str) {
                     resp.headers_mut().append(name, val);
@@ -116,13 +144,12 @@ fn rewrite_set_cookie(cookie: &str, strip_secure: bool, new_domain: Option<&str>
     cookie.split(';')
         .filter_map(|part| {
             let trimmed = part.trim();
-            let lower = trimmed.to_lowercase();
-
-            if strip_secure && lower == "secure" {
+            if strip_secure && trimmed.eq_ignore_ascii_case("secure") {
                 return None; // 去掉 Secure 标志
             }
             if let Some(domain) = new_domain {
-                if lower.starts_with("domain=") {
+                // 小写不敏感匹配 "domain="
+                if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("domain=") {
                     return Some(format!("Domain={}", domain));
                 }
             }

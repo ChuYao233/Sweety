@@ -9,6 +9,7 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::debug;
+use xitca_web::http::header::HeaderMap;
 
 use crate::config::model::HeaderOverride;
 
@@ -23,13 +24,13 @@ pub enum AuthResult {
 /// 执行 auth_request 子请求
 ///
 /// - `auth_url`：完整鉴权 URL，如 `http://127.0.0.1:8080/auth` 或相对路径 `/auth`
-/// - `original_headers`：原始请求的头部（透传 Cookie、Authorization 等给鉴权服务）
+/// - `original_headers`：原始请求的 HeaderMap（直接传入，避免中间 Vec 堆分配）
 /// - `client_ip`：客户端 IP（注入 X-Real-IP）
 /// - `extra_headers`：`auth_request_headers` 列表（额外注入子请求的头）
 /// - `failure_status`：鉴权失败时返回的 HTTP 状态码
 pub async fn check(
     auth_url: &str,
-    original_headers: &[(String, String)],
+    original_headers: &HeaderMap,
     client_ip: &str,
     extra_headers: &[HeaderOverride],
     failure_status: u16,
@@ -54,7 +55,7 @@ pub async fn check(
 /// 内部：发送 auth 子请求，返回 (状态码, 响应头列表)
 async fn do_auth_request(
     auth_url: &str,
-    original_headers: &[(String, String)],
+    original_headers: &HeaderMap,
     client_ip: &str,
     extra_headers: &[HeaderOverride],
 ) -> anyhow::Result<(u16, Vec<(String, String)>)> {
@@ -68,26 +69,49 @@ async fn do_auth_request(
     ).await
     .map_err(|_| anyhow::anyhow!("auth_request 连接超时: {}", addr))??;
 
-    // 构造 GET 子请求
-    let mut req = format!("GET {} HTTP/1.1\r\nHost: {}\r\n", path, host);
+    // 构造 GET 子请求（push_str 替代 format! 减少堆分配）
+    let mut req = String::with_capacity(path.len() + host.len() + 128);
+    req.push_str("GET "); req.push_str(&path);
+    req.push_str(" HTTP/1.1\r\nHost: "); req.push_str(&host); req.push_str("\r\n");
 
     // 透传安全相关头（Cookie、Authorization、X-Forwarded-For 等）
-    for (k, v) in original_headers {
-        let kl = k.to_lowercase();
-        // 只透传认证相关头，不透传 body 相关头
-        if matches!(kl.as_str(), "cookie" | "authorization" | "x-forwarded-for"
-            | "x-real-ip" | "x-forwarded-proto" | "accept" | "accept-language") {
-            req.push_str(&format!("{}: {}\r\n", k, v));
+    // 直接遍历 HeaderMap，零中间分配
+    use xitca_web::http::header;
+    let pass_headers = [
+        header::COOKIE,
+        header::AUTHORIZATION,
+        header::ACCEPT,
+        header::ACCEPT_LANGUAGE,
+    ];
+    for hname in &pass_headers {
+        if let Some(v) = original_headers.get(hname) {
+            if let Ok(vs) = v.to_str() {
+                req.push_str(hname.as_str());
+                req.push_str(": ");
+                req.push_str(vs);
+                req.push_str("\r\n");
+            }
+        }
+    }
+    // X-Forwarded-For / X-Real-IP / X-Forwarded-Proto 用自定义名称查找
+    for name in &["x-forwarded-for", "x-real-ip", "x-forwarded-proto"] {
+        if let Some(v) = original_headers.get(*name) {
+            if let Ok(vs) = v.to_str() {
+                req.push_str(name);
+                req.push_str(": ");
+                req.push_str(vs);
+                req.push_str("\r\n");
+            }
         }
     }
 
     // 注入 extra_headers（auth_request_headers 配置）
     for h in extra_headers {
         let val = h.value.replace("$remote_addr", client_ip);
-        req.push_str(&format!("{}: {}\r\n", h.name, val));
+        req.push_str(&h.name); req.push_str(": "); req.push_str(&val); req.push_str("\r\n");
     }
 
-    req.push_str(&format!("X-Real-IP: {}\r\n", client_ip));
+    req.push_str("X-Real-IP: "); req.push_str(client_ip); req.push_str("\r\n");
     req.push_str("X-Auth-Request: 1\r\n");
     req.push_str("Connection: close\r\n");
     req.push_str("Content-Length: 0\r\n\r\n");

@@ -94,14 +94,15 @@ pub async fn handle_xitca(
     let fcgi_cache = ctx.state().fcgi_caches.get(&site.name).cloned();
     let method_str = ctx.req().method().as_str();
     let req_path   = ctx.req().uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let host_str   = ctx.req().headers().get("host")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
+    let host_str_owned: String = ctx.req().uri().authority()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| ctx.req().headers().get("host").and_then(|v| v.to_str().ok()).map(|s| s.to_string()))
+        .unwrap_or_default();
+    let host_str = host_str_owned.as_str();
 
     if let Some(cache) = &fcgi_cache {
-        let req_hdrs: Vec<(String, String)> = ctx.req().headers().iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
-            .collect();
-        if cache.should_lookup(method_str, &req_hdrs) {
+        // \u76f4\u63a5\u4f20 HeaderMap\uff0c\u8df3\u8fc7\u4e2d\u95f4 Vec \u5806\u5206\u914d
+        if cache.should_lookup(method_str, ctx.req().headers()) {
             let key = CacheKey::new(method_str, host_str, req_path);
             if let Some(entry) = cache.get(&key) {
                 // 命中：直接返回缓存响应
@@ -140,20 +141,29 @@ pub async fn handle_xitca(
     };
 
     // ── 提取请求信息 ──────────────────────────────────────────────────────
-    let method   = ctx.req().method().as_str().to_string();
+    // 全部用 &str 引用，避免每请求的堆分配
+    let method   = ctx.req().method().as_str();
     let uri      = ctx.req().uri();
     let path_qs  = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let req_uri  = path_qs.to_string();
+    let req_uri  = path_qs;  // CGI REQUEST_URI
     let path_raw = uri.path();
-    let query    = uri.query().unwrap_or("").to_string();
+    let query    = uri.query().unwrap_or("");
     let peer     = ctx.req().body().socket_addr();
-    let peer_ip  = peer.ip().to_string();
-    let peer_port= peer.port().to_string();
+    let peer_ip  = peer.ip().to_string();  // IP 必须 owned
+    let peer_port= peer.port().to_string(); // 端口必须 owned
 
-    let host_hdr = ctx.req().headers()
-        .get("host").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    let host_name = host_hdr.split(':').next().unwrap_or(&host_hdr).to_string();
-    let host_port_str = host_hdr.split(':').nth(1).unwrap_or("80").to_string();
+    // HTTP/2 下没有 Host 头，:authority 伪头在 uri.authority() 里
+    let host_hdr_owned: String = ctx.req().uri().authority()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| ctx.req().headers().get("host").and_then(|v| v.to_str().ok()).map(|s| s.to_string()))
+        .unwrap_or_default();
+    let host_hdr = host_hdr_owned.as_str();
+    // 一次 rsplit_once 同时得到 host 和 port，保持引用避免堆分配
+    let (host_name, host_port_str): (&str, &str) = if let Some((h, p)) = host_hdr.rsplit_once(':') {
+        (h, p)
+    } else {
+        (host_hdr, "80")
+    };
 
     // ── 站点 root ─────────────────────────────────────────────────────────
     let root = match location.root.as_ref().or(site.root.as_ref()) {
@@ -190,8 +200,7 @@ pub async fn handle_xitca(
     let content_type = ctx.req().headers()
         .get(xitca_web::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");  // 保持 &str 引用，不分配堆内存
 
     // 超出限制时拒绝，避免 CONTENT_LENGTH 与实际 body 不一致
     if content_length > max_body && max_body > 0 {
@@ -199,7 +208,7 @@ pub async fn handle_xitca(
     }
 
     // 读取请求体（与 reverse_proxy 相同方式：ctx.body_borrow_mut() + StreamExt）
-    let req_body: Vec<u8> = if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+    let req_body: Vec<u8> = if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
         use futures_util::StreamExt;
         let mut collected = Vec::with_capacity(content_length.min(16 * 1024 * 1024) as usize);
         let mut body = ctx.body_borrow_mut();
@@ -222,30 +231,19 @@ pub async fn handle_xitca(
             Some("https") => true,
             Some("http")  => false,
             _ => {
-                // HTTP/1 fallback：从 Host 头端口判断是否在 TLS 端口列表里
-                let port: u16 = host_hdr.split(':')
-                    .nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-                if port > 0 {
-                    ctx.state().tls_ports.contains(&port)
+                // HTTP/1 fallback：用已解析的 host_port_str 避免重复 split
+                if let Ok(port) = host_port_str.parse::<u16>() {
+                    if port != 80 { ctx.state().tls_ports.contains(&port) }
+                    else { !ctx.state().tls_ports.is_empty() }
                 } else {
-                    // 无端口：若站点有 TLS 端口则默认视为 HTTPS
                     !ctx.state().tls_ports.is_empty()
                 }
             }
         }
     };
 
-    // SERVER_PORT：HTTPS 时优先用 443（或站点 TLS 端口），HTTP 时用 Host 里的端口
-    let server_port = if is_https {
-        if host_hdr.contains(':') {
-            host_hdr.split(':').nth(1).unwrap_or("443").to_string()
-        } else {
-            // HTTPS 无端口 = 标准 443
-            "443".to_string()
-        }
-    } else {
-        host_port_str.clone()
-    };
+    // SERVER_PORT：HTTPS 时无端口用 443，HTTP 用解析到的端口（均为 &str 零分配）
+    let server_port: &str = if is_https && host_port_str == "80" { "443" } else { host_port_str };
 
     // REMOTE_ADDR：反代后优先读 X-Real-IP，再读 X-Forwarded-For 第一个 IP
     // 与 Nginx fastcgi_param REMOTE_ADDR $remote_addr 配合 realip 模块效果一致
@@ -262,28 +260,31 @@ pub async fn handle_xitca(
         })
         .unwrap_or_else(|| peer_ip.clone());
 
-    // ── 构建 CGI 参数（RFC 3875）────────────────────────────────────────
-    let mut params: Vec<(String, String)> = vec![
+    // ── 构建 CGI 参数（RFC 3875）────────────────────────────────────
+    // 预分配：18 个固定参数 + 请求头数量
+    let header_cnt = ctx.req().headers().len();
+    let mut params: Vec<(String, String)> = Vec::with_capacity(18 + header_cnt + 2);
+    params.extend([
         ("SCRIPT_FILENAME".into(), script_filename),
         ("SCRIPT_NAME".into(),     script_name.to_string()),
         ("PATH_INFO".into(),       path_info.to_string()),
         ("PATH_TRANSLATED".into(), format!("{}{}", root.trim_end_matches('/'), path_info)),
-        ("REQUEST_METHOD".into(),  method),
-        ("REQUEST_URI".into(),     req_uri),
-        ("QUERY_STRING".into(),    query),
+        ("REQUEST_METHOD".into(),  method.to_owned()),
+        ("REQUEST_URI".into(),     req_uri.to_owned()),
+        ("QUERY_STRING".into(),    query.to_owned()),
         ("SERVER_SOFTWARE".into(), "Sweety/0.1".into()),
         ("SERVER_PROTOCOL".into(), "HTTP/1.1".into()),
         ("GATEWAY_INTERFACE".into(),"CGI/1.1".into()),
-        ("SERVER_NAME".into(),     host_name),
-        ("SERVER_PORT".into(),     server_port),
+        ("SERVER_NAME".into(),     host_name.to_owned()),
+        ("SERVER_PORT".into(),     server_port.to_owned()),
         ("REMOTE_ADDR".into(),     real_ip.clone()),
         ("REMOTE_HOST".into(),     real_ip),
         ("REMOTE_PORT".into(),     peer_port),
         ("DOCUMENT_ROOT".into(),   root.clone()),
         // CONTENT_TYPE / CONTENT_LENGTH 是 POST 必须参数
-        ("CONTENT_TYPE".into(),    content_type),
-        ("CONTENT_LENGTH".into(),  req_body.len().to_string()),
-    ];
+        ("CONTENT_TYPE".into(),    content_type.to_owned()),
+        ("CONTENT_LENGTH".into(),  itoa::Buffer::new().format(req_body.len()).to_string()),
+    ]);
 
     // HTTPS=on（WordPress is_ssl()、其他框架判断协议依赖此变量）
     if is_https {
@@ -294,10 +295,18 @@ pub async fn handle_xitca(
     // Cookie、Authorization、Accept、Referer、User-Agent 等全部透传
     for (name, value) in ctx.req().headers().iter() {
         let key_str = name.as_str();
-        // 跳过已经单独处理的头
-        if matches!(key_str, "content-type" | "content-length") { continue; }
+        // 跳过已经单独处理的头（eq_ignore_ascii_case 零堆分配）
+        if key_str.eq_ignore_ascii_case("content-type")
+            || key_str.eq_ignore_ascii_case("content-length")
+        { continue; }
         if let Ok(val_str) = value.to_str() {
-            let http_key = format!("HTTP_{}", key_str.replace('-', "_").to_uppercase());
+            // 用 push_str 替代 format! 减少堆分配
+            let mut http_key = String::with_capacity(5 + key_str.len());
+            http_key.push_str("HTTP_");
+            for c in key_str.chars() {
+                if c == '-' { http_key.push('_'); }
+                else { http_key.extend(c.to_uppercase()); }
+            }
             params.push((http_key, val_str.to_string()));
         }
     }
@@ -640,30 +649,19 @@ async fn stream_remaining(
         }
     });
 
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body = ResponseBody::box_stream(stream);
-    let mut resp = WebResponse::new(body);
-    *resp.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-    for (k, v) in &headers {
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            resp.headers_mut().append(name, val);
-        }
-    }
-    if !headers.iter().any(|(k, _)| k.to_lowercase() == "content-type") {
-        resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    }
-    resp
-}
-
-/// 构造完整响应（body 已全量，无需 stream）
-fn make_complete_response(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> WebResponse {
-    use xitca_web::http::header::HeaderName;
     let http_status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-    let body_len = body.len();
-    let mut resp = WebResponse::new(ResponseBody::from(body));
+    // 304/204/205/1xx 不能带 body
+    let no_body = http_status == StatusCode::NOT_MODIFIED
+        || http_status == StatusCode::NO_CONTENT
+        || http_status == StatusCode::RESET_CONTENT
+        || http_status.is_informational();
+    let body_rb = if no_body {
+        ResponseBody::none()
+    } else {
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        ResponseBody::box_stream(stream)
+    };
+    let mut resp = WebResponse::new(body_rb);
     *resp.status_mut() = http_status;
     for (k, v) in &headers {
         if let (Ok(name), Ok(val)) = (
@@ -673,11 +671,43 @@ fn make_complete_response(status: u16, headers: Vec<(String, String)>, body: Vec
             resp.headers_mut().append(name, val);
         }
     }
-    if !headers.iter().any(|(k, _)| k.to_lowercase() == "content-type") {
+    if !no_body && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
         resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
     }
-    if let Ok(v) = HeaderValue::from_str(&body_len.to_string()) {
-        resp.headers_mut().insert(xitca_web::http::header::CONTENT_LENGTH, v);
+    resp
+}
+
+/// 构造完整响应（body 已全量，无需 stream）
+fn make_complete_response(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> WebResponse {
+    use xitca_web::http::header::HeaderName;
+    let http_status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    // 304/204/205/1xx 不能带 body（HTTP 规范 + H2 dispatcher 要求）
+    let no_body = http_status == StatusCode::NOT_MODIFIED
+        || http_status == StatusCode::NO_CONTENT
+        || http_status == StatusCode::RESET_CONTENT
+        || http_status.is_informational();
+    let body_len = if no_body { 0 } else { body.len() };
+    let mut resp = if no_body {
+        WebResponse::new(ResponseBody::none())
+    } else {
+        WebResponse::new(ResponseBody::from(body))
+    };
+    *resp.status_mut() = http_status;
+    for (k, v) in &headers {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            resp.headers_mut().append(name, val);
+        }
+    }
+    if !no_body {
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+            resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+        }
+        if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_len)) {
+            resp.headers_mut().insert(xitca_web::http::header::CONTENT_LENGTH, v);
+        }
     }
     resp
 }
@@ -827,7 +857,7 @@ fn parse_fcgi_response(stdout: Vec<u8>) -> WebResponse {
     }
 
     // 若 PHP 没有输出 Content-Type，默认 text/html
-    if !response_headers.iter().any(|(k, _)| k.to_lowercase() == "content-type") {
+    if !response_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
         resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
     }
 

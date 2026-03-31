@@ -41,15 +41,23 @@ impl ConnPool {
     pub fn acquire(&self, key: &str) -> Option<PooledConn> {
         let mut entry = self.inner.get_mut(key)?;
         let pool = entry.value_mut();
-        let now = Instant::now();
-        // 惰性清理过期连接
-        pool.idle.retain(|c| now.duration_since(c.returned_at) < self.idle_timeout);
-        pool.idle.pop_front().map(|c| c.conn)
+        // 惰性清理：只有当队列中有多个连接时才扫描，单连接时直接擐取跳过 O(n)
+        if pool.idle.len() > 1 {
+            let now = Instant::now();
+            pool.idle.retain(|c| now.duration_since(c.returned_at) < self.idle_timeout);
+        }
+        // 展示队头连接（过期连接直接丢弃）
+        while let Some(c) = pool.idle.pop_front() {
+            if c.returned_at.elapsed() < self.idle_timeout {
+                return Some(c.conn);
+            }
+        }
+        None
     }
 
     /// 归还连接到池
-    pub fn release(&self, key: String, conn: PooledConn) {
-        let mut entry = self.inner.entry(key).or_default();
+    pub fn release(&self, key: &str, conn: PooledConn) {
+        let mut entry = self.inner.entry(key.to_owned()).or_default();
         let pool = entry.value_mut();
         if pool.idle.len() >= self.max_idle {
             return; // 超过上限，丢弃
@@ -79,9 +87,13 @@ pub enum PooledConn {
 }
 
 impl PooledConn {
-    /// 连接 key（用于池索引）
+    /// 连接 key（用于池索引），用 push_str 预分配替代 format!
     pub fn key(addr: &str, tls: bool) -> String {
-        format!("{}:{}", if tls { "tls" } else { "tcp" }, addr)
+        let prefix = if tls { "tls:" } else { "tcp:" };
+        let mut k = String::with_capacity(prefix.len() + addr.len());
+        k.push_str(prefix);
+        k.push_str(addr);
+        k
     }
 }
 

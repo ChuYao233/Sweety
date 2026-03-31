@@ -30,51 +30,61 @@ pub async fn handle_xitca(
     site: &SiteInfo,
     location: &LocationConfig,
 ) -> WebResponse {
-    use crate::handler::reverse_proxy::lb::UpstreamPool;
     use futures_util::StreamExt;
 
-    // ── 找到上游 ─────────────────────────────────────────────────────────
+    // ── 找到上游（直接用预构建的池，零堆分配） ───────────────────────
     let upstream_name = match &location.upstream {
-        Some(n) => n.clone(),
+        Some(n) => n.as_str(),
         None => return grpc_error(StatusCode::INTERNAL_SERVER_ERROR, 13, "未配置 upstream"),
     };
-    let upstream_cfg = match site.upstreams.iter().find(|u| u.name == upstream_name) {
-        Some(u) => u.clone(),
+    let pool = match site.upstream_pools.get(upstream_name) {
+        Some(p) => p.clone(),
         None => return grpc_error(
             StatusCode::INTERNAL_SERVER_ERROR, 13,
             &format!("上游组 '{}' 未找到", upstream_name),
         ),
     };
 
-    let pool = UpstreamPool::from_config(&upstream_cfg);
     let client_ip = ctx.req().body().socket_addr().ip().to_string();
     let node = match pool.pick(Some(&client_ip)) {
         Some(n) => n,
         None => return grpc_error(StatusCode::BAD_GATEWAY, 14, "所有上游节点均不可用"),
     };
 
-    // ── 提取请求信息 ─────────────────────────────────────────────────────
-    let method = ctx.req().method().as_str().to_string();
+    // ── 提取请求信息（全部用 &str 引用，避免堆分配） ───────────────────
+    let method = ctx.req().method().as_str();
     let path = ctx.req().uri().path_and_query()
-        .map(|p| p.as_str()).unwrap_or("/").to_string();
-    let client_host = ctx.req().headers()
-        .get("host").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    let upstream_host = node.upstream_host.clone().unwrap_or_else(|| client_host.clone());
+        .map(|p| p.as_str()).unwrap_or("/");
+    // HTTP/2 下没有 Host 头，:authority 伪头在 uri.authority() 里
+    let client_host_owned: String = ctx.req().uri().authority()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| ctx.req().headers().get("host").and_then(|v| v.to_str().ok()).map(|s| s.to_string()))
+        .unwrap_or_default();
+    let upstream_host: std::borrow::Cow<str> = node.upstream_host.as_deref()
+        .map(std::borrow::Cow::Borrowed)
+        .unwrap_or(std::borrow::Cow::Owned(client_host_owned));
 
-    // ── 收集请求头（过滤 hop-by-hop）────────────────────────────────────
-    let mut req_headers: Vec<(String, String)> = ctx.req().headers().iter()
-        .filter_map(|(k, v)| {
-            let name = k.as_str().to_lowercase();
-            if matches!(name.as_str(),
-                "host" | "connection" | "proxy-connection" | "transfer-encoding" | "te" | "trailer"
-            ) { return None; }
-            v.to_str().ok().map(|val| (k.as_str().to_string(), val.to_string()))
-        })
-        .collect();
+    // ── 收集请求头（过滤 hop-by-hop）──────────────────────────────────
+    let hdr_count = ctx.req().headers().len();
+    let mut req_headers: Vec<(String, String)> = Vec::with_capacity(hdr_count + 4);
+    req_headers.extend(
+        ctx.req().headers().iter()
+            .filter_map(|(k, v)| {
+                let name = k.as_str();
+                if name.eq_ignore_ascii_case("host")
+                    || name.eq_ignore_ascii_case("connection")
+                    || name.eq_ignore_ascii_case("proxy-connection")
+                    || name.eq_ignore_ascii_case("transfer-encoding")
+                    || name.eq_ignore_ascii_case("te")
+                    || name.eq_ignore_ascii_case("trailer")
+                { return None; }
+                v.to_str().ok().map(|val| (name.to_string(), val.to_string()))
+            })
+    );
 
     // 确保 Content-Type 包含 application/grpc
     let has_grpc_ct = req_headers.iter()
-        .any(|(k, v)| k.to_lowercase() == "content-type" && v.contains("application/grpc"));
+        .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("application/grpc"));
     if !has_grpc_ct {
         req_headers.push(("Content-Type".to_string(), "application/grpc".to_string()));
     }
@@ -84,11 +94,10 @@ pub async fn handle_xitca(
     for h in &location.proxy_set_headers {
         let val = h.value
             .replace("$remote_addr", &client_ip)
-            .replace("$host", &upstream_host)
+            .replace("$host", upstream_host.as_ref())
             .replace("$scheme", scheme)
-            .replace("$request_uri", &path);
-        let lower = h.name.to_lowercase();
-        req_headers.retain(|(k, _)| k.to_lowercase() != lower);
+            .replace("$request_uri", path);
+        req_headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&h.name));
         req_headers.push((h.name.clone(), val));
     }
 
@@ -114,13 +123,14 @@ pub async fn handle_xitca(
 
     let result = crate::handler::reverse_proxy::conn::forward_request(
         &ctx.state().conn_pool,
-        &node.addr, &method, &path, &upstream_host,
+        &node.addr, method, path, upstream_host.as_ref(),
         node.tls, &node.tls_sni, node.tls_insecure,
         &req_headers, &client_ip,
         &req_body,
         false, None, None, None,
         &[], // gRPC 不做 sub_filter
         None, // gRPC 不做缓存
+        scheme, // client_proto
     ).await;
 
     node.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -169,7 +179,7 @@ fn grpc_error(http_status: StatusCode, grpc_status: u32, msg: &str) -> WebRespon
         CONTENT_TYPE,
         HeaderValue::from_static("application/grpc"),
     );
-    if let Ok(v) = HeaderValue::from_str(&grpc_status.to_string()) {
+    if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(grpc_status)) {
         resp.headers_mut().insert(
             HeaderName::from_static("grpc-status"),
             v,

@@ -74,6 +74,7 @@ impl NodeState {
 // ─────────────────────────────────────────────
 
 /// 上游节点组，对应配置中的一个 upstream 块
+#[derive(Debug)]
 pub struct UpstreamPool {
     pub nodes: Vec<Arc<NodeState>>,
     strategy: LoadBalanceStrategy,
@@ -92,45 +93,47 @@ impl UpstreamPool {
     }
 
     /// 根据策略选出一个健康节点
+    /// 直接遍历 nodes，跳过不健康节点，零堆分配（不再收集 healthy Vec）
     pub fn pick(&self, client_ip: Option<&str>) -> Option<Arc<NodeState>> {
-        let healthy: Vec<Arc<NodeState>> =
-            self.nodes.iter().filter(|n| n.is_healthy()).cloned().collect();
-
-        if healthy.is_empty() {
+        let healthy_count = self.nodes.iter().filter(|n| n.is_healthy()).count();
+        if healthy_count == 0 {
             return None;
         }
 
         match self.strategy {
             LoadBalanceStrategy::RoundRobin => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len();
-                Some(healthy[idx].clone())
+                // 轮询：在 nodes 里选第 N 个健康节点
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_count;
+                self.nodes.iter().filter(|n| n.is_healthy()).nth(idx).cloned()
             }
-            LoadBalanceStrategy::Weighted => self.pick_weighted(&healthy),
-            LoadBalanceStrategy::LeastConn => healthy
-                .iter()
+            LoadBalanceStrategy::Weighted => {
+                let total_weight: u32 = self.nodes.iter()
+                    .filter(|n| n.is_healthy())
+                    .map(|n| n.weight)
+                    .sum();
+                if total_weight == 0 {
+                    return self.nodes.iter().find(|n| n.is_healthy()).cloned();
+                }
+                let target = (self.rr_counter.fetch_add(1, Ordering::Relaxed) as u32) % total_weight;
+                let mut cumulative = 0u32;
+                for node in self.nodes.iter().filter(|n| n.is_healthy()) {
+                    cumulative += node.weight;
+                    if target < cumulative {
+                        return Some(node.clone());
+                    }
+                }
+                self.nodes.iter().filter(|n| n.is_healthy()).last().cloned()
+            }
+            LoadBalanceStrategy::LeastConn => self.nodes.iter()
+                .filter(|n| n.is_healthy())
                 .min_by_key(|n| n.active_connections.load(Ordering::Relaxed))
                 .cloned(),
             LoadBalanceStrategy::IpHash => {
                 let hash = simple_hash(client_ip.unwrap_or("0.0.0.0"));
-                Some(healthy[hash % healthy.len()].clone())
+                let idx = hash % healthy_count;
+                self.nodes.iter().filter(|n| n.is_healthy()).nth(idx).cloned()
             }
         }
-    }
-
-    fn pick_weighted(&self, healthy: &[Arc<NodeState>]) -> Option<Arc<NodeState>> {
-        let total_weight: u32 = healthy.iter().map(|n| n.weight).sum();
-        if total_weight == 0 {
-            return healthy.first().cloned();
-        }
-        let target = (self.rr_counter.fetch_add(1, Ordering::Relaxed) as u32) % total_weight;
-        let mut cumulative = 0u32;
-        for node in healthy {
-            cumulative += node.weight;
-            if target < cumulative {
-                return Some(node.clone());
-            }
-        }
-        healthy.last().cloned()
     }
 }
 

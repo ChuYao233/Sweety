@@ -47,13 +47,14 @@ impl TlsManager {
         let tls_versions = resolve_tls_versions(sites);
 
         let resolver = Arc::new(SniResolver::new(certs_map));
-        // ALPN 顺序策略：http/1.1 在前，h2 在后
+        // ALPN 顺序策略：h2 优先，降级到 http/1.1
         let mut cfg = ServerConfig::builder_with_provider(make_crypto_provider())
             .with_protocol_versions(&tls_versions)
             .context("TLS 版本配置失败")?
             .with_no_client_auth()
             .with_cert_resolver(resolver.clone());
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
+        // h2 优先：客户端支持 HTTP/2 时优先协商 h2，不支持时降级到 http/1.1
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok((cfg, resolver))
     }
 
@@ -675,8 +676,13 @@ mod sni_resolver {
         }
 
         fn lookup<'a>(inner: &'a Inner, name: &str) -> &'a Vec<Arc<rustls::sign::CertifiedKey>> {
-            let lower = name.to_lowercase();
-            if let Some(cks) = inner.exact.get(&lower) { return cks; }
+            // 大多数 SNI name 已是小写，用 Cow 避免不必要的堆分配
+            let lower: std::borrow::Cow<'_, str> = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(name.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(name)
+            };
+            if let Some(cks) = inner.exact.get(lower.as_ref()) { return cks; }
             if let Some(dot) = lower.find('.') {
                 let suffix = &lower[dot + 1..];
                 if let Some(cks) = inner.wildcard.get(suffix) { return cks; }

@@ -477,6 +477,48 @@ pub struct LocationConfig {
     /// 仅对文本类 Content-Type（html/json/js/text）生效
     #[serde(default)]
     pub sub_filter: Vec<SubFilter>,
+
+    /// 子请求鉴权 URL（等价 Nginx auth_request /auth）
+    /// 每个请求先向此 URL 发 GET 子请求；2xx 则继续，非 2xx 则返回 401/403
+    /// 鉴权服务可通过响应头传回 X-Auth-User 等信息（会注入原始请求的头中）
+    #[serde(default)]
+    pub auth_request: Option<String>,
+
+    /// auth_request 失败时返回的状态码（默认 401）
+    #[serde(default = "default_auth_failure_status")]
+    pub auth_failure_status: u16,
+
+    /// auth_request 时向子请求注入的额外头（等价 auth_request_set）
+    /// 格式同 proxy_set_headers
+    #[serde(default)]
+    pub auth_request_headers: Vec<HeaderOverride>,
+}
+
+impl Default for LocationConfig {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            handler: HandlerType::Static,
+            root: None,
+            upstream: None,
+            cache_control: None,
+            return_code: None,
+            max_connections: None,
+            strip_cookie_secure: false,
+            proxy_cookie_domain: None,
+            proxy_redirect_from: None,
+            proxy_redirect_to: None,
+            proxy_set_headers: vec![],
+            add_headers: vec![],
+            cache_rules: vec![],
+            return_url: None,
+            try_files: vec![],
+            sub_filter: vec![],
+            auth_request: None,
+            auth_failure_status: 401,  // 与 serde default 保持一致
+            auth_request_headers: vec![],
+        }
+    }
 }
 
 /// 请求头/响应头覆盖配置
@@ -535,10 +577,11 @@ pub struct ProxyCacheConfig {
 }
 
 /// 请求处理器类型
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HandlerType {
     /// 静态文件服务
+    #[default]
     Static,
     /// PHP / FastCGI
     Fastcgi,
@@ -546,6 +589,8 @@ pub enum HandlerType {
     Websocket,
     /// 反向代理
     ReverseProxy,
+    /// gRPC 反向代理（HTTP/2 二进制帧，Content-Type: application/grpc）
+    Grpc,
 }
 
 // ─────────────────────────────────────────────
@@ -690,9 +735,15 @@ pub struct RateLimitRule {
     /// 稳定速率（每秒请求数）
     pub rate: u64,
 
-    /// 突发容量（令牌桶上限）
+    /// 突发容量（令牌桶上限，默认 = rate）
     #[serde(default)]
     pub burst: u64,
+
+    /// nodelay 模式（等价 Nginx limit_req nodelay）
+    /// true = burst 内请求立即放行，不排队，超出 burst 才 429
+    /// false = 按陈列限速，请求到达过快则等待（默认 true，与 Nginx 行为一致）
+    #[serde(default = "default_true")]
+    pub nodelay: bool,
 
     /// 路径匹配模式（dimension = path 时使用）
     #[serde(default)]
@@ -705,7 +756,7 @@ pub struct RateLimitRule {
 
 /// 限流维度
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum RateLimitDimension {
     /// 按客户端 IP
     Ip,
@@ -715,6 +766,8 @@ pub enum RateLimitDimension {
     Header,
     /// 按 User-Agent
     UserAgent,
+    /// IP + 路径组合（等价 Nginx $binary_remote_addr$uri）
+    IpPath,
 }
 
 // ─────────────────────────────────────────────
@@ -753,6 +806,7 @@ fn default_cache_ttl() -> u64 { 60 }
 fn default_cache_statuses() -> Vec<u16> { vec![200, 301, 302] }
 fn default_cache_methods() -> Vec<String> { vec!["GET".into(), "HEAD".into()] }
 fn default_no_cache_headers() -> Vec<String> { vec!["Authorization".into(), "Cookie".into()] }
+fn default_auth_failure_status() -> u16 { 401 }
 
 // ─────────────────────────────────────────────
 // 单元测试

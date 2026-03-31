@@ -26,11 +26,18 @@ pub struct CacheKey {
 
 impl CacheKey {
     pub fn new(method: &str, host: &str, path: &str) -> Self {
-        Self {
-            method: method.to_uppercase(),
-            host: host.to_lowercase(),
-            path: path.to_string(),
-        }
+        // method 通常已是大写（GET/POST），host 通常已是小写，用条件分支避免无谓堆分配
+        let method = if method.bytes().any(|b| b.is_ascii_lowercase()) {
+            method.to_ascii_uppercase()
+        } else {
+            method.to_string()
+        };
+        let host = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+            host.to_ascii_lowercase()
+        } else {
+            host.to_string()
+        };
+        Self { method, host, path: path.to_string() }
     }
 
     /// 转为磁盘文件名（URL 安全编码）
@@ -96,18 +103,22 @@ impl ProxyCache {
     }
 
     /// 判断请求是否应该查缓存（可缓存的方法且没有 bypass 头）
+    /// 直接接受 HeaderMap 引用，跳过调用方每请求构造的中间 Vec
     pub fn should_lookup(
         &self,
         method: &str,
-        req_headers: &[(String, String)],
+        req_headers: &xitca_web::http::header::HeaderMap,
     ) -> bool {
-        if !self.cacheable_methods.contains(&method.to_uppercase()) {
+        // method 已是大写（HTTP 规范），直接大写比较
+        if !self.cacheable_methods.iter().any(|m| m.eq_ignore_ascii_case(method)) {
             return false;
         }
-        // bypass_headers 中的任意头存在且非空时，跳过缓存
-        for (k, v) in req_headers {
-            if self.bypass_headers.contains(&k.to_lowercase()) && !v.is_empty() {
-                return false;
+        // bypass_headers 在构建时已转小写，每个 bypass 头存在且非空时跳过缓存
+        for bypass in &self.bypass_headers {
+            if let Some(val) = req_headers.get(bypass.as_str()) {
+                if !val.is_empty() {
+                    return false;
+                }
             }
         }
         true
@@ -120,14 +131,14 @@ impl ProxyCache {
         }
         // Cache-Control: no-store / private 时不缓存
         for (k, v) in resp_headers {
-            if k.to_lowercase() == "cache-control" {
-                let v = v.to_lowercase();
-                if v.contains("no-store") || v.contains("private") {
+            if k.eq_ignore_ascii_case("cache-control") {
+                let vl = v.to_ascii_lowercase();
+                if vl.contains("no-store") || vl.contains("private") {
                     return false;
                 }
             }
             // Set-Cookie 响应默认不缓存（防止 session 泄露）
-            if k.to_lowercase() == "set-cookie" {
+            if k.eq_ignore_ascii_case("set-cookie") {
                 return false;
             }
         }

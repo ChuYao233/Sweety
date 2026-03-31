@@ -52,11 +52,6 @@ impl SweetyServer {
         let metrics = Arc::new(GlobalMetrics::new());
         let registry = Arc::new(VHostRegistry::from_config(&cfg.sites));
 
-        // 收集所有 TLS 端口（用于 HSTS 判断）
-        let tls_port_set: HashSet<u16> = cfg.sites.iter()
-            .flat_map(|s| s.listen_tls.iter().copied())
-            .collect();
-
         // 上游连接池：idle 连接数 = worker_connections / 128（兼顾并发与内存），keepalive_timeout 秒超时
         let pool_idle = (cfg.global.worker_connections / 128).max(8).min(256);
         let conn_pool = ConnPool::new(pool_idle, cfg.global.keepalive_timeout);
@@ -64,18 +59,29 @@ impl SweetyServer {
         // 第一步：收集所有端口的 TLS 配置和 SniResolver（key=端口号，热重载按端口精确更新）
         let mut port_resolvers: HashMap<u16, Arc<SniResolver>> = HashMap::new();
         let mut tls_bindings: Vec<(String, rustls::ServerConfig)> = Vec::new();
+        // 注意：tls_port_set 只收集实际成功绑定的端口
+        // 证书加载失败的端口不计入，防止 is_https 判断错误导致 421
+        let mut tls_port_set: HashSet<u16> = HashSet::new();
         for (port, sites_for_port) in collect_tls_ports_grouped(&cfg) {
             let addr = format!("0.0.0.0:{}", port);
             let site_refs: Vec<&crate::config::model::SiteConfig> =
                 sites_for_port.iter().map(|s| s.as_ref()).collect();
             match TlsManager::build_sni_server_config(&site_refs) {
                 Ok((rustls_cfg, resolver)) => {
+                    tls_port_set.insert(port); // 只有成功绑定的端口才计入
                     port_resolvers.insert(port, resolver);
                     tls_bindings.push((addr, rustls_cfg));
                     info!("HTTPS/HTTP2 监听: 0.0.0.0:{} ({} 个站点/证书)", port, site_refs.len());
                 }
                 Err(e) => {
-                    tracing::warn!("TLS 配置加载失败（端口 {}）: {}，跳过该端口", port, e);
+                    // error 级别：证书加载失败必须让用户看到，打印完整错误链
+                    tracing::error!(
+                        "TLS 证书加载失败（端口 {}），该端口 HTTPS 不可用: {:#}",
+                        port, e
+                    );
+                    tracing::error!(
+                        "  提示：运行 `sweety -t` 可验证证书格式是否正确"
+                    );
                 }
             }
         }
@@ -152,6 +158,7 @@ impl SweetyServer {
             proxy_caches,
             active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_connections: cfg.global.max_connections,
+            max_body_bytes: (cfg.global.client_max_body_size as u64) * 1024 * 1024,
             fcgi_pool: Arc::new(FcgiPool::new(
                 32,   // 每地址最多 32 个 idle 连接
                 cfg.global.fastcgi_connect_timeout,
@@ -161,10 +168,14 @@ impl SweetyServer {
         };
 
         // 第三步：构建 xitca-web App
+        // 注册所有 HTTP 方法，避免 PUT/DELETE/PATCH/HEAD 等返回 405
+        let h = || handler_service(multi_site_handler);
+        let all_methods = get(h()).post(h()).put(h()).delete(h())
+            .patch(h()).head(h()).options(h()).trace(h());
         let app = App::new()
             .with_state(state.clone())
-            .at("/*path", get(handler_service(multi_site_handler)).post(handler_service(multi_site_handler)))
-            .at("/", get(handler_service(multi_site_handler)).post(handler_service(multi_site_handler)));
+            .at("/*path", all_methods)
+            .at("/", get(h()).post(h()).put(h()).delete(h()).patch(h()).head(h()).options(h()).trace(h()));
 
         let mut server = xitca_web::HttpServer::serve(app.finish());
 
@@ -251,31 +262,45 @@ impl SweetyServer {
 }
 
 /// 所有请求共享状态
+/// 字段顺序按热路径访问频率排列，提升缓存行命中率
 #[derive(Clone)]
 pub struct AppState {
+    /// 虚拟主机注册表（每请求必访）
     pub registry: Arc<VHostRegistry>,
+    /// 全局指标（每请求必访）
     pub metrics: Arc<GlobalMetrics>,
+    /// 应用配置（每请求必访）
     pub cfg: Arc<AppConfig>,
-    /// HTTPS/TLS 端口集合
+    /// HTTPS/TLS 端口集合（每请求必访）
     pub tls_ports: Arc<HashSet<u16>>,
-    /// HTTP 明文端口集合（O(1) 查找判断 HTTP/HTTPS，不依赖 scheme）
+    /// HTTP 明文端口集合（O(1) 查找）
     pub http_ports: Arc<HashSet<u16>>,
+    /// 最大并发连接数（0 = 不限制）
+    pub max_connections: usize,
+    /// 最大请求体字节数（预计算，避免每请求乘法；0 = 不限制）
+    pub max_body_bytes: u64,
+    /// 当前活跃连接数（原子计数器，无锁）
+    pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// 访问日志写入器（按站点名索引）
+    pub access_loggers: Arc<HashMap<String, Arc<AccessLogger>>>,
     /// 上游 TCP/TLS 连接池（跨请求复用 idle 连接）
     pub conn_pool: ConnPool,
     /// SNI 证书 Resolver 按端口索引（热重载时原地更新证书，不断连）
     pub sni_resolvers: Arc<HashMap<u16, Arc<SniResolver>>>,
-    /// 访问日志写入器（按站点名索引）
-    pub access_loggers: Arc<HashMap<String, Arc<AccessLogger>>>,
     /// 反代响应缓存（按站点名索引）
     pub proxy_caches: Arc<HashMap<String, Arc<ProxyCache>>>,
-    /// 当前活跃连接数（原子计数器，无锁）
-    pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
-    /// 最大并发连接数（0 = 不限制）
-    pub max_connections: usize,
     /// FastCGI 连接池（复用 PHP-FPM 连接）
     pub fcgi_pool: Arc<FcgiPool>,
     /// FastCGI 响应缓存（按站点名索引，复用 ProxyCache 实现）
     pub fcgi_caches: Arc<HashMap<String, Arc<ProxyCache>>>,
+}
+
+/// max_connections RAII 守卫：Drop 时自动减计数器
+struct ConnGuard(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// 多站点请求分发处理器
@@ -284,54 +309,74 @@ pub struct AppState {
 async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     use std::sync::atomic::Ordering;
     let state = ctx.state();
-    let req_start = std::time::Instant::now();
+    // req_start 延迟初始化：只有当该站点配置了访问日志时才计时
+    // 大多数 bench 站点没有日志，就完全跳过此系统调用
+    let req_start: Option<std::time::Instant> = if state.access_loggers.is_empty() {
+        None
+    } else {
+        Some(std::time::Instant::now())
+    };
 
     // max_connections 限流：超出并发上限时返回 503（与 Nginx limit_conn 行为一致）
-    if state.max_connections > 0 {
+    // 限流关闭时跳过全部原子操作，除去 bench 场景下的无效开销
+    let _conn_guard: Option<ConnGuard> = if state.max_connections > 0 {
         let cur = state.active_connections.fetch_add(1, Ordering::Relaxed);
         if cur >= state.max_connections {
             state.active_connections.fetch_sub(1, Ordering::Relaxed);
             state.metrics.record_status(503);
             return make_error_resp(StatusCode::SERVICE_UNAVAILABLE);
         }
+        Some(ConnGuard(state.active_connections.clone()))
     } else {
-        state.active_connections.fetch_add(1, Ordering::Relaxed);
-    }
-    // 使用 defer 模式：无论如何退出都减计数器
-    struct ConnGuard(Arc<std::sync::atomic::AtomicUsize>);
-    impl Drop for ConnGuard {
-        fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Relaxed); }
-    }
-    let _guard = ConnGuard(state.active_connections.clone());
+        None
+    };
 
     state.metrics.inc_requests();
 
     // ACME HTTP-01 challenge 响应（优先于所有站点匹配）
-    // Let's Encrypt 访问 http://domain/.well-known/acme-challenge/<token>
+    // 快速路径：先检查路径是否以 "/.w" 开头，平均 99.99% 请求一次字符比较就跳过
     {
         let path = ctx.req().uri().path();
-        if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-            if let Some(entry) = crate::server::tls::ACME_HTTP01_TOKENS.get(token) {
-                let body = entry.value().clone();
-                let mut resp = WebResponse::new(ResponseBody::from(body));
-                *resp.status_mut() = StatusCode::OK;
-                resp.headers_mut().insert(
-                    CONTENT_TYPE,
-                    HeaderValue::from_static("text/plain"),
-                );
-                return resp;
+        if path.len() > 25 && path.as_bytes().get(1) == Some(&b'.')
+            && path.starts_with("/.well-known/acme-challenge/")
+        {
+            if let Some(token) = path.get(28..) {
+                if let Some(entry) = crate::server::tls::ACME_HTTP01_TOKENS.get(token) {
+                    let body = entry.value().clone();
+                    let mut resp = WebResponse::new(ResponseBody::from(body));
+                    *resp.status_mut() = StatusCode::OK;
+                    resp.headers_mut().insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("text/plain"),
+                    );
+                    return resp;
+                }
             }
         }
     }
 
-    // 一次解析 Host 头，后续复用（避免多次 get）
-    let host_raw = ctx.req().headers()
-        .get("host")
-        .and_then(|v| v.to_str().ok())
+    // 一次解析 Host 头，同时得到 host 和 port（避免两次 split 迭代）
+    // HTTP/2 下没有 Host 头，:authority 伪头被 xitca-web 放到 URI authority 里
+    // 优先用 URI authority（H2/H3），回退到 Host 头（H1）
+    let host_raw = ctx.req().uri().authority()
+        .map(|a| a.as_str())
+        .or_else(|| ctx.req().headers().get("host").and_then(|v| v.to_str().ok()))
         .unwrap_or("");
-    // host 只包含主机名（去掉端口），用于 vhost 匹配
-    let host = host_raw.split(':').next().unwrap_or(host_raw);
-    let host_port: Option<u16> = host_raw.split(':').nth(1).and_then(|p| p.parse().ok());
+    let (host, host_port): (&str, Option<u16>) = if host_raw.starts_with('[') {
+        // IPv6 格式：[::1]:8080
+        if let Some(end) = host_raw.find(']') {
+            let h = &host_raw[..=end];
+            let p = host_raw[end + 1..].strip_prefix(':').and_then(|s| s.parse().ok());
+            (h, p)
+        } else {
+            (host_raw, None)
+        }
+    } else if let Some((h, p)) = host_raw.rsplit_once(':') {
+        // 普通 host:port，rsplit_once 一次拿到两部分
+        (h, p.parse().ok())
+    } else {
+        (host_raw, None)
+    };
 
     let path = ctx.req().uri().path();
     let request_uri = ctx.req().uri().path_and_query()
@@ -424,7 +469,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     let effective_path = rewritten.as_deref().unwrap_or(&path);
 
     let location = match crate::dispatcher::location::match_location(&site.locations, effective_path) {
-        Some(loc) => loc.clone(),
+        Some(loc) => loc,
         None => {
             state.metrics.record_status(404);
             return make_error_resp(StatusCode::NOT_FOUND);
@@ -432,7 +477,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     };
 
     // 请求体大小限制（Content-Length 超过 client_max_body_size 时拒绝）
-    let max_body_bytes = (state.cfg.global.client_max_body_size as u64) * 1024 * 1024;
+    let max_body_bytes = state.max_body_bytes;
     if max_body_bytes > 0 {
         if let Some(content_length) = ctx.req().headers()
             .get(xitca_web::http::header::CONTENT_LENGTH)
@@ -461,6 +506,29 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         let mut resp = WebResponse::new(ResponseBody::empty());
         *resp.status_mut() = status;
         return resp;
+    }
+
+    // auth_request 前置鉴权（等价 Nginx auth_request）
+    // 直接传 HeaderMap，零中间 Vec 堆分配
+    if let Some(ref auth_url) = location.auth_request {
+        let client_ip_for_auth = ctx.req().body().socket_addr().ip().to_string();
+        match crate::handler::auth_request::check(
+            auth_url,
+            ctx.req().headers(),
+            &client_ip_for_auth,
+            &location.auth_request_headers,
+            location.auth_failure_status,
+        ).await {
+            crate::handler::auth_request::AuthResult::Allow(_auth_headers) => {
+                // 鉴权通过，继续处理（auth_headers 可在此处注入到请求，当前忽略）
+            }
+            crate::handler::auth_request::AuthResult::Deny(code) => {
+                state.metrics.record_status(code);
+                return make_error_resp(
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED)
+                );
+            }
+        }
     }
 
     // 根据 handler 类型分发
@@ -507,6 +575,9 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         HandlerType::ReverseProxy => {
             crate::handler::reverse_proxy::handle_xitca(ctx, &site, &location).await
         }
+        HandlerType::Grpc => {
+            crate::handler::grpc::handle_xitca(ctx, &site, &location).await
+        }
     };
 
     state.metrics.record_status(resp.status().as_u16());
@@ -533,32 +604,33 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     }
 
     // 注入 HSTS 响应头（仅当 HTTPS 且站点配置了 hsts 时）
-    // 兴趣：is_https 为 false 时也检查 Host 端口，兼容部分反代场景 scheme 未设置的情况
-    let inject_hsts = is_https || {
-        let host_val = ctx.req().headers()
-            .get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
-        if let Some(p) = host_val.split(':').nth(1) {
-            p.parse::<u16>().map(|p| state.tls_ports.contains(&p)).unwrap_or(false)
-        } else { false }
-    };
-    if let Some(hsts) = &site.hsts {
-        if inject_hsts && hsts.max_age > 0 {
-            if let Ok(v) = HeaderValue::try_from(build_hsts_value(hsts)) {
-                resp.headers_mut().insert(
-                    xitca_web::http::header::HeaderName::from_static("strict-transport-security"),
-                    v,
-                );
-            }
+    // 直接用预计算的 hsts_header_value，零 format! 分配
+    let inject_hsts = is_https
+        || host_port.map(|p| state.tls_ports.contains(&p)).unwrap_or(false);
+    if inject_hsts {
+        if let Some(hsts_val) = &site.hsts_header_value {
+            resp.headers_mut().insert(
+                xitca_web::http::header::HeaderName::from_static("strict-transport-security"),
+                hsts_val.clone(),  // HeaderValue::clone 只增引用计数，零堆分配
+            );
         }
     }
 
     // 访问日志：非阻塞投递到 channel，后台 task 批量写文件
+    // 只有该站点配置了日志记录器时才进入此分支（access_loggers 为空时直接跳过）
     if let Some(logger) = state.access_loggers.get(&site.name) {
+        let duration_ms = req_start.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
         logger.send(AccessLogEntry {
             client_ip: ctx.req().body().socket_addr().ip().to_string(),
             method:    ctx.req().method().as_str().to_string(),
             uri:       request_uri.to_string(),
-            http_version: format!("{:?}", ctx.req().version()),
+            http_version: match ctx.req().version() {
+                xitca_web::http::Version::HTTP_11 => "HTTP/1.1",
+                xitca_web::http::Version::HTTP_2  => "HTTP/2.0",
+                xitca_web::http::Version::HTTP_3  => "HTTP/3.0",
+                xitca_web::http::Version::HTTP_10 => "HTTP/1.0",
+                _                                  => "HTTP/?",
+            }.to_string(),
             status:    resp.status().as_u16(),
             bytes_sent: resp.headers()
                 .get(xitca_web::http::header::CONTENT_LENGTH)
@@ -575,7 +647,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("-")
                 .to_string(),
-            duration_ms: req_start.elapsed().as_millis() as u64,
+            duration_ms,
             site: site.name.clone(),
         });
     }
@@ -583,17 +655,6 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     resp
 }
 
-/// 构造 Strict-Transport-Security 头值
-fn build_hsts_value(hsts: &crate::config::model::HstsConfig) -> String {
-    let mut val = format!("max-age={}", hsts.max_age);
-    if hsts.include_sub_domains {
-        val.push_str("; includeSubDomains");
-    }
-    if hsts.preload {
-        val.push_str("; preload");
-    }
-    val
-}
 
 /// 构造 HTML 错误响应（不依赖 ctx）
 fn make_error_resp(status: StatusCode) -> WebResponse {

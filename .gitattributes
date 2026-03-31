@@ -1,0 +1,8 @@
+# 统一使用 LF 换行符，避免 Windows/Linux 混用 CRLF 警告
+* text=auto eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf

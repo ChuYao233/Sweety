@@ -142,6 +142,12 @@ impl<'a, C, B> WebContext<'a, C, B> {
         self.req.as_response(body.into())
     }
 
+    /// 返回 body 的 RefCell 引用，用于借用而不 take body
+    /// 调用方必须保证 borrow_mut() 不跨 await 持有
+    pub fn body_cell(&self) -> &RefCell<B> {
+        self.body
+    }
+
     pub fn take_body_ref(&self) -> B
     where
         B: Default,

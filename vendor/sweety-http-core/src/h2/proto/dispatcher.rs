@@ -35,6 +35,7 @@ use crate::{
 pub(crate) struct Dispatcher<'a, TlsSt, S, ReqB> {
     io: &'a mut Connection<TlsSt, Bytes>,
     addr: SocketAddr,
+    is_tls: bool,
     keep_alive: Pin<&'a mut KeepAlive>,
     ka_dur: Duration,
     service: &'a S,
@@ -54,6 +55,7 @@ where
     pub(crate) fn new(
         io: &'a mut Connection<TlsSt, Bytes>,
         addr: SocketAddr,
+        is_tls: bool,
         keep_alive: Pin<&'a mut KeepAlive>,
         ka_dur: Duration,
         service: &'a S,
@@ -62,6 +64,7 @@ where
         Self {
             io,
             addr,
+            is_tls,
             keep_alive,
             ka_dur,
             service,
@@ -74,6 +77,7 @@ where
         let Self {
             io,
             addr,
+            is_tls,
             mut keep_alive,
             ka_dur,
             service,
@@ -108,7 +112,7 @@ where
                         .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
                         .unwrap_or(false);
                     let req = req.map(|body| {
-                        let ext = if is_h2_ws { Extension::new_h2_ws(addr) } else { Extension::new(addr) };
+                        let ext = if is_h2_ws { Extension::new_h2_ws(addr, is_tls) } else { Extension::new(addr, is_tls) };
                         let body = ReqB::from(RequestBody::from(body));
                         RequestExt::from_parts(body, ext)
                     });

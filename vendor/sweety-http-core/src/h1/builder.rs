@@ -20,6 +20,7 @@ impl<St, FA, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE
         HttpServiceBuilder {
             tls_factory: self.tls_factory,
             config: self.config,
+            is_tls: self.is_tls,
             _body: std::marker::PhantomData,
         }
     }
@@ -42,6 +43,7 @@ impl<St, FA, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE
         HttpServiceBuilder {
             tls_factory: self.tls_factory,
             config: self.config,
+            is_tls: self.is_tls,
             _body: std::marker::PhantomData,
         }
     }
@@ -62,7 +64,7 @@ where
     async fn call(&self, res: Result<S, E>) -> Result<Self::Response, Self::Error> {
         let service = res.map_err(|e| Box::new(e) as Error)?;
         let tls_acceptor = self.tls_factory.call(()).await.map_err(|e| Box::new(e) as Error)?;
-        Ok(H1Service::new(self.config, service, tls_acceptor))
+        Ok(H1Service::new_with_tls(self.config, service, tls_acceptor, self.is_tls))
     }
 }
 

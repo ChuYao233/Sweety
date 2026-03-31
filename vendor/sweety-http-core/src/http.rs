@@ -146,19 +146,21 @@ where
 pub(crate) struct Extension(Box<_Extension>);
 
 impl Extension {
-    pub(crate) fn new(addr: SocketAddr) -> Self {
+    pub(crate) fn new(addr: SocketAddr, is_tls: bool) -> Self {
         Self(Box::new(_Extension {
             addr,
             h2_ws: false,
+            is_tls,
             #[cfg(feature = "router")]
             params: Default::default(),
         }))
     }
 
-    pub(crate) fn new_h2_ws(addr: SocketAddr) -> Self {
+    pub(crate) fn new_h2_ws(addr: SocketAddr, is_tls: bool) -> Self {
         Self(Box::new(_Extension {
             addr,
             h2_ws: true,
+            is_tls,
             #[cfg(feature = "router")]
             params: Default::default(),
         }))
@@ -170,6 +172,8 @@ struct _Extension {
     addr: SocketAddr,
     /// H2 extended CONNECT 且 :protocol=websocket（RFC 8441）
     pub h2_ws: bool,
+    /// 当前连接是否为 TLS（HTTPS/WSS），用于 force_https 等需要区分协议的场景
+    pub is_tls: bool,
     #[cfg(feature = "router")]
     params: Params,
 }
@@ -183,6 +187,12 @@ impl<B> RequestExt<B> {
     #[inline]
     pub fn is_h2_ws(&self) -> bool {
         self.ext.0.h2_ws
+    }
+
+    /// 当前连接是否为 TLS（HTTPS/WSS）
+    #[inline]
+    pub fn is_tls(&self) -> bool {
+        self.ext.0.is_tls
     }
 
     /// retrieve remote peer's socket address.
@@ -227,7 +237,7 @@ where
     B: Default,
 {
     fn default() -> Self {
-        Self::from_parts(B::default(), Extension::new(crate::unspecified_socket_addr()))
+        Self::from_parts(B::default(), Extension::new(crate::unspecified_socket_addr(), false))
     }
 }
 

@@ -37,6 +37,7 @@ pub struct HttpServiceBuilder<
 > {
     pub(crate) tls_factory: FA,
     pub(crate) config: HttpServiceConfig<HEADER_LIMIT, READ_BUF_LIMIT, WRITE_BUF_LIMIT>,
+    pub(crate) is_tls: bool,
     pub(crate) _body: PhantomData<fn(V, St)>,
 }
 
@@ -69,6 +70,7 @@ impl
         HttpServiceBuilder {
             tls_factory: tls::NoOpTlsAcceptorBuilder,
             config,
+            is_tls: false,
             _body: PhantomData,
         }
     }
@@ -86,6 +88,7 @@ impl
         HttpServiceBuilder {
             tls_factory: tls::NoOpTlsAcceptorBuilder,
             config: HttpServiceConfig::default(),
+            is_tls: false,
             _body: PhantomData,
         }
     }
@@ -103,6 +106,7 @@ impl
         HttpServiceBuilder {
             tls_factory: tls::NoOpTlsAcceptorBuilder,
             config: HttpServiceConfig::default(),
+            is_tls: false,
             _body: PhantomData,
         }
     }
@@ -125,6 +129,7 @@ impl<V, St, FA, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WR
         HttpServiceBuilder {
             tls_factory: self.tls_factory,
             config,
+            is_tls: self.is_tls,
             _body: PhantomData,
         }
     }
@@ -137,6 +142,7 @@ impl<V, St, FA, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WR
         HttpServiceBuilder {
             tls_factory,
             config: self.config,
+            is_tls: true,
             _body: PhantomData,
         }
     }
@@ -198,6 +204,6 @@ where
     async fn call(&self, res: Result<S, E>) -> Result<Self::Response, Self::Error> {
         let service = res.map_err(|e| Box::new(e) as Error)?;
         let tls_acceptor = self.tls_factory.call(()).await.map_err(|e| Box::new(e) as Error)?;
-        Ok(HttpService::new(self.config, service, tls_acceptor))
+        Ok(HttpService::new_with_tls(self.config, service, tls_acceptor, self.is_tls))
     }
 }

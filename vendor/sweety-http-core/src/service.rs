@@ -31,22 +31,26 @@ pub struct HttpService<
     pub(crate) date: DateTimeService,
     pub(crate) service: S,
     pub(crate) tls_acceptor: A,
+    /// 当前 service 绑定的是否为 TLS 端口（由 builder 在构建时写入）
+    pub(crate) is_tls: bool,
     _body: PhantomData<(St, ReqB)>,
 }
 
 impl<St, S, ReqB, A, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE_BUF_LIMIT: usize>
     HttpService<St, S, ReqB, A, HEADER_LIMIT, READ_BUF_LIMIT, WRITE_BUF_LIMIT>
 {
-    pub(crate) fn new(
+    pub(crate) fn new_with_tls(
         config: HttpServiceConfig<HEADER_LIMIT, READ_BUF_LIMIT, WRITE_BUF_LIMIT>,
         service: S,
         tls_acceptor: A,
+        is_tls: bool,
     ) -> Self {
         Self {
             config,
             date: DateTimeService::new(),
             service,
             tls_acceptor,
+            is_tls,
             _body: PhantomData,
         }
     }
@@ -116,6 +120,7 @@ where
                     super::http::Version::HTTP_11 | super::http::Version::HTTP_10 => super::h1::dispatcher::run(
                         &mut _tls_stream,
                         _addr,
+                        self.is_tls,
                         timer.as_mut(),
                         self.config,
                         &self.service,
@@ -138,6 +143,7 @@ where
                         super::h2::Dispatcher::new(
                             &mut conn,
                             _addr,
+                            self.is_tls,
                             timer.as_mut(),
                             self.config.keep_alive_timeout,
                             &self.service,
@@ -164,6 +170,7 @@ where
                     super::h1::dispatcher::run(
                         &mut io,
                         crate::unspecified_socket_addr(),
+                        false, // Unix socket 不是 TLS
                         timer.as_mut(),
                         self.config,
                         &self.service,

@@ -41,7 +41,7 @@ where
             .await
             .map_err(|_| HttpServiceError::Timeout(TimeoutError::TlsAccept))??;
 
-        super::dispatcher::run(&mut io, addr, timer, self.config, &self.service, self.date.get())
+        super::dispatcher::run(&mut io, addr, true, timer, self.config, &self.service, self.date.get())
             .await
             .map_err(Into::into)
     }

@@ -76,6 +76,7 @@ where
         let dispatcher = Dispatcher::new(
             &mut conn,
             addr,
+            true, // H2 service 只在 TLS accept 后创建
             timer,
             self.config.keep_alive_timeout,
             &self.service,

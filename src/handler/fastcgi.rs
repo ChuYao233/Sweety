@@ -225,21 +225,8 @@ pub async fn handle_sweety(
 
     // ── 判断是否 HTTPS（用于 HTTPS=on 和 SERVER_PORT）───────────────────
     let is_https = {
-        // 优先用 URI scheme（HTTP/2、HTTP/3 有效）
-        let scheme = ctx.req().uri().scheme_str();
-        match scheme {
-            Some("https") => true,
-            Some("http")  => false,
-            _ => {
-                // HTTP/1 fallback：用已解析的 host_port_str 避免重复 split
-                if let Ok(port) = host_port_str.parse::<u16>() {
-                    if port != 80 { ctx.state().tls_ports.contains(&port) }
-                    else { !ctx.state().tls_ports.is_empty() }
-                } else {
-                    !ctx.state().tls_ports.is_empty()
-                }
-            }
-        }
+        // 直接用框架层在 TLS accept 时注入的连接级标记，零推断
+        ctx.req().body().is_tls()
     };
 
     // SERVER_PORT：HTTPS 时无端口用 443，HTTP 用解析到的端口（均为 &str 零分配）

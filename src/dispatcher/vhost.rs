@@ -76,7 +76,18 @@ impl SiteInfo {
     /// 从 SiteConfig 转换为运行时 SiteInfo
     pub fn from_config(cfg: &SiteConfig) -> Self {
         // 按匹配优先级排序，同时预编译所有正则 location
-        let mut locations: Vec<CompiledLocation> = cfg.locations.iter()
+        // 若 locations 为空且站点有 root，自动注入默认 static location（与 Nginx/Caddy 行为一致）
+        let effective_locations: std::borrow::Cow<[crate::config::model::LocationConfig]> =
+            if cfg.locations.is_empty() && cfg.root.is_some() {
+                std::borrow::Cow::Owned(vec![crate::config::model::LocationConfig {
+                    path: "/".to_string(),
+                    handler: crate::config::model::HandlerType::Static,
+                    ..Default::default()
+                }])
+            } else {
+                std::borrow::Cow::Borrowed(&cfg.locations)
+            };
+        let mut locations: Vec<CompiledLocation> = effective_locations.iter()
             .map(|loc| CompiledLocation::new(loc.clone()))
             .collect();
         locations.sort_by_key(|cl| location_priority(&cl.config.path));

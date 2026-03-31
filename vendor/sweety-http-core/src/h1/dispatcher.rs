@@ -59,6 +59,7 @@ pub(crate) async fn run<
 >(
     io: &'a mut St,
     addr: SocketAddr,
+    is_tls: bool,
     timer: Pin<&'a mut KeepAlive>,
     config: HttpServiceConfig<HEADER_LIMIT, READ_BUF_LIMIT, WRITE_BUF_LIMIT>,
     service: &'a S,
@@ -77,7 +78,7 @@ where
         EitherBuf::Right(WriteBuf::<WRITE_BUF_LIMIT>::default())
     };
 
-    Dispatcher::new(io, addr, timer, config, service, date, write_buf)
+    Dispatcher::new(io, addr, is_tls, timer, config, service, date, write_buf)
         .run()
         .await
 }
@@ -169,6 +170,7 @@ where
     fn new<const WRITE_BUF_LIMIT: usize>(
         io: &'a mut St,
         addr: SocketAddr,
+        is_tls: bool,
         timer: Pin<&'a mut KeepAlive>,
         config: HttpServiceConfig<HEADER_LIMIT, READ_BUF_LIMIT, WRITE_BUF_LIMIT>,
         service: &'a S,
@@ -178,7 +180,7 @@ where
         Self {
             io: BufferedIo::new(io, write_buf),
             timer: Timer::new(timer, config.keep_alive_timeout, config.request_head_timeout),
-            ctx: Context::with_addr(addr, date),
+            ctx: Context::with_addr_tls(addr, is_tls, date),
             service,
             _phantom: PhantomData,
         }

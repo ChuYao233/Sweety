@@ -59,16 +59,12 @@ impl SweetyServer {
         // 第一步：收集所有端口的 TLS 配置和 SniResolver（key=端口号，热重载按端口精确更新）
         let mut port_resolvers: HashMap<u16, Arc<SniResolver>> = HashMap::new();
         let mut tls_bindings: Vec<(String, rustls::ServerConfig)> = Vec::new();
-        // 注意：tls_port_set 只收集实际成功绑定的端口
-        // 证书加载失败的端口不计入，防止 is_https 判断错误导致 421
-        let mut tls_port_set: HashSet<u16> = HashSet::new();
         for (port, sites_for_port) in collect_tls_ports_grouped(&cfg) {
             let addr = format!("0.0.0.0:{}", port);
             let site_refs: Vec<&crate::config::model::SiteConfig> =
                 sites_for_port.iter().map(|s| s.as_ref()).collect();
             match TlsManager::build_sni_server_config(&site_refs) {
                 Ok((rustls_cfg, resolver)) => {
-                    tls_port_set.insert(port); // 只有成功绑定的端口才计入
                     port_resolvers.insert(port, resolver);
                     tls_bindings.push((addr, rustls_cfg));
                     info!("HTTPS/HTTP2 监听: 0.0.0.0:{} ({} 个站点/证书)", port, site_refs.len());
@@ -86,8 +82,6 @@ impl SweetyServer {
             }
         }
 
-        // HTTP 端口集合（用于判断请求是否是 HTTP）
-        let http_port_set: HashSet<u16> = collect_http_ports(&cfg).into_iter().collect();
 
         // 为各站点创建 access_logger / proxy_cache / fcgi_cache 并直接注入 SiteInfo
         // 消除每请求 HashMap 字符串哈希查找（从 O(1) 哈希 → 直接指针解引用）
@@ -155,8 +149,6 @@ impl SweetyServer {
             registry: registry.clone(),
             metrics: metrics.clone(),
             cfg: cfg.clone(),
-            tls_ports: Arc::new(tls_port_set),
-            http_ports: Arc::new(http_port_set),
             h3_ports: Arc::new(h3_port_set),
             conn_pool,
             sni_resolvers: Arc::new(port_resolvers),
@@ -319,10 +311,6 @@ pub struct AppState {
     pub metrics: Arc<GlobalMetrics>,
     /// 应用配置（每请求必访）
     pub cfg: Arc<AppConfig>,
-    /// HTTPS/TLS 端口集合（每请求必访）
-    pub tls_ports: Arc<HashSet<u16>>,
-    /// HTTP 明文端口集合（O(1) 查找）
-    pub http_ports: Arc<HashSet<u16>>,
     /// 最大并发连接数（0 = 不限制）
     pub max_connections: usize,
     /// 最大请求体字节数（预计算，避免每请求乘法；0 = 不限制）
@@ -429,19 +417,9 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     let request_uri = ctx.req().uri().path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(path);
-    // URI scheme（H2/H3 有效，H1 通常为 None）
-    let uri_scheme = ctx.req().uri().scheme_str();
-    let is_https = match uri_scheme {
-        Some("https") => true,
-        Some("http")  => false,
-        _ => match host_port {
-            // Host 带端口：在 http_ports 里 = HTTP，否则 = HTTPS
-            Some(p) => !state.http_ports.contains(&p),
-            // Host 无端口 + H1：无法可靠判断，默认视为 HTTPS
-            // （tls_ports 有端口说明站点有 TLS，无端口访问通常是通过浏览器直接输入 https://）
-            None => !state.http_ports.is_empty() && state.tls_ports.contains(&443),
-        },
-    };
+    // 从框架层注入的连接级 TLS 标记获取，零推断、零歧义
+    // H1/H2/H3 dispatcher 在 accept 时根据绑定端口类型写入，与 Nginx HTTP/HTTPS server block 分离等价
+    let is_https = ctx.req().body().is_tls();
 
     // HTTPS 请求严格匹配（防跨站）：无精确/通配符匹配时返回 421 Misdirected Request
     // HTTP 请求允许 fallback 到默认站点（与 Nginx 行为一致）
@@ -464,25 +442,10 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         }
     };
 
-    // force_https：与 Nginx 行为完全一致
-    // Nginx 的 return 301 https://... 写在 HTTP server block 里，HTTPS 连接根本不会进入那个 block。
-    // Sweety 等效实现：只对 Host 头明确带了 HTTP 端口（如 :80）的请求跳转，
-    // 无端口的请求不跳转（无法可靠判断协议，避免死循环）。
-    // 带端口访问（http://ip:80 → Host: ip:80）完全可靠。
-    // 无端口直接访问（http://ip → Host: ip，H1）无法区分，不处理，由用户在 DNS/CDN 层做强制 HTTPS。
+    // force_https：等价 Nginx 在 HTTP server block 写 return 301 https://...
+    // is_https 由框架层在 TLS accept 时注入，零推断，HTTP/HTTPS 天然隔离
     if site.force_https {
-        let should_redirect = match uri_scheme {
-            Some("http") => true,   // H2/H3 明确 scheme=http
-            Some("https") => false, // H2/H3 明确 scheme=https
-            _ => {
-                // H1 无 scheme：只有 Host 头明确带了 http_port 才跳转
-                match host_port {
-                    Some(p) => state.http_ports.contains(&p),
-                    None => false,  // 无端口：不跳转，无法可靠判断
-                }
-            }
-        };
-        if should_redirect {
+        if !is_https {
             let tls_port = if site.listen_tls.contains(&443) { 443 }
                            else { site.listen_tls.first().copied().unwrap_or(443) };
             let host_for_redirect = if tls_port == 443 { host.to_string() }
@@ -734,9 +697,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
 
     // 注入 HSTS 响应头（仅当 HTTPS 且站点配置了 hsts_header_value 时）
     // hsts_header_value 为 None 时直接短路，零开销
-    if site.hsts_header_value.is_some() && (is_https
-        || host_port.map(|p| state.tls_ports.contains(&p)).unwrap_or(false))
-    {
+    if site.hsts_header_value.is_some() && is_https {
         if let Some(hsts_val) = &site.hsts_header_value {
             resp.headers_mut().insert(
                 sweety_web::http::header::HeaderName::from_static("strict-transport-security"),
@@ -749,8 +710,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
     // 仅对 HTTPS 响应且当前请求端口有对应 HTTP/3 端口时注入
     // 浏览器收到后会尝试分群用 QUIC 重新连接
     {
-        let on_tls = is_https
-            || host_port.map(|p| state.tls_ports.contains(&p)).unwrap_or(false);
+        let on_tls = is_https;
         if on_tls && !state.h3_ports.is_empty() {
             // 取当前端口（优先用 host_port，没有则用 TLS 端口列表第一个）
             let effective_port = host_port

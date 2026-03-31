@@ -26,6 +26,8 @@ impl ContextState {
     const HEAD: u8 = 0b_0100;
     // Enable when current connection is supposed to be closed after current response is sent.
     const CLOSE: u8 = 0b_1000;
+    // Enable when current connection is TLS (HTTPS/WSS).
+    const IS_TLS: u8 = 0b_0001_0000;
 
     const fn new() -> Self {
         Self(0)
@@ -58,9 +60,16 @@ impl<'a, D, const HEADER_LIMIT: usize> Context<'a, D, HEADER_LIMIT> {
     /// [DateTime]: crate::date::DateTime
     #[inline]
     pub fn with_addr(addr: SocketAddr, date: &'a D) -> Self {
+        Self::with_addr_tls(addr, false, date)
+    }
+
+    #[inline]
+    pub fn with_addr_tls(addr: SocketAddr, is_tls: bool, date: &'a D) -> Self {
+        let mut state = ContextState::new();
+        if is_tls { state.insert(ContextState::IS_TLS); }
         Self {
             addr,
-            state: ContextState::new(),
+            state,
             header: None,
             exts: Extensions::new(),
             date,
@@ -165,5 +174,11 @@ impl<'a, D, const HEADER_LIMIT: usize> Context<'a, D, HEADER_LIMIT> {
     #[inline]
     pub fn socket_addr(&self) -> &SocketAddr {
         &self.addr
+    }
+
+    /// Return true if current connection is TLS (HTTPS/WSS).
+    #[inline]
+    pub const fn is_tls(&self) -> bool {
+        self.state.contains(ContextState::IS_TLS)
     }
 }

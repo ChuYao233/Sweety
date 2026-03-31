@@ -198,6 +198,9 @@ pub async fn handle_xitca(
             sub_filter,
             cache_ref,
             scheme_str,
+            pool.keepalive_requests,
+            pool.keepalive_time,
+            pool.keepalive_max_idle,
         ).await;
 
         match result {

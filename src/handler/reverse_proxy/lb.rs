@@ -79,6 +79,12 @@ pub struct UpstreamPool {
     pub nodes: Vec<Arc<NodeState>>,
     strategy: LoadBalanceStrategy,
     rr_counter: AtomicUsize,
+    /// 单连接最大复用请求数（0 = 不限制）
+    pub keepalive_requests: u64,
+    /// 连接最大复用时间（秒，0 = 不限制）
+    pub keepalive_time: u64,
+    /// 每节点最大空闲连接数（0 = 用全局默认 32）
+    pub keepalive_max_idle: usize,
 }
 
 impl UpstreamPool {
@@ -89,6 +95,9 @@ impl UpstreamPool {
             nodes,
             strategy: cfg.strategy.clone(),
             rr_counter: AtomicUsize::new(0),
+            keepalive_requests: cfg.keepalive_requests,
+            keepalive_time: cfg.keepalive_time,
+            keepalive_max_idle: cfg.keepalive,
         }
     }
 

@@ -37,11 +37,12 @@ impl ConnPool {
         }
     }
 
-    /// 从连接池取一个 idle 连接；若无则返回 None（调用方新建）
-    pub fn acquire(&self, key: &str) -> Option<PooledConn> {
+    /// 从连接池取一个 idle 连接
+    /// 返回 (conn, created_at, request_count)，用于归还时传递 keepalive 判断
+    pub fn acquire(&self, key: &str) -> Option<(PooledConn, Instant, u64)> {
         let mut entry = self.inner.get_mut(key)?;
         let pool = entry.value_mut();
-        // 惰性清理：只有当队列中有多个连接时才扫描，单连接时直接擐取跳过 O(n)
+        // 惰性清理：只有当队列中有多个连接时才扫描，单连接时直接擦取跳过 O(n)
         if pool.idle.len() > 1 {
             let now = Instant::now();
             pool.idle.retain(|c| now.duration_since(c.returned_at) < self.idle_timeout);
@@ -49,22 +50,42 @@ impl ConnPool {
         // 展示队头连接（过期连接直接丢弃）
         while let Some(c) = pool.idle.pop_front() {
             if c.returned_at.elapsed() < self.idle_timeout {
-                return Some(c.conn);
+                return Some((c.conn, c.created_at, c.request_count));
             }
         }
         None
     }
 
-    /// 归还连接到池
-    pub fn release(&self, key: &str, conn: PooledConn) {
+    /// 归还连接到池，附带应该验证的限制参数
+    pub fn release(
+        &self,
+        key: &str,
+        conn: PooledConn,
+        created_at: Instant,
+        request_count: u64,
+        keepalive_requests: u64,  // 0 = 不限制
+        keepalive_time: u64,       // 0 = 不限制（秒）
+        max_idle_override: usize,  // 0 = 用全局默认
+    ) {
+        // keepalive_requests 超限：不归还
+        if keepalive_requests > 0 && request_count >= keepalive_requests {
+            return;
+        }
+        // keepalive_time 超限：不归还
+        if keepalive_time > 0 && created_at.elapsed() >= Duration::from_secs(keepalive_time) {
+            return;
+        }
+        let limit = if max_idle_override > 0 { max_idle_override } else { self.max_idle };
         let mut entry = self.inner.entry(key.to_owned()).or_default();
         let pool = entry.value_mut();
-        if pool.idle.len() >= self.max_idle {
+        if pool.idle.len() >= limit {
             return; // 超过上限，丢弃
         }
         pool.idle.push_back(IdleConn {
             conn,
             returned_at: Instant::now(),
+            created_at,
+            request_count,
         });
     }
 }
@@ -77,7 +98,12 @@ struct NodePool {
 
 struct IdleConn {
     conn: PooledConn,
+    /// 连接归还时刻（用于 idle 超时判断）
     returned_at: Instant,
+    /// 连接创建时刻（用于 keepalive_time 判断）
+    created_at: Instant,
+    /// 已处理请求数（用于 keepalive_requests 判断）
+    request_count: u64,
 }
 
 /// 池化连接（TCP 或 TLS 统一枚举）

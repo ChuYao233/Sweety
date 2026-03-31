@@ -1,7 +1,7 @@
 //! HTTP 连接层
 //! 负责：与上游建立连接、发送请求、读取响应（支持 chunked/gzip）、健康检查探活
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -37,7 +37,11 @@ pub async fn forward_request(
     proxy_redirect_to: Option<&str>,
     sub_filter: &[crate::config::model::SubFilter],
     proxy_cache: Option<(&std::sync::Arc<ProxyCache>, &CacheKey)>,
-    client_proto: &str,   // 客户端连接的协议（"https" 或 "http"）
+    client_proto: &str,
+    // upstream keepalive 精细控制参数（0 = 不限制/用默认）
+    keepalive_requests: u64,
+    keepalive_time: u64,
+    keepalive_max_idle: usize,
 ) -> Result<WebResponse> {
     debug!("转发 {} {} → {} (tls={}, body={}B)",
         method, path, upstream_addr, use_tls, body.len());
@@ -46,19 +50,19 @@ pub async fn forward_request(
 
     // 尝试从池取 idle 连接，最多重试一次（防止服务端关闭了 idle 连接）
     for attempt in 0..2u8 {
-        let conn = if attempt == 0 {
-            // 先尝试池里的 idle 连接
+        // (conn, created_at, request_count)
+        let (conn, created_at, req_count) = if attempt == 0 {
             match pool.acquire(&key) {
-                Some(c) => { debug!("复用 idle 连接: {}", upstream_addr); c }
+                Some((c, ca, rc)) => { debug!("复用 idle 连接: {}", upstream_addr); (c, ca, rc) }
                 None => {
-                    // 池为空，新建连接
-                    new_conn(upstream_addr, use_tls, tls_sni, tls_insecure).await?
+                    let c = new_conn(upstream_addr, use_tls, tls_sni, tls_insecure).await?;
+                    (c, Instant::now(), 0u64)
                 }
             }
         } else {
-            // 第二次： idle 连接失效，强制新建
             debug!("重试新建连接: {}", upstream_addr);
-            new_conn(upstream_addr, use_tls, tls_sni, tls_insecure).await?
+            let c = new_conn(upstream_addr, use_tls, tls_sni, tls_insecure).await?;
+            (c, Instant::now(), 0u64)
         };
 
         match send_recv_pooled(conn, method, path, host, extra_headers, client_ip, body,
@@ -66,14 +70,16 @@ pub async fn forward_request(
             sub_filter, proxy_cache, client_proto).await
         {
             Ok((resp, maybe_conn)) => {
-                // 如果连接可复用，归还到池
                 if let Some(c) = maybe_conn {
-                    pool.release(&key, c);
+                    pool.release(
+                        &key, c,
+                        created_at, req_count + 1,
+                        keepalive_requests, keepalive_time, keepalive_max_idle,
+                    );
                 }
                 return Ok(resp);
             }
             Err(e) if attempt == 0 => {
-                // 可能是 idle 连接已失效，重试一次
                 debug!("连接失效，重试: {}", e);
                 continue;
             }

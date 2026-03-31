@@ -43,8 +43,8 @@ struct BiDirStream<R, W> {
     upstream_read:  R,
     upstream_write: W,
     client_body:    RequestBody,
-    /// 从上游读取的缓冲区（每帧 64KB）
-    read_buf:       Box<[u8; 65536]>,
+    /// 从上游读取的缓冲区（80KB BytesMut， freeze() 零拷贝转 Bytes）
+    read_buf:       bytes::BytesMut,
     /// 暂存已从 client body 拿到但尚未写完上游的数据
     pending_write:  Option<Bytes>,
     /// client body 是否已结束
@@ -57,11 +57,13 @@ where
     W: AsyncWrite + Unpin,
 {
     fn new(upstream_read: R, upstream_write: W, client_body: RequestBody) -> Self {
+        let mut read_buf = bytes::BytesMut::with_capacity(65536);
+        read_buf.resize(65536, 0);
         Self {
             upstream_read,
             upstream_write,
             client_body,
-            read_buf: Box::new([0u8; 65536]),
+            read_buf,
             pending_write: None,
             client_done: false,
         }
@@ -78,9 +80,9 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Result<Bytes, io::Error>>> {
         let this = self.get_mut();
 
-        // ── 方向 A：client → upstream ────────────────────────────────────
+        // ── 方向 A：client → upstream ──────────────────────────────
         // 先把上次未写完的数据继续写
-        if let Some(ref data) = this.pending_write.clone() {
+        if let Some(ref data) = this.pending_write.as_ref() {
             match Pin::new(&mut this.upstream_write).poll_write(cx, data.as_ref()) {
                 Poll::Ready(Ok(n)) if n == data.len() => { this.pending_write = None; }
                 Poll::Ready(Ok(n)) => { this.pending_write = Some(data.slice(n..)); }
@@ -105,8 +107,10 @@ where
             }
         }
 
-        // ── 方向 B：upstream → client ─────────────────────────────────────
-        let mut rb = TokioReadBuf::new(&mut *this.read_buf);
+        // ── 方向 B：upstream → client ───────────────────────────────
+        // 读入 BytesMut 后 split_to().freeze() 零拷贝转 Bytes，与 Nginx sendfile 语义相同
+        this.read_buf.resize(65536, 0);
+        let mut rb = TokioReadBuf::new(&mut this.read_buf);
         match Pin::new(&mut this.upstream_read).poll_read(cx, &mut rb) {
             Poll::Ready(Ok(())) => {
                 let n = rb.filled().len();
@@ -114,7 +118,8 @@ where
                     // 上游关闭连接，结束 stream
                     return Poll::Ready(None);
                 }
-                let chunk = Bytes::copy_from_slice(rb.filled());
+                // freeze() 零拷贝：内部将 BytesMut 的内存所有权转移给 Bytes，不复制
+                let chunk = this.read_buf.split_to(n).freeze();
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),

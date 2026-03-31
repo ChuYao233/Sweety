@@ -165,12 +165,9 @@ impl SweetyServer {
         let h = || handler_service(multi_site_handler);
         let all_methods = get(h()).post(h()).put(h()).delete(h())
             .patch(h()).head(h()).options(h()).trace(h());
-        let all_methods2 = get(h()).post(h()).put(h()).delete(h())
-            .patch(h()).head(h()).options(h()).trace(h());
         let app = App::new()
             .with_state(state.clone())
             .at("/*path", all_methods)
-            .at("/:file", all_methods2)
             .at("/", get(h()).post(h()).put(h()).delete(h()).patch(h()).head(h()).options(h()).trace(h()));
 
         let mut server = xitca_web::HttpServer::serve(app.finish());

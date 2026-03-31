@@ -199,27 +199,30 @@ impl VHostRegistry {
     /// Cow 优化：Host 头概率已是 ASCII 小写，直接借用，避免堆分配。
     pub fn lookup(&self, host: &str) -> Option<Arc<SiteInfo>> {
         let host = strip_port(host);
-        let host_lower: Cow<str> = if host.bytes().all(|b| !b.is_ascii_uppercase()) {
-            Cow::Borrowed(host)
-        } else {
-            Cow::Owned(host.to_ascii_lowercase())
-        };
-        let inner = self.inner.load();
-        if let Some(site) = inner.exact.get(host_lower.as_ref()) {
-            return Some(Arc::clone(site));
-        }
-        if let Some(dot_pos) = host_lower.find('.') {
-            let suffix = &host_lower[dot_pos + 1..];
-            if let Some(site) = inner.wildcard.get(suffix) {
-                return Some(Arc::clone(site));
-            }
-        }
-        inner.fallback.as_ref().map(Arc::clone)
+        self.lookup_inner(host, true)
     }
 
     /// 严格匹配：HTTPS 请求防跨站用
     pub fn lookup_strict(&self, host: &str) -> Option<Arc<SiteInfo>> {
         let host = strip_port(host);
+        self.lookup_inner(host, false)
+    }
+
+    /// 调用方已解析好无端口的 host（热路径优化：跳过 strip_port，避免重复扫描）
+    #[inline(always)]
+    pub fn lookup_by_host(&self, host: &str) -> Option<Arc<SiteInfo>> {
+        self.lookup_inner(host, true)
+    }
+
+    /// 调用方已解析好无端口的 host，严格模式（HTTPS 防跨站）
+    #[inline(always)]
+    pub fn lookup_by_host_strict(&self, host: &str) -> Option<Arc<SiteInfo>> {
+        self.lookup_inner(host, false)
+    }
+
+    /// 内部查找实现，host 必须已去掉端口
+    #[inline(always)]
+    fn lookup_inner(&self, host: &str, with_fallback: bool) -> Option<Arc<SiteInfo>> {
         let host_lower: Cow<str> = if host.bytes().all(|b| !b.is_ascii_uppercase()) {
             Cow::Borrowed(host)
         } else {
@@ -235,7 +238,12 @@ impl VHostRegistry {
                 return Some(Arc::clone(site));
             }
         }
-        inner.fallback.as_ref().map(Arc::clone)
+        // fallback 站点明确声明接受所有请求（包括 HTTP 和 HTTPS）
+        if with_fallback {
+            inner.fallback.as_ref().map(Arc::clone)
+        } else {
+            None
+        }
     }
 
     /// 返回注册的站点总数

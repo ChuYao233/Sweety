@@ -398,8 +398,9 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
 
     // HTTPS 请求严格匹配（防跨站）：无精确/通配符匹配时返回 421 Misdirected Request
     // HTTP 请求允许 fallback 到默认站点（与 Nginx 行为一致）
+    // host 已在上方解析为无端口字符串，直接用 lookup_by_host 跳过 strip_port 重复扫描
     let site = if is_https {
-        match state.registry.lookup_strict(&host) {
+        match state.registry.lookup_by_host_strict(host) {
             Some(s) => s,
             None => {
                 state.metrics.record_status(421);
@@ -407,7 +408,7 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
             }
         }
     } else {
-        match state.registry.lookup(&host) {
+        match state.registry.lookup_by_host(host) {
             Some(s) => s,
             None => {
                 state.metrics.record_status(404);
@@ -584,8 +585,9 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
 
     // error_page：自定义错误页（等价 Nginx error_page 404 /404.html）
     // 使用 tokio::fs::read 异步读取，不阻塞 worker thread
+    // 大多数站点没有配置 error_pages，提前短路避免状态码判断开销
     let status_u16 = resp.status().as_u16();
-    if (400..600).contains(&status_u16) {
+    if !site.error_pages.is_empty() && (400..600).contains(&status_u16) {
         if let Some(ep_path) = site.error_pages.get(&status_u16) {
             if let Some(root) = location.root.as_ref().or(site.root.as_ref()) {
                 let ep_file = root.join(ep_path.trim_start_matches('/'));
@@ -603,11 +605,11 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         }
     }
 
-    // 注入 HSTS 响应头（仅当 HTTPS 且站点配置了 hsts 时）
-    // 直接用预计算的 hsts_header_value，零 format! 分配
-    let inject_hsts = is_https
-        || host_port.map(|p| state.tls_ports.contains(&p)).unwrap_or(false);
-    if inject_hsts {
+    // 注入 HSTS 响应头（仅当 HTTPS 且站点配置了 hsts_header_value 时）
+    // hsts_header_value 为 None 时直接短路，零开销
+    if site.hsts_header_value.is_some() && (is_https
+        || host_port.map(|p| state.tls_ports.contains(&p)).unwrap_or(false))
+    {
         if let Some(hsts_val) = &site.hsts_header_value {
             resp.headers_mut().insert(
                 xitca_web::http::header::HeaderName::from_static("strict-transport-security"),

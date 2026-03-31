@@ -678,14 +678,28 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
         HandlerType::Grpc => {
             crate::handler::grpc::handle_sweety(ctx, &site, &location).await
         }
-        // Plugin handler：on_request 已在上方处理，这里 on_request 返回 Continue
-        // 插件可以作为独立 handler（不走其他 handler），直接返回 200 或交由 on_response 改写
+        // Plugin handler：优先查找已注册的自定义 RequestHandler
+        // 没注册则退化为旧 Plugin 钩子逻辑，完全向前兼容
         HandlerType::Plugin(ref plugin_name) => {
-            use sweety_web::body::ResponseBody;
-            let mut r = WebResponse::new(ResponseBody::none());
-            *r.status_mut() = StatusCode::OK;
-            // 调用 on_response：插件可在此修改响应体/头
-            crate::handler::plugin::run_plugin_response(plugin_name, r)
+            let handler_ip = ctx.req().body().socket_addr().ip().to_string();
+            let hctx = crate::handler::plugin::HandlerContext {
+                method:        ctx.req().method().as_str(),
+                path:          effective_path,
+                headers:       ctx.req().headers(),
+                client_ip:     &handler_ip,
+                site_name:     &site.name,
+                location_path: &location.path,
+            };
+            // 先尝试自定义 RequestHandler
+            if let Some(resp) = crate::handler::plugin::run_custom_handler(plugin_name, hctx).await {
+                resp
+            } else {
+                // fallback：旧 Plugin 钩子（on_request 已在上方处理）
+                use sweety_web::body::ResponseBody;
+                let mut r = WebResponse::new(ResponseBody::none());
+                *r.status_mut() = StatusCode::OK;
+                crate::handler::plugin::run_plugin_response(plugin_name, r)
+            }
         }
     };
 

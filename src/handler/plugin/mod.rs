@@ -115,6 +115,115 @@ pub fn plugin_registry() -> &'static PluginRegistry {
 }
 
 // ─────────────────────────────────────────────
+// RequestHandler trait（完整 handler 注册）
+// ─────────────────────────────────────────────
+
+/// 完整请求处理上下文（传给自定义 handler）
+pub struct HandlerContext<'a> {
+    /// HTTP 方法
+    pub method:    &'a str,
+    /// 请求路径（含 query）
+    pub path:      &'a str,
+    /// 请求头
+    pub headers:   &'a sweety_web::http::header::HeaderMap,
+    /// 客户端 IP
+    pub client_ip: &'a str,
+    /// 站点名称
+    pub site_name: &'a str,
+    /// Location 路径匹配模式
+    pub location_path: &'a str,
+}
+
+/// 自定义请求 Handler trait
+///
+/// 实现此 trait 并注册到 `handler_registry()` 后，
+/// 在配置中用 `handler = "plugin:my_handler"` 调用。
+///
+/// # 示例
+/// ```rust
+/// use sweety_lib::handler::plugin::{RequestHandler, HandlerContext, handler_registry};
+/// use sweety_web::http::{WebResponse, StatusCode};
+/// use sweety_web::body::ResponseBody;
+/// use std::sync::Arc;
+///
+/// struct MyHandler;
+///
+/// impl RequestHandler for MyHandler {
+///     fn name(&self) -> &'static str { "my_handler" }
+///
+///     fn handle<'a>(&'a self, ctx: HandlerContext<'a>)
+///         -> std::pin::Pin<Box<dyn std::future::Future<Output = WebResponse> + Send + 'a>>
+///     {
+///         Box::pin(async move {
+///             let mut resp = WebResponse::new(ResponseBody::none());
+///             *resp.status_mut() = StatusCode::OK;
+///             resp
+///         })
+///     }
+/// }
+///
+/// // main.rs 启动时注册
+/// handler_registry().register("my_handler", Arc::new(MyHandler));
+/// ```
+pub trait RequestHandler: Send + Sync {
+    /// handler 名称（唯一标识）
+    fn name(&self) -> &'static str;
+
+    /// 处理请求，返回响应
+    ///
+    /// 使用 `Box::pin(async move { ... })` 包裹 async 逻辑
+    fn handle<'a>(
+        &'a self,
+        ctx: HandlerContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WebResponse> + Send + 'a>>;
+}
+
+/// 自定义 handler 注册表（全局单例）
+#[derive(Default)]
+pub struct HandlerRegistry {
+    handlers: RwLock<HashMap<String, Arc<dyn RequestHandler>>>,
+}
+
+impl HandlerRegistry {
+    pub fn new() -> Self { Self::default() }
+
+    /// 注册自定义 handler
+    pub fn register(&self, name: impl Into<String>, handler: Arc<dyn RequestHandler>) {
+        self.handlers.write().unwrap_or_else(|e| e.into_inner()).insert(name.into(), handler);
+    }
+
+    /// 查找已注册 handler
+    #[inline]
+    pub fn lookup(&self, name: &str) -> Option<Arc<dyn RequestHandler>> {
+        self.handlers.read().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
+    }
+
+    /// 返回所有注册的 handler 名（Admin API 用）
+    pub fn handler_names(&self) -> Vec<String> {
+        self.handlers.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
+    }
+}
+
+/// 全局 handler 注册表单例
+pub static HANDLER_REGISTRY: std::sync::LazyLock<HandlerRegistry> =
+    std::sync::LazyLock::new(HandlerRegistry::new);
+
+/// 获取全局 handler 注册表
+#[inline(always)]
+pub fn handler_registry() -> &'static HandlerRegistry {
+    &HANDLER_REGISTRY
+}
+
+/// 尝试用注册的自定义 handler 处理请求
+///
+/// 返回 `Some(resp)` 表示找到 handler 并处理了；`None` 表示未注册，继续走内置逻辑
+#[inline]
+pub async fn run_custom_handler(handler_name: &str, ctx: HandlerContext<'_>) -> Option<WebResponse> {
+    let handler = handler_registry().lookup(handler_name)?;
+    Some(handler.handle(ctx).await)
+}
+
+// ─────────────────────────────────────────────
 // 配置解析辅助
 // ─────────────────────────────────────────────
 

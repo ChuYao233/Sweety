@@ -33,12 +33,13 @@ impl TlsManager {
 
         for site in sites {
             let Some(tls) = &site.tls else { continue };
-            let certified_keys = build_certified_keys(tls)?;
-            if !certified_keys.is_empty() {
-                certs_map.push((site.server_name.clone(), certified_keys));
-            }
+            // 传入域名，ACME 模式按域名查证书路径
+            let certified_keys = build_certified_keys(tls, &site.server_name);
+            certs_map.push((site.server_name.clone(), certified_keys));
         }
 
+        // 过滤掉空的（应该不会发生，自签名路径总会成功）
+        certs_map.retain(|(_, keys)| !keys.is_empty());
         if certs_map.is_empty() {
             bail!("未找到有效的 TLS 证书配置");
         }
@@ -1002,17 +1003,46 @@ mod sni_resolver {
 
 /// 公开给热重载模块调用：从 TlsConfig 加载所有证书
 impl TlsManager {
-    pub fn build_certified_keys_pub(tls: &TlsConfig) -> Result<Vec<rustls::sign::CertifiedKey>> {
-        build_certified_keys(tls)
+    pub fn build_certified_keys_pub(tls: &TlsConfig, server_names: &[String]) -> Result<Vec<rustls::sign::CertifiedKey>> {
+        Ok(build_certified_keys(tls, server_names))
     }
 }
 
-fn build_certified_keys(tls: &TlsConfig) -> Result<Vec<rustls::sign::CertifiedKey>> {
+/// 加载站点证书列表（返回空 Vec 而非 Err，调用方自行处理空预期）
+///
+/// ACME 模式：按域名查证书文件，不存在时自签名占位（对标 Caddy）——保证端口始终能 bind
+fn build_certified_keys(tls: &TlsConfig, server_names: &[String]) -> Vec<rustls::sign::CertifiedKey> {
     if tls.acme {
-        // ACME 模式：只有一张证书
-        let domain = tls.acme_email.as_deref().unwrap_or("default");
-        let ck = load_certified_key_from_path(&acme_cert_path(domain), &acme_key_path(domain))?;
-        return Ok(vec![ck]);
+        // ACME 模式：每个域名独立存储证书，取第一个非通配符域名作为主域名
+        let domain = server_names.iter()
+            .find(|d| !d.starts_with("*."))
+            .or_else(|| server_names.first())
+            .map(|s| s.as_str())
+            .unwrap_or("localhost");
+
+        let cert_path = acme_cert_path(domain);
+        let key_path  = acme_key_path(domain);
+
+        if cert_path.exists() && key_path.exists() {
+            match load_certified_key_from_path(&cert_path, &key_path) {
+                Ok(ck) => {
+                    info!("TLS 证书加载成功: {}", cert_path.display());
+                    return vec![ck];
+                }
+                Err(e) => warn!("ACME 证书读取失败，将用自签名证书占位 ({}): {}", domain, e),
+            }
+        }
+
+        // 证书尚未就绪 / 读取失败：生成自签名证书占位，连接会收到证书警告但不会 502
+        // ACME 申请成功后由 acme_renewal_loop 热重载真实证书
+        warn!("站点 {:?} ACME 证书尚未就绪，用自签名证书临时占位（域名: {}），申请成功后会自动热重载", server_names, domain);
+        match generate_self_signed_key(domain) {
+            Ok(ck) => return vec![ck],
+            Err(e) => {
+                error!("生成自签名证书失败 ({}): {}", domain, e);
+                return vec![];
+            }
+        }
     }
 
     if !tls.certs.is_empty() {
@@ -1024,17 +1054,46 @@ fn build_certified_keys(tls: &TlsConfig) -> Result<Vec<rustls::sign::CertifiedKe
                 Err(e) => warn!("跳过证书 {}: {}", pair.cert.display(), e),
             }
         }
-        if keys.is_empty() {
-            bail!("certs 列表中没有可用的证书");
-        }
-        return Ok(keys);
+        return keys;
     }
 
     // 单证书兼容模式
-    let cert = tls.cert.as_ref().context("TLS 需要指定 cert 路径")?;
-    let key  = tls.key.as_ref().context("TLS 需要指定 key 路径")?;
-    let ck = load_certified_key_from_path(cert, key)?;
-    Ok(vec![ck])
+    let cert = match tls.cert.as_ref() {
+        Some(p) => p,
+        None => { warn!("TLS 需要指定 cert 路径"); return vec![]; }
+    };
+    let key = match tls.key.as_ref() {
+        Some(p) => p,
+        None => { warn!("TLS 需要指定 key 路径"); return vec![]; }
+    };
+    match load_certified_key_from_path(cert, key) {
+        Ok(ck) => vec![ck],
+        Err(e) => { warn!("证书加载失败: {}", e); vec![] }
+    }
+}
+
+/// 生成自签名 CertifiedKey（不是 ServerConfig），ACME 占位用
+fn generate_self_signed_key(domain: &str) -> Result<rustls::sign::CertifiedKey> {
+    use rustls::crypto::ring as ring_crypto;
+
+    let subject_alt_names = if domain.is_empty() {
+        vec!["localhost".to_string()]
+    } else {
+        vec![domain.to_string()]
+    };
+
+    let cert = rcgen::generate_simple_self_signed(subject_alt_names)
+        .context("生成自签名证书失败")?;
+
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())
+    );
+
+    let signing_key = ring_crypto::sign::any_supported_type(&key_der)
+        .context("自签名私鑰不支持")?;
+
+    Ok(rustls::sign::CertifiedKey::new(vec![cert_der], signing_key))
 }
 
 /// 从文件路径加载单张证书

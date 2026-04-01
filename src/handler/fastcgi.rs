@@ -114,7 +114,7 @@ pub async fn handle_sweety(
                 for (k, v) in &entry.headers {
                     if let (Ok(name), Ok(val)) = (
                         HeaderName::from_bytes(k.as_bytes()),
-                        HeaderValue::from_str(v),
+                        HeaderValue::from_bytes(v.as_bytes()),
                     ) {
                         resp.headers_mut().append(name, val);
                     }
@@ -140,30 +140,36 @@ pub async fn handle_sweety(
         FcgiAddr::Tcp(format!("{}:{}", host, port))
     };
 
-    // ── 提取请求信息 ──────────────────────────────────────────────────────
-    // 全部用 &str 引用，避免每请求的堆分配
+    // ── 连接级信息 ────────────────────────────────────────────────────────
+    let is_https  = ctx.req().body().is_tls();
+    let peer      = ctx.req().body().socket_addr();
+    let peer_ip   = peer.ip().to_string();
+    let peer_port = peer.port().to_string();
+
+    // ── 请求行信息 ────────────────────────────────────────────────────────
     let method   = ctx.req().method().as_str();
     let uri      = ctx.req().uri();
-    let path_qs  = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let req_uri  = path_qs;  // CGI REQUEST_URI
     let path_raw = uri.path();
     let query    = uri.query().unwrap_or("");
-    let peer     = ctx.req().body().socket_addr();
-    let peer_ip  = peer.ip().to_string();  // IP 必须 owned
-    let peer_port= peer.port().to_string(); // 端口必须 owned
+    let req_uri  = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
-    // HTTP/2 下没有 Host 头，:authority 伪头在 uri.authority() 里
-    let host_hdr_owned: String = ctx.req().uri().authority()
+    // ── Host / SERVER_NAME / SERVER_PORT ─────────────────────────────────
+    // HTTP/2 用 :authority 伪头，HTTP/1.1 用 Host 头，统一从 uri.authority() 优先读
+    let host_hdr: String = uri.authority()
         .map(|a| a.as_str().to_string())
-        .or_else(|| ctx.req().headers().get("host").and_then(|v| v.to_str().ok()).map(|s| s.to_string()))
+        .or_else(|| ctx.req().headers().get("host")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()))
         .unwrap_or_default();
-    let host_hdr = host_hdr_owned.as_str();
-    // 一次 rsplit_once 同时得到 host 和 port，保持引用避免堆分配
-    let (host_name, host_port_str): (&str, &str) = if let Some((h, p)) = host_hdr.rsplit_once(':') {
-        (h, p)
-    } else {
-        (host_hdr, "80")
-    };
+    // rsplit_once(':') 分离 host 和 port；不带端口时按协议填默认值
+    let (server_name, server_port): (&str, &str) =
+        if let Some((h, p)) = host_hdr.rsplit_once(':') {
+            (h, p)
+        } else if is_https {
+            (host_hdr.as_str(), "443")
+        } else {
+            (host_hdr.as_str(), "80")
+        };
 
     // ── 站点 root ─────────────────────────────────────────────────────────
     let root = match location.root.as_ref().or(site.root.as_ref()) {
@@ -171,131 +177,127 @@ pub async fn handle_sweety(
         None => return fcgi_error(StatusCode::INTERNAL_SERVER_ERROR, "FastCGI: 未配置 root 目录"),
     };
 
-    // ── SCRIPT_FILENAME / SCRIPT_NAME / PATH_INFO 解析 ───────────────────
-    // 优先使用 try_files 解析到的绝对路径（最准确）；
-    // 否则从请求路径推断（直接访问 .php 时）。
+    // ── SCRIPT_FILENAME / SCRIPT_NAME / PATH_INFO ────────────────────────
+    // try_files 已解析出绝对路径时直接用；否则从 URI 路径推断（直接访问 .php）
     let (script_filename, script_name, path_info) = if let Some(abs) = resolved_script {
         let abs_str = abs.to_string_lossy().into_owned();
-        // SCRIPT_NAME 是相对 root 的 URL 路径
-        let rel = abs_str.strip_prefix(root.trim_end_matches('/')).unwrap_or(&abs_str);
-        let sname = rel.replace('\\', "/");
-        (abs_str, sname, "".to_string())
+        let sname = abs_str.strip_prefix(root.trim_end_matches('/'))
+            .unwrap_or(&abs_str)
+            .replace('\\', "/");
+        (abs_str, sname, String::new())
     } else {
         let (sname, pinfo) = split_script_path(path_raw);
-        let filename = format!("{}{}", root.trim_end_matches('/'), sname);
-        (filename, sname.to_string(), pinfo.to_string())
+        (format!("{}{}", root.trim_end_matches('/'), sname), sname.to_string(), pinfo.to_string())
     };
 
-    // ── 读取请求体 ────────────────────────────────────────────────────────
-    // 使用 Content-Length 上限（等价 Nginx fastcgi_read_timeout）
-    let max_body = {
-        let mb = ctx.state().cfg.global.client_max_body_size;
-        (mb as u64) * 1024 * 1024
-    };
+    // ── 请求体 ────────────────────────────────────────────────────────────
+    let max_body = (ctx.state().cfg.global.client_max_body_size as u64) * 1024 * 1024;
     let content_length = ctx.req().headers()
         .get(sweety_web::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-    let content_type = ctx.req().headers()
-        .get(sweety_web::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");  // 保持 &str 引用，不分配堆内存
-
-    // 超出限制时拒绝，避免 CONTENT_LENGTH 与实际 body 不一致
     if content_length > max_body && max_body > 0 {
         return fcgi_error(StatusCode::PAYLOAD_TOO_LARGE, "请求体超过 client_max_body_size 限制");
     }
-
-    // 读取请求体（与 reverse_proxy 相同方式：ctx.body_borrow_mut() + StreamExt）
+    let content_type = ctx.req().headers()
+        .get(sweety_web::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let req_body: Vec<u8> = if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
         use futures_util::StreamExt;
-        let mut collected = Vec::with_capacity(content_length.min(16 * 1024 * 1024) as usize);
+        let mut buf = Vec::with_capacity(content_length.min(16 * 1024 * 1024) as usize);
         let mut body = ctx.body_borrow_mut();
         while let Some(chunk) = body.next().await {
             match chunk {
-                Ok(b) => collected.extend_from_slice(b.as_ref()),
+                Ok(b) => buf.extend_from_slice(b.as_ref()),
                 Err(_) => break,
             }
         }
-        collected
+        buf
     } else {
         Vec::new()
     };
 
-    // ── 判断是否 HTTPS（用于 HTTPS=on 和 SERVER_PORT）───────────────────
-    let is_https = {
-        // 直接用框架层在 TLS accept 时注入的连接级标记，零推断
-        ctx.req().body().is_tls()
-    };
-
-    // SERVER_PORT：HTTPS 时无端口用 443，HTTP 用解析到的端口（均为 &str 零分配）
-    let server_port: &str = if is_https && host_port_str == "80" { "443" } else { host_port_str };
-
-    // REMOTE_ADDR：反代后优先读 X-Real-IP，再读 X-Forwarded-For 第一个 IP
-    // 与 Nginx fastcgi_param REMOTE_ADDR $remote_addr 配合 realip 模块效果一致
-    let real_ip = ctx.req().headers()
+    // ── REMOTE_ADDR：优先 X-Real-IP，再 X-Forwarded-For，最后直连 IP ─────
+    let remote_addr = ctx.req().headers()
         .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
-        .or_else(|| {
-            ctx.req().headers()
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(|s| s.trim().to_string())
-        })
+        .or_else(|| ctx.req().headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_string()))
         .unwrap_or_else(|| peer_ip.clone());
 
-    // ── 构建 CGI 参数（RFC 3875）────────────────────────────────────
-    // 预分配：18 个固定参数 + 请求头数量
-    let header_cnt = ctx.req().headers().len();
-    let mut params: Vec<(String, String)> = Vec::with_capacity(18 + header_cnt + 2);
+    // ── CGI 参数（对标 Nginx /etc/nginx/fastcgi_params）─────────────────
+    // 固定参数 + HTTP_* 动态头，预分配避免 realloc
+    let mut params: Vec<(String, String)> = Vec::with_capacity(20 + ctx.req().headers().len());
     params.extend([
-        ("SCRIPT_FILENAME".into(), script_filename),
-        ("SCRIPT_NAME".into(),     script_name.to_string()),
-        ("PATH_INFO".into(),       path_info.to_string()),
-        ("PATH_TRANSLATED".into(), format!("{}{}", root.trim_end_matches('/'), path_info)),
-        ("REQUEST_METHOD".into(),  method.to_owned()),
-        ("REQUEST_URI".into(),     req_uri.to_owned()),
-        ("QUERY_STRING".into(),    query.to_owned()),
-        ("SERVER_SOFTWARE".into(), "Sweety/0.1".into()),
-        ("SERVER_PROTOCOL".into(), "HTTP/1.1".into()),
-        ("GATEWAY_INTERFACE".into(),"CGI/1.1".into()),
-        ("SERVER_NAME".into(),     host_name.to_owned()),
-        ("SERVER_PORT".into(),     server_port.to_owned()),
-        ("REMOTE_ADDR".into(),     real_ip.clone()),
-        ("REMOTE_HOST".into(),     real_ip),
-        ("REMOTE_PORT".into(),     peer_port),
-        ("DOCUMENT_ROOT".into(),   root.clone()),
-        // CONTENT_TYPE / CONTENT_LENGTH 是 POST 必须参数
-        ("CONTENT_TYPE".into(),    content_type.to_owned()),
-        ("CONTENT_LENGTH".into(),  itoa::Buffer::new().format(req_body.len()).to_string()),
+        // RFC 3875 必须参数
+        ("GATEWAY_INTERFACE".into(), "CGI/1.1".into()),
+        ("SERVER_SOFTWARE".into(),   "Sweety/0.1".into()),
+        ("SERVER_PROTOCOL".into(),   "HTTP/1.1".into()),
+        ("SERVER_NAME".into(),       server_name.to_owned()),
+        ("SERVER_PORT".into(),       server_port.to_owned()),
+        ("REQUEST_METHOD".into(),    method.to_owned()),
+        ("REQUEST_URI".into(),       req_uri.to_owned()),
+        ("DOCUMENT_URI".into(),      path_raw.to_owned()),
+        ("QUERY_STRING".into(),      query.to_owned()),
+        ("DOCUMENT_ROOT".into(),     root.clone()),
+        ("SCRIPT_FILENAME".into(),   script_filename),
+        ("SCRIPT_NAME".into(),       script_name),
+        ("PATH_INFO".into(),         path_info.clone()),
+        ("PATH_TRANSLATED".into(),   format!("{}{}", root.trim_end_matches('/'), path_info)),
+        ("REMOTE_ADDR".into(),       remote_addr.clone()),
+        ("REMOTE_HOST".into(),       remote_addr),
+        ("REMOTE_PORT".into(),       peer_port),
+        // POST 必须参数
+        ("CONTENT_TYPE".into(),      content_type.to_owned()),
+        ("CONTENT_LENGTH".into(),    itoa::Buffer::new().format(req_body.len()).to_string()),
     ]);
 
-    // HTTPS=on（WordPress is_ssl()、其他框架判断协议依赖此变量）
+    // HTTPS=on —— 等价 Nginx `fastcgi_param HTTPS $https if_not_empty`
     if is_https {
         params.push(("HTTPS".into(), "on".into()));
     }
 
-    // 将所有 HTTP 请求头转换为 HTTP_* 变量（等价 Nginx fastcgi_param HTTP_* ...）
-    // Cookie、Authorization、Accept、Referer、User-Agent 等全部透传
+    // HTTP_HOST —— HTTP/2 的 :authority 不出现在 headers() 迭代中，必须显式补
+    if !host_hdr.is_empty() {
+        params.push(("HTTP_HOST".into(), host_hdr.clone()));
+    }
+
+    // HTTP/2 Cookie 合并：RFC 7540 §8.1.2.5 规定 HTTP/2 把每个 cookie pair 拆成独立 header 条目
+    // PHP-FPM 期望 HTTP_COOKIE 是分号分隔的完整字符串（等价 HTTP/1.1 行为）
+    // 必须先收集所有 cookie 头合并，否则 $_COOKIE 只会有最后一个值
+    let http_cookie: String = ctx.req().headers().get_all("cookie")
+        .iter()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !http_cookie.is_empty() {
+        params.push(("HTTP_COOKIE".into(), http_cookie));
+    }
+
+    // HTTP_* —— 将其余请求头转为 CGI 变量，等价 Nginx `fastcgi_param HTTP_* ...`
+    // 跳过已单独处理的头，避免重复
+    // Nginx 行为：header value 按字节原样传，不做 UTF-8 验证，非法字节也不丢弃
+    // 用 String::from_utf8_lossy 而非 to_str()，保证头不会因非 ASCII 字节被静默丢弃
     for (name, value) in ctx.req().headers().iter() {
-        let key_str = name.as_str();
-        // 跳过已经单独处理的头（eq_ignore_ascii_case 零堆分配）
-        if key_str.eq_ignore_ascii_case("content-type")
-            || key_str.eq_ignore_ascii_case("content-length")
+        let k = name.as_str();
+        if k.eq_ignore_ascii_case("host")
+            || k.eq_ignore_ascii_case("cookie")       // 已在上方合并处理
+            || k.eq_ignore_ascii_case("content-type")
+            || k.eq_ignore_ascii_case("content-length")
         { continue; }
-        if let Ok(val_str) = value.to_str() {
-            // 用 push_str 替代 format! 减少堆分配
-            let mut http_key = String::with_capacity(5 + key_str.len());
-            http_key.push_str("HTTP_");
-            for c in key_str.chars() {
-                if c == '-' { http_key.push('_'); }
-                else { http_key.extend(c.to_uppercase()); }
-            }
-            params.push((http_key, val_str.to_string()));
+        let mut key = String::with_capacity(5 + k.len());
+        key.push_str("HTTP_");
+        for c in k.chars() {
+            if c == '-' { key.push('_'); } else { key.extend(c.to_uppercase()); }
         }
+        let v = String::from_utf8_lossy(value.as_bytes()).into_owned();
+        params.push((key, v));
     }
 
     // ── 发送 FastCGI 请求（连接池 + 超时控制）─────────────────────────────
@@ -658,7 +660,7 @@ async fn stream_remaining(
     for (k, v) in &headers {
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
+            HeaderValue::from_bytes(v.as_bytes()),
         ) {
             resp.headers_mut().append(name, val);
         }
@@ -688,7 +690,7 @@ fn make_complete_response(status: u16, headers: Vec<(String, String)>, body: Vec
     for (k, v) in &headers {
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
+            HeaderValue::from_bytes(v.as_bytes()),
         ) {
             resp.headers_mut().append(name, val);
         }
@@ -842,7 +844,7 @@ fn parse_fcgi_response(stdout: Vec<u8>) -> WebResponse {
     for (k, v) in &response_headers {
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
+            HeaderValue::from_bytes(v.as_bytes()),
         ) {
             resp.headers_mut().append(name, val);
         }
@@ -854,7 +856,7 @@ fn parse_fcgi_response(stdout: Vec<u8>) -> WebResponse {
     }
 
     // 设置 Content-Length（PHP 已知输出长度时有利于 keep-alive 复用）
-    if let Ok(v) = HeaderValue::from_str(&body_len.to_string()) {
+    if let Ok(v) = HeaderValue::from_bytes(body_len.to_string().as_bytes()) {
         resp.headers_mut().insert(
             sweety_web::http::header::CONTENT_LENGTH,
             v,

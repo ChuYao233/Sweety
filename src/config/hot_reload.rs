@@ -233,8 +233,13 @@ fn apply_diff(old: &AppConfig, new: &AppConfig, ctx: &HotReloadContext) {
 /// 将站点证书插入/更新到该站点的各 TLS 端口对应的 SniResolver
 fn upsert_site_to_resolvers(site: &SiteConfig, ctx: &HotReloadContext) {
     let Some(tls) = &site.tls else { return };
-    let keys: Vec<rustls::sign::CertifiedKey> = match TlsManager::build_certified_keys_pub(tls) {
-        Ok(k) => k,
+    let keys = TlsManager::build_certified_keys_pub(tls, &site.server_name);
+    let keys = match keys {
+        Ok(k) if !k.is_empty() => k,
+        Ok(_) => {
+            warn!("热重载证书为空（站点 '{}'），跳过", site.name);
+            return;
+        }
         Err(e) => {
             warn!("热重载证书加载失败（站点 '{}'）: {}", site.name, e);
             return;
@@ -277,7 +282,7 @@ fn preflight_tls(cfg: &AppConfig) -> anyhow::Result<()> {
 
         // 验证单证书模式（cert + key）
         if tls.cert.is_some() || tls.key.is_some() {
-            TlsManager::build_certified_keys_pub(tls)
+            let keys = TlsManager::build_certified_keys_pub(tls, &site.server_name)
                 .map_err(|e| anyhow::anyhow!(
                     "站点 '{}' TLS 证书无效\n  cert: {}\n  key:  {}\n  原因: {:#}",
                     site.name,
@@ -285,6 +290,9 @@ fn preflight_tls(cfg: &AppConfig) -> anyhow::Result<()> {
                     tls.key.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
                     e
                 ))?;
+            if keys.is_empty() {
+                return Err(anyhow::anyhow!("站点 '{}' TLS 证书为空", site.name));
+            }
         }
 
         // 验证多证书列表（certs[]）
@@ -296,12 +304,15 @@ fn preflight_tls(cfg: &AppConfig) -> anyhow::Result<()> {
                 acme:  false,
                 ..tls.clone()
             };
-            TlsManager::build_certified_keys_pub(&single_tls)
+            let keys = TlsManager::build_certified_keys_pub(&single_tls, &site.server_name)
                 .map_err(|e| anyhow::anyhow!(
                     "站点 '{}' 第 {} 张证书无效\n  cert: {}\n  key:  {}\n  原因: {:#}",
                     site.name, i + 1,
                     c.cert.display(), c.key.display(), e
                 ))?;
+            if keys.is_empty() {
+                return Err(anyhow::anyhow!("站点 '{}' 第 {} 张证书为空", site.name, i + 1));
+            }
         }
     }
     Ok(())

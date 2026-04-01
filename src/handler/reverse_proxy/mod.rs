@@ -15,7 +15,6 @@ pub mod response;
 pub mod tls_client;
 pub mod ws_proxy;
 
-use futures_util::StreamExt;
 use tracing::error;
 use sweety_web::{
     http::{StatusCode, WebResponse},
@@ -130,26 +129,11 @@ pub async fn handle_sweety(
         client_headers.push((h.name.clone(), val));
     }
 
-    // ── 读取请求体（POST/PUT/PATCH 等）──────────────────────────────────
-    // 不能只依赖 Content-Length（H2 下无此头，chunked 也无），直接读 body stream
-    let request_body: Vec<u8> = if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
-        let cap = ctx.req().headers()
-            .get(sweety_web::http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-        let mut bytes = Vec::with_capacity(cap);
-        let mut body = ctx.body_borrow_mut();
-        while let Some(chunk) = body.next().await {
-            match chunk {
-                Ok(b) => bytes.extend_from_slice(b.as_ref()),
-                Err(_) => break,
-            }
-        }
-        bytes
-    } else {
-        Vec::new()
-    };
+    // ── 请求体流式透传（POST/PUT/PATCH/DELETE）────────────────────────────
+    // 不全量 collect 到内存：大文件上传零内存拷贝，chunked body 直接 pipe 给上游
+    // 100-continue 处理、流式写上游均在 conn::forward_request 内完成
+    // GET/HEAD 等无 body 方法：take_body_ref() 返回 RequestBody::None，conn 层会跳过发送
+    let request_body = ctx.take_body_ref();
 
     // ── Location 配置 ─────────────────────────────────────────────────────
     let strip_cookie_secure  = location.strip_cookie_secure;
@@ -204,19 +188,21 @@ pub async fn handle_sweety(
     } else {
         // 将 proxy_cache 引用传入 conn 层，在有完整 body bytes 时导入缓存
         let cache_ref = proxy_cache.as_ref().map(|c| (c, &cache_key));
-        // retry 循环：失败时重新选节点重试，第一次失败不算在 retry 次数内
+        // retry 循环：上游级别重试（节点故障），conn::forward_request 内部处理 idle 连接重试
+        // body 流只能消耗一次，上游级别重试只在首次（body 尚未消费）时有效
         let max_attempts = 1 + pool.retry as usize;
         let mut last_err = String::new();
         let mut resp_opt: Option<sweety_web::http::WebResponse> = None;
+        let mut body_for_retry = Some(request_body);
 
         'retry: for attempt in 0..max_attempts {
             if attempt > 0 {
+                // body 已消费则无法重试（大文件上传场景）
+                if body_for_retry.is_none() { break 'retry; }
                 if pool.retry_timeout > 0 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(pool.retry_timeout)).await;
                 }
-                // 重试时重新选节点（避免重选到已失败的节点）
                 if let Some(new_node) = pool.pick(Some(&client_ip_str)) {
-                    // 用新节点覆盖（内层用 node 变量嵌套，这里只记录日志）
                     tracing::debug!("反向代理第 {} 次重试，节点: {}", attempt, new_node.addr);
                 }
             }
@@ -226,7 +212,7 @@ pub async fn handle_sweety(
                 &node.addr, method, path, upstream_host,
                 node.tls, &node.tls_sni, node.tls_insecure,
                 &client_headers, client_ip_str_ref,
-                &request_body,
+                body_for_retry.take().unwrap_or_default(),
                 strip_cookie_secure, proxy_cookie_domain,
                 proxy_redirect_from, proxy_redirect_to,
                 sub_filter,

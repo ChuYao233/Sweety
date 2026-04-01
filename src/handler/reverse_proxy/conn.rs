@@ -4,11 +4,12 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use futures_util::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::debug;
 use sweety_web::{
-    body::ResponseBody,
+    body::{RequestBody, ResponseBody},
     http::{StatusCode, WebResponse, header::{CONTENT_LENGTH, HeaderValue}},
 };
 
@@ -19,6 +20,7 @@ use super::tls_client::tls_connect;
 use crate::middleware::proxy_cache::{CacheKey, ProxyCache};
 
 /// 向上游转发请求，优先复用连接池里的 idle 连接
+/// body 只能消耗一次；外层 retry 循环已做 take，第一次 attempt 传 Some，重试传 None
 #[allow(clippy::too_many_arguments)]
 pub async fn forward_request(
     pool: &ConnPool,
@@ -31,7 +33,7 @@ pub async fn forward_request(
     tls_insecure: bool,
     extra_headers: &[(String, String)],
     client_ip: &str,
-    body: &[u8],
+    req_body: RequestBody,
     strip_cookie_secure: bool,
     proxy_cookie_domain: Option<&str>,
     proxy_redirect_from: Option<&str>,
@@ -42,21 +44,29 @@ pub async fn forward_request(
     keepalive_requests: u64,
     keepalive_time: u64,
     keepalive_max_idle: usize,
-    // 超时控制（0 = 用默认）
     connect_timeout_secs: u64,
     read_timeout_secs: u64,
     write_timeout_secs: u64,
     // false = 流式透传（不等上游响应体完成即开始转发）
     proxy_buffering: bool,
 ) -> Result<WebResponse> {
-    debug!("转发 {} {} → {} (tls={}, body={}B)",
-        method, path, upstream_addr, use_tls, body.len());
+    debug!("转发 {} {} → {} (tls={})", method, path, upstream_addr, use_tls);
+
+    // 从 extra_headers 提取 Content-Length（如果客户端提供了就透传，否则用 chunked）
+    let known_content_length: Option<u64> = extra_headers.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.parse().ok());
+
+    // 检测 Expect: 100-continue（大文件上传协商）
+    let has_expect_continue = extra_headers.iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("expect") && v.eq_ignore_ascii_case("100-continue"));
 
     let key = PooledConn::key(upstream_addr, use_tls);
 
-    // 尝试从池取 idle 连接，最多重试一次（防止服务端关闭了 idle 连接）
+    // body 用 Option 包装：首次 take() 消费，若 body 未消费则可重试（idle 连接失效场景）
+    let mut body_slot = Some(req_body);
+
     for attempt in 0..2u8 {
-        // (conn, created_at, request_count)
         let (conn, created_at, req_count) = if attempt == 0 {
             match pool.acquire(&key) {
                 Some((c, ca, rc)) => { debug!("复用 idle 连接: {}", upstream_addr); (c, ca, rc) }
@@ -71,12 +81,17 @@ pub async fn forward_request(
             (c, Instant::now(), 0u64)
         };
 
-        match send_recv_pooled(conn, method, path, host, extra_headers, client_ip, body,
+        // take()：消费 body，后续 body_slot = None
+        let body = body_slot.take().unwrap_or_default();
+
+        match send_recv_pooled(conn, method, path, host, extra_headers, client_ip,
+            body,
+            known_content_length, has_expect_continue,
             strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
             sub_filter, proxy_cache, client_proto,
-            read_timeout_secs, write_timeout_secs, proxy_buffering).await
+            read_timeout_secs, write_timeout_secs, proxy_buffering, attempt == 0).await
         {
-            Ok((resp, maybe_conn)) => {
+            Ok((resp, maybe_conn, _body_consumed)) => {
                 if let Some(c) = maybe_conn {
                     pool.release(
                         &key, c,
@@ -86,14 +101,70 @@ pub async fn forward_request(
                 }
                 return Ok(resp);
             }
-            Err(e) if attempt == 0 => {
-                debug!("连接失效，重试: {}", e);
-                continue;
+            Err((e, body_consumed)) => {
+                if attempt == 0 && !body_consumed {
+                    // body 还未消费（请求头阶段失败），可安全重试
+                    debug!("连接失效（body 未消费），重试: {}", e);
+                    continue;
+                }
+                return Err(e);
             }
-            Err(e) => return Err(e),
         }
     }
     unreachable!()
+}
+
+/// 请求体流式写入上游
+/// 支持两种模式：
+/// 1. 已知 Content-Length：直接写 body 块，上游用 Content-Length 模式接收
+/// 2. 未知长度（chunked）：每块加 `<hex>\r\n<data>\r\n`，结束时写 `0\r\n\r\n`
+async fn pipe_request_body<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    mut body: RequestBody,
+    use_chunked: bool,
+    write_timeout: Duration,
+) -> std::io::Result<()> {
+    loop {
+        // 逐块读取（每块加逐包超时）
+        let chunk = tokio::time::timeout(write_timeout, body.next()).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "请求体读取超时"))?;
+        match chunk {
+            None => break,
+            Some(Err(e)) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string())),
+            Some(Ok(bytes)) => {
+                if bytes.is_empty() { continue; }
+                if use_chunked {
+                    // chunked 编码：`<hex_len>\r\n<data>\r\n`
+                    let size_line = format!("{:x}\r\n", bytes.len());
+                    tokio::time::timeout(write_timeout, async {
+                        writer.write_all(size_line.as_bytes()).await?;
+                        writer.write_all(&bytes).await?;
+                        writer.write_all(b"\r\n").await
+                    }).await
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "写上游超时"))?
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("写上游: {e}")))?;
+                } else {
+                    tokio::time::timeout(write_timeout, writer.write_all(&bytes)).await
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "写上游超时"))?
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("写上游: {e}")))?;
+                }
+            }
+        }
+    }
+    if use_chunked {
+        // 终止 chunk
+        tokio::time::timeout(write_timeout, async {
+            writer.write_all(b"0\r\n\r\n").await?;
+            writer.flush().await
+        }).await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "写上游超时"))?
+        .map_err(|e| std::io::Error::new(e.kind(), format!("flush 上游: {e}")))?;
+    } else {
+        tokio::time::timeout(write_timeout, writer.flush()).await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "flush 超时"))?
+        .map_err(|e| std::io::Error::new(e.kind(), format!("flush 上游: {e}")))?;
+    }
+    Ok(())
 }
 
 /// 新建一个上游连接
@@ -125,8 +196,13 @@ async fn new_conn(
     }
 }
 
-/// HTTP/1.1 请求发送 + 响应读取（支持 chunked、Content-Length、gzip 透传）
-/// 返回：(响应, Option<连接>)，连接为 Some 表示可归还到池（上游保持 keep-alive）
+/// HTTP/1.1 请求发送 + 响应读取（支持 chunked 流式请求体、100-Continue、逐包超时）
+///
+/// 返回：
+/// - `Ok((响应, Option<连接>, body_consumed))`
+/// - `Err((error, body_consumed))`
+///
+/// `body_consumed = true` 表示请求体已开始发送，不可重试。
 #[allow(clippy::too_many_arguments)]
 async fn send_recv_pooled(
     conn: PooledConn,
@@ -135,7 +211,9 @@ async fn send_recv_pooled(
     host: &str,
     extra_headers: &[(String, String)],
     client_ip: &str,
-    req_body: &[u8],
+    req_body: RequestBody,
+    known_content_length: Option<u64>,
+    has_expect_continue: bool,
     strip_cookie_secure: bool,
     proxy_cookie_domain: Option<&str>,
     proxy_redirect_from: Option<&str>,
@@ -146,64 +224,130 @@ async fn send_recv_pooled(
     read_timeout_secs: u64,
     write_timeout_secs: u64,
     proxy_buffering: bool,
-) -> Result<(WebResponse, Option<PooledConn>)> {
+    // 是否允许在发送请求头失败时回退（第一次尝试 idle 连接时为 true）
+    allow_retry_on_header_fail: bool,
+) -> Result<(WebResponse, Option<PooledConn>, bool), (anyhow::Error, bool)> {
     let read_timeout  = Duration::from_secs(if read_timeout_secs  > 0 { read_timeout_secs  } else { 60 });
     let write_timeout = Duration::from_secs(if write_timeout_secs > 0 { write_timeout_secs } else { 60 });
-    // ── 构造请求头（keep-alive）──────────────────────────────────────────────
-    // 预分配容量：请求行 + host + 过滤后的头 + 4 个固定头 + \r\n
+
+    // 判断是否需要发送请求体（GET/HEAD/OPTIONS 等通常无 body）
+    let has_body = matches!(method, "POST" | "PUT" | "PATCH" | "DELETE");
+    // 未知长度时用 chunked 编码，已知长度时直接写 Content-Length
+    let use_chunked = has_body && known_content_length.is_none();
+
+    // ── 构造请求头 ──────────────────────────────────────────────────────────
     let mut req = String::with_capacity(
         method.len() + path.len() + host.len() + extra_headers.len() * 32 + 128
     );
     req.push_str(method); req.push(' '); req.push_str(path);
     req.push_str(" HTTP/1.1\r\nHost: "); req.push_str(host); req.push_str("\r\n");
     for (k, v) in extra_headers {
-        // content-length 由下方统一设置，避免与 extra_headers 里的重复
-        if k.eq_ignore_ascii_case("content-length") { continue; }
+        // content-length / transfer-encoding / expect 由下方统一设置
+        if k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("transfer-encoding")
+            || k.eq_ignore_ascii_case("expect") {
+            continue;
+        }
         req.push_str(k); req.push_str(": "); req.push_str(v); req.push_str("\r\n");
     }
     req.push_str("X-Real-IP: "); req.push_str(client_ip); req.push_str("\r\n");
     req.push_str("X-Forwarded-For: "); req.push_str(client_ip); req.push_str("\r\n");
-    req.push_str("X-Forwarded-Proto: "); req.push_str(client_proto); req.push_str("\r\nConnection: keep-alive\r\nContent-Length: ");
-    req.push_str(itoa::Buffer::new().format(req_body.len())); req.push_str("\r\n\r\n");
+    req.push_str("X-Forwarded-Proto: "); req.push_str(client_proto); req.push_str("\r\nConnection: keep-alive\r\n");
+    if has_body {
+        if use_chunked {
+            req.push_str("Transfer-Encoding: chunked\r\n");
+        } else if let Some(len) = known_content_length {
+            req.push_str("Content-Length: ");
+            req.push_str(itoa::Buffer::new().format(len));
+            req.push_str("\r\n");
+        }
+        // 100-Continue 协商：只有 has_body 时才有意义
+        if has_expect_continue {
+            req.push_str("Expect: 100-continue\r\n");
+        }
+    }
+    req.push_str("\r\n");
 
-    debug!("→ {} {} Host:{} body={}B", method, path, host, req_body.len());
+    debug!("→ {} {} Host:{} chunked={} expect_continue={}", method, path, host, use_chunked, has_expect_continue);
 
-    // HTTP/1.1 串行：先写请求，再读响应
-    // BufReader::new(conn) 直接 move conn，后续流式路径可直接 move buf 进 task
     let mut conn = conn;
-    // 合并请求头+body 为单次发送，减少 syscall（对标 Nginx writev 行为）
-    let send_result = tokio::time::timeout(write_timeout, async {
-        if req_body.is_empty() {
-            // 无 body：直接写头部
-            conn.write_all(req.as_bytes()).await?;
-        } else {
-            // 有 body：头部+body 一次性写出，内核层面可能合并为单个 TCP 段
-            conn.write_all(req.as_bytes()).await?;
-            conn.write_all(req_body).await?;
-        }
+
+    // ── 发送请求头 ──────────────────────────────────────────────────────────
+    let header_send_result = tokio::time::timeout(write_timeout, async {
+        conn.write_all(req.as_bytes()).await?;
         conn.flush().await
-    }).await
-    .map_err(|_| ProxyError::WriteTimeout { addr: String::new(), timeout_secs: write_timeout.as_secs() })
-    .and_then(|r| r.map_err(|e| ProxyError::from_io("", e, IoContext::Write)))?;
-    let _ = send_result;
-
-    // ── 读取响应头（BufReader move conn，不借用）─────────────────────────
-    let mut buf = BufReader::new(conn);
-
-    let mut status_line = String::new();
-    match tokio::time::timeout(read_timeout, buf.read_line(&mut status_line)).await {
-        Err(_) => return Err(ProxyError::TtfbTimeout { addr: String::new() }.into()),
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof && !status_line.is_empty() => {}
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset
-                   || e.kind() == std::io::ErrorKind::BrokenPipe => {
-            return Err(ProxyError::ConnReset { addr: String::new() }.into());
+    }).await;
+    match header_send_result {
+        Err(_) | Ok(Err(_)) if allow_retry_on_header_fail => {
+            // 请求头发送失败，body 未消费，可重试
+            let e = anyhow::anyhow!(ProxyError::WriteTimeout { addr: String::new(), timeout_secs: write_timeout.as_secs() });
+            return Err((e, false));
         }
-        Ok(Err(e)) => return Err(ProxyError::from_io("", e, IoContext::Read).into()),
-        Ok(Ok(_)) => {}
+        Err(_) => return Err((anyhow::anyhow!(ProxyError::WriteTimeout { addr: String::new(), timeout_secs: write_timeout.as_secs() }), false)),
+        Ok(Err(e)) => return Err((ProxyError::from_io("", e, IoContext::Write).into(), false)),
+        Ok(Ok(())) => {}
     }
 
-    let status_code = parse_status_code(&status_line);
-    tracing::debug!("上游 {} ← {} {}", status_code, method, path);
+    // ── 发送请求体 + 处理 100-Continue（RFC 7231 §5.1.1）────────────────────
+    // 正确流程：发头 → BufReader::new(conn) → 读状态行
+    //   若 100  → 读掉空行 → pipe body → 读真实状态行
+    //   若非100 → has_expect_continue=true 说明上游直接拒绝（417等），不发 body
+    //   无 Expect → 先 pipe body → 再读状态行
+    let (mut buf, status_code) = if has_body && has_expect_continue {
+        // 发头后等上游决策，BufReader 在此建立，后续所有读取都通过它
+        let mut buf = BufReader::new(conn);
+        let mut status_line = String::new();
+        match tokio::time::timeout(Duration::from_secs(5), buf.read_line(&mut status_line)).await {
+            Err(_) | Ok(Err(_)) => return Err((ProxyError::TtfbTimeout { addr: String::new() }.into(), false)),
+            Ok(Ok(_)) => {}
+        }
+        let code = parse_status_code(&status_line);
+        if code == 100 {
+            // 读掉 "\r\n" 空行
+            let mut blank = String::new();
+            let _ = buf.read_line(&mut blank).await;
+            // 现在发 body
+            if let Err(e) = pipe_request_body(buf.get_mut(), req_body, use_chunked, write_timeout).await {
+                return Err((e.into(), true));
+            }
+            // 读真实状态行
+            status_line.clear();
+            match tokio::time::timeout(read_timeout, buf.read_line(&mut status_line)).await {
+                Err(_) => return Err((ProxyError::TtfbTimeout { addr: String::new() }.into(), true)),
+                Ok(Err(e)) => return Err((ProxyError::from_io("", e, IoContext::Read).into(), true)),
+                Ok(Ok(_)) => {}
+            }
+            let real_code = parse_status_code(&status_line);
+            tracing::debug!("上游 100→{} ← {} {}", real_code, method, path);
+            (buf, real_code)
+        } else {
+            // 上游直接拒绝（417 等），不发 body
+            tracing::debug!("上游拒绝 {} ← {} {} (expect_continue)", code, method, path);
+            (buf, code)
+        }
+    } else {
+        // 无 Expect：先 pipe body（若有），再建 BufReader 读响应
+        if has_body {
+            if let Err(e) = pipe_request_body(&mut conn, req_body, use_chunked, write_timeout).await {
+                return Err((e.into(), true));
+            }
+        }
+        let mut buf = BufReader::new(conn);
+        let mut status_line = String::new();
+        match tokio::time::timeout(read_timeout, buf.read_line(&mut status_line)).await {
+            Err(_) => return Err((ProxyError::TtfbTimeout { addr: String::new() }.into(), has_body)),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof && !status_line.is_empty() => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset
+                       || e.kind() == std::io::ErrorKind::BrokenPipe => {
+                return Err((ProxyError::ConnReset { addr: String::new() }.into(), has_body));
+            }
+            Ok(Err(e)) => return Err((ProxyError::from_io("", e, IoContext::Read).into(), has_body)),
+            Ok(Ok(_)) => {}
+        }
+        let code = parse_status_code(&status_line);
+        tracing::debug!("上游 {} ← {} {}", code, method, path);
+        (buf, code)
+    };
 
     let mut resp_content_length: Option<usize> = None;
     let mut resp_is_chunked = false;
@@ -216,7 +360,7 @@ async fn send_recv_pooled(
         match buf.read_line(&mut line).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err((e.into(), true)),
         }
         let trimmed = line.trim();
         if trimmed.is_empty() { break; }
@@ -249,7 +393,7 @@ async fn send_recv_pooled(
             *resp.status_mut() = s;
             apply_response_headers(&mut resp, &response_headers,
                 strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
-            return Ok((resp, maybe_conn));
+            return Ok((resp, maybe_conn, true));
         }
     }
 
@@ -269,12 +413,15 @@ async fn send_recv_pooled(
             *resp.status_mut() = http_status;
             apply_response_headers(&mut resp, &response_headers,
                 strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
-            return Ok((resp, None));
+            return Ok((resp, None, true));
         }
 
         // 用 bounded channel 流式转发：生产者读上游解码后数据，消费者写客户端
         // cap=16：生产者（读上游）和消费者（写客户端）之间缓冲 16 个 chunk
         let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(16);
+        // per-chunk read timeout：等价 Nginx proxy_read_timeout 逐包语义
+        // 每次从上游读取数据的最大等待时间，超时即关闭连接（不是整体响应超时）
+        let per_chunk_timeout = read_timeout;
 
         if resp_is_chunked {
             // chunked 上游：解码后用 BytesMut.freeze() 零拷贝转 Bytes
@@ -283,9 +430,10 @@ async fn send_recv_pooled(
                 let mut size_line = String::new();
                 loop {
                     size_line.clear();
-                    match reader.read_line(&mut size_line).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
+                    // 逐包超时：每个 chunk size 行的读取都有独立超时
+                    match tokio::time::timeout(per_chunk_timeout, reader.read_line(&mut size_line)).await {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(_)) => {}
                     }
                     let size_str = size_line.trim().split(';').next().unwrap_or("0");
                     let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
@@ -295,19 +443,25 @@ async fn send_recv_pooled(
                         break;
                     }
                     // BytesMut 直接读入，freeze() 零拷贝转 Bytes
-                    let mut buf = bytes::BytesMut::with_capacity(chunk_size);
-                    buf.resize(chunk_size, 0);
+                    let mut chunk_buf = bytes::BytesMut::with_capacity(chunk_size);
+                    chunk_buf.resize(chunk_size, 0);
                     let mut offset = 0;
                     while offset < chunk_size {
-                        match reader.read(&mut buf[offset..]).await {
-                            Ok(0) => break,
-                            Ok(n) => offset += n,
-                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                            Err(e) => { let _ = tx.send(Err(e)).await; return; }
+                        // 逐包超时：每次 read 都有独立超时
+                        match tokio::time::timeout(per_chunk_timeout, reader.read(&mut chunk_buf[offset..])).await {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(n)) => offset += n,
+                            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                            Ok(Err(e)) => { let _ = tx.send(Err(e)).await; return; }
+                            Err(_) => {
+                                let e = std::io::Error::new(std::io::ErrorKind::TimedOut, "上游响应体读取超时");
+                                let _ = tx.send(Err(e)).await;
+                                return;
+                            }
                         }
                     }
-                    buf.truncate(offset);
-                    if tx.send(Ok(buf.freeze())).await.is_err() { break; }
+                    chunk_buf.truncate(offset);
+                    if tx.send(Ok(chunk_buf.freeze())).await.is_err() { break; }
                     // 读 chunk 后面的 \r\n
                     let mut crlf = [0u8; 2];
                     let _ = reader.read_exact(&mut crlf).await;
@@ -325,14 +479,20 @@ async fn send_recv_pooled(
                     if remaining == 0 { break; }
                     let to_read = remaining.min(chunk_size);
                     heap.resize(to_read, 0);
-                    match reader.read(&mut heap[..to_read]).await {
-                        Ok(0) => break,
-                        Ok(n) => {
+                    // 逐包超时：每次 read 都有独立超时
+                    match tokio::time::timeout(per_chunk_timeout, reader.read(&mut heap[..to_read])).await {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => {
                             remaining = remaining.saturating_sub(n);
                             // split_to(n).freeze()：将前 n 字节的所有权转移，不复制
                             if tx.send(Ok(heap.split_to(n).freeze())).await.is_err() { break; }
                         }
-                        Err(e) => { let _ = tx.send(Err(e)).await; break; }
+                        Ok(Err(e)) => { let _ = tx.send(Err(e)).await; break; }
+                        Err(_) => {
+                            let e = std::io::Error::new(std::io::ErrorKind::TimedOut, "上游响应体读取超时");
+                            let _ = tx.send(Err(e)).await;
+                            break;
+                        }
                     }
                 }
             });
@@ -353,14 +513,14 @@ async fn send_recv_pooled(
                 resp.headers_mut().insert(CONTENT_LENGTH, v);
             }
         }
-        return Ok((resp, None)); // 连接已 move 进 task，不归还池
+        return Ok((resp, None, true)); // 连接已 move 进 task，不归还池
     }
 
     // ── 读取响应体（支持 chunked / Content-Length / EOF）───────────────────
     let body_bytes = if resp_is_chunked {
-        read_chunked_body(&mut buf).await?
+        read_chunked_body(&mut buf).await.map_err(|e| (e, true))?
     } else if let Some(len) = resp_content_length {
-        read_exact_body(&mut buf, len).await?
+        read_exact_body(&mut buf, len).await.map_err(|e| (e, true))?
     } else {
         resp_conn_close = true; // EOF 模式：读完即关
         let mut b = Vec::new();
@@ -408,7 +568,7 @@ async fn send_recv_pooled(
         }
     }
 
-    Ok((resp, maybe_conn))
+    Ok((resp, maybe_conn, true))
 }
 
 // ─────────────────────────────────────────────

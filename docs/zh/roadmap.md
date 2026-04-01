@@ -31,6 +31,9 @@
 | 访问日志（combined/json/自定义） | 异步写，不占 worker |
 | Admin REST API | 健康检查 / 统计 / 热重载 / 节点管理 |
 | 插件系统 | Rust trait，运行时注册 |
+| **Expect: 100-continue 处理** | RFC 7231 §5.1.1，发头等上游回 100 再 pipe body，上游拒绝则直接返回 |
+| **chunked 请求体流式透传** | `RequestBody` stream 直接 pipe 给上游，零内存拷贝，不全量 collect |
+| **proxy_read_timeout 逐包语义** | 响应体流式 spawn task 每次 `read()` 独立超时，等价 Nginx 两包间隔超时语义 |
 
 ---
 
@@ -40,16 +43,13 @@
 
 | 功能 | Nginx 对应 | 说明 |
 |------|-----------|------|
-| **100 Continue 处理** | 自动响应 | 大文件上传前客户端发 `Expect: 100-continue`，Sweety 未处理会导致上传超时 |
-| **proxy_read_timeout 逐包语义** | 两包之间超时 | 当前是整个响应总时间，Nginx 是相邻两个数据包之间的间隔，长 streaming 响应会误超时 |
-| **chunked 请求体流式透传** | 完整支持 | 当前对大请求体 collect 全量后再转发，内存占用高；应改为流式 |
+| **响应 Trailer 头透传** | 支持 | HTTP/1.1 chunked trailer、HTTP/2 trailer 头未透传 |
 
 ### 中优先级（协议兼容性）
 
 | 功能 | Nginx 对应 | 说明 |
 |------|-----------|------|
 | **304 响应体强制为空** | 自动处理 | 上游返回 304 时响应体应为空，部分场景未验证 |
-| **响应 Trailer 头透传** | 支持 | HTTP/1.1 chunked trailer、HTTP/2 trailer 头未透传 |
 | **Accept-Encoding 协商完整性** | 完整 | gzip/br 条件压缩的 mime type 白名单需与 Nginx 对齐 |
 | **TLS session ticket 复用** | 支持 | 依赖 rustls 默认行为，未显式配置 session cache 大小 |
 | **HTTP/1.0 支持** | 完整 | 部分 HTTP/1.0 客户端行为（Connection: close 等）未充分验证 |
@@ -83,9 +83,9 @@
 
 ## 近期计划（下一版本）
 
-1. **100 Continue** — 在 HTTP 请求代理路径加入 `Expect: 100-continue` 处理
-2. **proxy_read_timeout 逐包语义** — 改用 `tokio::time::timeout` 包裹每次 `read()` 操作
-3. **chunked 请求体流式透传** — 去掉 collect，直接 pipe request body stream 到上游
+1. **响应 Trailer 透传** — chunked trailer / H2 trailer 头透传给客户端
+2. **TCP/UDP 四层代理** — 无协议解析的纯字节转发（`stream {}` 等价功能）
+3. **`limit_req` 全局速率限流** — 跨 worker 共享的全局限流
 
 ---
 

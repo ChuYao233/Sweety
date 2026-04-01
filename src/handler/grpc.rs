@@ -126,7 +126,7 @@ pub async fn handle_sweety(
         &node.addr, method, path, upstream_host.as_ref(),
         node.tls, &node.tls_sni, node.tls_insecure,
         &req_headers, &client_ip,
-        &req_body,
+        sweety_web::body::RequestBody::from(req_body),
         false, None, None, None,
         &[], // gRPC 不做 sub_filter
         None, // gRPC 不做缓存

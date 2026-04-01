@@ -53,9 +53,8 @@ impl H2NodePool {
     /// 获取可用 SendRequest：优先复用现有连接，不足时新建
     async fn get_sender(&self) -> Result<SendRequest<Bytes>> {
         let mut guard = self.conns.lock().await;
-        // 清理已关闭的连接
-        guard.retain(|c| !c.sender.is_closed());
         // 尝试复用：clone 出 SendRequest（共享同一条 TCP），等待流量控制窗口
+        // ready() 失败说明连接已失效，继续尝试下一条
         for conn in guard.iter_mut() {
             match conn.sender.clone().ready().await {
                 Ok(s) => return Ok(s),

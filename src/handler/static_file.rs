@@ -428,9 +428,8 @@ pub async fn handle_sweety(
                 tracing::error!("读取文件失败 {}: {}", file_path.display(), e);
                 return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
             }
-            let compress_result = gzip_compress(&raw, gzip_level);
-            drop(raw);
-            match compress_result {
+            let compress_result = tokio::task::spawn_blocking(move || gzip_compress(&raw, gzip_level)).await;
+            match compress_result.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::Other, "task panic"))) {
                 Ok(compressed) => {
                     let clen = compressed.len() as u64;
                     let mut resp = WebResponse::new(ResponseBody::from(compressed));
@@ -472,7 +471,7 @@ fn stream_file_response(
     resp
 }
 
-/// gzip 压缩（flate2，仅用于小文件）
+/// gzip 压缩（flate2，仅用于小文件；调用方需通过 spawn_blocking 调用）
 fn gzip_compress(data: &[u8], level: u32) -> std::io::Result<bytes::Bytes> {
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;

@@ -70,47 +70,62 @@ enum WriteCmd {
     },
 }
 
-/// writer loop：接收 WriteCmd，串行处理所有连接级写操作
-/// 运行在 LocalSet 同一线程，持有 SendResponse（!Send），无锁竞争
+/// writer loop：批量处理连接级写操作（write batching）
+///
+/// 批量策略：先 recv() 等第一个 cmd，立即 try_recv() drain 其余就绪 cmd，
+/// 批量 send_response 写入 h2 发送缓冲区，Connection::poll_send 统一 flush
+/// → N 个 stream 的 HEADERS 在同一次 syscall 里发出，减少 N-1 次 write()
 async fn conn_writer_loop(mut rx: mpsc::UnboundedReceiver<WriteCmd>) {
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            WriteCmd::Headers { mut respond, res, end_stream, inline_body, trailers, stream_tx } => {
-                if end_stream {
-                    // 无 body：send_response(end_stream=true)，一帧完成
-                    let _ = respond.send_response(res, true);
-                    continue;
-                }
+    let mut batch: Vec<WriteCmd> = Vec::with_capacity(WRITER_BATCH_SIZE);
 
-                // 有 body：send_response(end_stream=false)
-                let mut stream = match respond.send_response(res, false) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-
-                if let Some(bytes) = inline_body {
-                    // 小文件：HEADERS 发完后立即发 DATA + trailers
-                    // 两帧在同一 writer 循环里，等价于帧内联
-                    if !bytes.is_empty() {
-                        let len = bytes.len();
-                        stream.reserve_capacity(len);
-                        // 初始窗口 16MB 常规足够，poll_capacity 通常立即 Ready
-                        match poll_fn(|cx| stream.poll_capacity(cx)).await {
-                            Some(Ok(cap)) if cap > 0 => {
-                                let _ = stream.send_data(bytes.slice(..cmp::min(cap, len)), false);
-                            }
-                            _ => {}
-                        }
+    loop {
+        // 阻塞等第一个 cmd
+        match rx.recv().await {
+            Some(cmd) => batch.push(cmd),
+            None => break,
+        }
+        // 非阻塞 drain 剩余就绪 cmd（最多 WRITER_BATCH_SIZE）
+        while batch.len() < WRITER_BATCH_SIZE {
+            match rx.try_recv() {
+                Ok(cmd) => batch.push(cmd),
+                Err(_) => break,
+            }
+        }
+        // 处理批次：所有 send_response 写入缓冲区，由 accept loop 驱动统一 flush
+        for cmd in batch.drain(..) {
+            match cmd {
+                WriteCmd::Headers { mut respond, res, end_stream, inline_body, trailers, stream_tx } => {
+                    if end_stream {
+                        let _ = respond.send_response(res, true);
+                        continue;
                     }
-                    let _ = stream.send_trailers(trailers);
-                } else {
-                    // 大文件：返回 SendStream 给 handler task，handler 自己发 DATA
-                    let _ = stream_tx.send(stream);
+                    let mut stream = match respond.send_response(res, false) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if let Some(bytes) = inline_body {
+                        if !bytes.is_empty() {
+                            let len = bytes.len();
+                            stream.reserve_capacity(len);
+                            match poll_fn(|cx| stream.poll_capacity(cx)).await {
+                                Some(Ok(cap)) if cap > 0 => {
+                                    let _ = stream.send_data(bytes.slice(..cmp::min(cap, len)), false);
+                                }
+                                _ => {}
+                            }
+                        }
+                        let _ = stream.send_trailers(trailers);
+                    } else {
+                        let _ = stream_tx.send(stream);
+                    }
                 }
             }
         }
     }
 }
+
+// 单批次最多处理 WriteCmd 数量：32 平衡吞吐与尾延迟
+const WRITER_BATCH_SIZE: usize = 32;
 
 /// Http/2 dispatcher
 pub(crate) struct Dispatcher<'a, TlsSt, S, ReqB> {
@@ -185,6 +200,11 @@ where
         // 所有 stream 的 HEADERS 写操作串行经过此 channel，消除锁竞争。
         let (write_tx, write_rx) = mpsc::unbounded_channel::<WriteCmd>();
 
+        // connection-level 限流：追踪 in-flight handler 数量
+        // 超过 MAX_PENDING_PER_CONN 时，accept loop 暂停接受新 stream
+        // h2 crate 的流控会自动通知对端停止发送新 stream
+        let pending_count = Rc::new(std::cell::Cell::new(0usize));
+
         let local = LocalSet::new();
 
         // writer loop：唯一操作 Connection 写侧的执行上下文
@@ -208,8 +228,16 @@ where
                         let write_tx = write_tx.clone();
                         let svc = Arc::clone(&service);
                         let dt  = Rc::clone(&date);
+                        let pc  = Rc::clone(&pending_count);
+                        // 超过限制时跳过 accept 等下一轮（h2 流控会自动通知对端）
+                        if pc.get() >= MAX_PENDING_PER_CONN {
+                            // 直接 drop respond，h2 发 RST_STREAM，客户端会重试
+                            continue;
+                        }
+                        pc.set(pc.get() + 1);
                         tokio::task::spawn_local(async move {
                             h2_handler(svc.call(req), respond, &*dt, write_tx).await;
+                            pc.set(pc.get() - 1);
                         });
                     }
                     SelectOutput::B(Ok(())) => {
@@ -440,3 +468,6 @@ const SMALL_BODY_INLINE: usize = 64 * 1024;
 
 // 大文件 chunk 大小：256KB
 const CHUNK_SIZE: usize = 256 * 1024;
+
+// 单连接最多同时在途的 handler 数量：超过则 RST_STREAM，客户端会重试
+const MAX_PENDING_PER_CONN: usize = 256;

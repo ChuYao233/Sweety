@@ -52,79 +52,223 @@ use crate::{
 /// handler task → writer loop 的写命令
 enum WriteCmd {
     /// 发送 HEADERS 帧（+ 可选内联 body）
-    ///
-    /// - `respond`     : 来自 io.accept() 的 SendResponse，writer 用它调 send_response
-    /// - `res`         : 已构造好的响应头（不含 body）
-    /// - `inline_body` : 小文件（<=SMALL_BODY_INLINE）已收集好的 body，None=大文件
-    /// - `trailers`    : 响应 trailers（小文件随 HEADERS 一起处理）
-    /// - `stream_tx`   : 大文件时 writer 通过此 oneshot 返回 SendStream，handler 继续发 DATA
     Headers {
-        respond:      SendResponse<Bytes>,
-        res:          Response<()>,
-        /// true = 无 body（send_response 时 end_stream=true，不需要 DATA 帧）
-        /// false = 有 body（小文件走 inline_body，大文件走 stream_tx）
-        end_stream:   bool,
-        inline_body:  Option<Bytes>,
-        trailers:     HeaderMap,
-        stream_tx:    oneshot::Sender<::h2::SendStream<Bytes>>,
+        respond:     SendResponse<Bytes>,
+        res:         Response<()>,
+        end_stream:  bool,
+        inline_body: Option<Bytes>,
+        trailers:    HeaderMap,
+        stream_tx:   oneshot::Sender<::h2::SendStream<Bytes>>,
+    },
+    /// 大文件注册：handler 把 body channel 交给 writer loop 调度
+    /// writer loop 自己驱动 DATA 发送，实现公平调度
+    Register {
+        stream:   ::h2::SendStream<Bytes>,
+        body_rx:  mpsc::Receiver<DataChunk>,
+        done_tx:  oneshot::Sender<()>,
     },
 }
 
-/// writer loop：批量处理连接级写操作（write batching）
+/// handler 向 writer loop 发送的 DATA 片
+struct DataChunk {
+    data:       Bytes,
+    end_stream: bool,
+    trailers:   HeaderMap,
+}
+
+/// writer loop 内部的流调度状态
+struct StreamState {
+    stream:  ::h2::SendStream<Bytes>,
+    body_rx: mpsc::Receiver<DataChunk>,
+    done_tx: oneshot::Sender<()>,
+    /// 当前待发的 chunk（已从 body_rx 取出但尚未发完）
+    pending: Option<DataChunk>,
+}
+
+/// writer loop：生产级 write fairness 调度
 ///
-/// 批量策略：先 recv() 等第一个 cmd，立即 try_recv() drain 其余就绪 cmd，
-/// 批量 send_response 写入 h2 发送缓冲区，Connection::poll_send 统一 flush
-/// → N 个 stream 的 HEADERS 在同一次 syscall 里发出，减少 N-1 次 write()
+/// 事件驱动，零 CPU 空转：
+///
+/// 主循环每轮：
+///   A. 非阻塞 drain cmd channel → 处理所有就绪 Headers/Register
+///   B. 取队首流（StreamState）：
+///      - pending 为空  → select!(cmd_channel | body_rx.recv()) 真正 await
+///        任意就绪：cmd 就处理控制帧；body_rx 就拿到数据 chunk
+///      - pending 有数据 → 检查 flow control 窗口：
+///          有 capacity → 发一片 CHUNK_SIZE → push_back 重入队（round-robin）
+///          无 capacity → select!(cmd_channel | poll_capacity) 真正 await
+///            窗口到了继续发；cmd 就先处理控制帧再回来等窗口
+///   C. 流结束 → done_tx 通知 handler，不重入队
+///
+/// 关键保证：
+///   - HEADERS 在任何 await 点都能插队（select! 的 cmd_channel 分支）
+///   - body 空/窗口耗尽时真正 sleep，不 busy-spin
+///   - 多个大文件流通过 push_back 实现 round-robin，单片最大 CHUNK_SIZE
 async fn conn_writer_loop(mut rx: mpsc::UnboundedReceiver<WriteCmd>) {
-    let mut batch: Vec<WriteCmd> = Vec::with_capacity(WRITER_BATCH_SIZE);
+    use std::collections::VecDeque;
+    let mut streams: VecDeque<StreamState> = VecDeque::new();
 
     loop {
-        // 阻塞等第一个 cmd
-        match rx.recv().await {
-            Some(cmd) => batch.push(cmd),
-            None => break,
-        }
-        // 非阻塞 drain 剩余就绪 cmd（最多 WRITER_BATCH_SIZE）
-        while batch.len() < WRITER_BATCH_SIZE {
+        // ── A. 非阻塞 drain cmd channel ────────────────────────────────────
+        // 每轮先处理所有就绪的控制帧，保证 HEADERS 优先
+        loop {
             match rx.try_recv() {
-                Ok(cmd) => batch.push(cmd),
+                Ok(cmd) => handle_cmd(cmd, &mut streams),
                 Err(_) => break,
             }
         }
-        // 处理批次：所有 send_response 写入缓冲区，由 accept loop 驱动统一 flush
-        for cmd in batch.drain(..) {
-            match cmd {
-                WriteCmd::Headers { mut respond, res, end_stream, inline_body, trailers, stream_tx } => {
-                    if end_stream {
-                        let _ = respond.send_response(res, true);
-                        continue;
+
+        // ── B. 取队首流处理 ─────────────────────────────────────────────────
+        let mut state = match streams.pop_front() {
+            Some(s) => s,
+            None => {
+                // 无流：阻塞等新 cmd（真正 sleep，零 CPU）
+                match rx.recv().await {
+                    Some(cmd) => { handle_cmd(cmd, &mut streams); continue; }
+                    None => break, // cmd channel 关闭，退出
+                }
+            }
+        };
+
+        // ── B1. 确保 pending 有数据 ─────────────────────────────────────────
+        if state.pending.is_none() {
+            // select! 同时等新 cmd 和队首流的 body 数据
+            // 任意就绪都不会 spin
+            tokio::select! {
+                biased; // cmd 优先（控制面 > 数据面）
+                cmd_opt = rx.recv() => {
+                    match cmd_opt {
+                        Some(cmd) => handle_cmd(cmd, &mut streams),
+                        None => break,
                     }
-                    let mut stream = match respond.send_response(res, false) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    if let Some(bytes) = inline_body {
-                        if !bytes.is_empty() {
-                            let len = bytes.len();
-                            stream.reserve_capacity(len);
-                            match poll_fn(|cx| stream.poll_capacity(cx)).await {
-                                Some(Ok(cap)) if cap > 0 => {
-                                    let _ = stream.send_data(bytes.slice(..cmp::min(cap, len)), false);
-                                }
-                                _ => {}
-                            }
+                    // 把 state 放回队首，下轮继续
+                    streams.push_front(state);
+                    continue;
+                }
+                chunk_opt = state.body_rx.recv() => {
+                    match chunk_opt {
+                        Some(chunk) => state.pending = Some(chunk),
+                        None => {
+                            // handler 已 drop body_tx（异常关闭），清理流
+                            let _ = state.done_tx.send(());
+                            continue;
                         }
-                        let _ = stream.send_trailers(trailers);
-                    } else {
-                        let _ = stream_tx.send(stream);
                     }
                 }
             }
         }
+
+        // ── B2. 有数据，检查 flow control 窗口 ─────────────────────────────
+        let chunk = state.pending.as_ref().unwrap();
+
+        if state.stream.capacity() == 0 {
+            // 窗口耗尽：reserve 后 select! 等窗口或新 cmd
+            state.stream.reserve_capacity(CHUNK_SIZE);
+            tokio::select! {
+                biased;
+                cmd_opt = rx.recv() => {
+                    match cmd_opt {
+                        Some(cmd) => handle_cmd(cmd, &mut streams),
+                        None => break,
+                    }
+                    // 窗口还没来，把 state 放回队尾（让其他流先跑）
+                    streams.push_back(state);
+                    continue;
+                }
+                cap_opt = poll_fn(|cx| state.stream.poll_capacity(cx)) => {
+                    match cap_opt {
+                        Some(Ok(cap)) if cap > 0 => { /* 有窗口了，继续发 */ }
+                        _ => {
+                            // 流被对端 RST 或关闭
+                            let _ = state.done_tx.send(());
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── B3. 发一片（最多 CHUNK_SIZE，受 capacity 限制）────────────────
+        let cap = state.stream.capacity();
+        let data_len = chunk.data.len();
+        let send_len = cmp::min(cap, cmp::min(data_len, CHUNK_SIZE));
+        let is_chunk_done = send_len >= data_len;
+
+        if is_chunk_done && chunk.end_stream {
+            // 最后一片发完 → 结束流
+            let data     = chunk.data.clone();
+            let trailers = chunk.trailers.clone();
+            state.pending = None;
+            if !data.is_empty() {
+                let _ = state.stream.send_data(data, false);
+            }
+            let _ = state.stream.send_trailers(trailers);
+            let _ = state.done_tx.send(());
+            // 不重入队，流结束
+        } else if is_chunk_done {
+            // 当前 chunk 发完，还有更多 chunk
+            let data = chunk.data.clone();
+            state.pending = None;
+            let _ = state.stream.send_data(data, false);
+            streams.push_back(state); // round-robin：放队尾
+        } else {
+            // capacity 不足以发完整 chunk，发一片后剩余留 pending
+            let data      = chunk.data.slice(..send_len);
+            let remaining = chunk.data.slice(send_len..);
+            let end_stream = chunk.end_stream;
+            let trailers   = chunk.trailers.clone();
+            state.pending  = Some(DataChunk { data: remaining, end_stream, trailers });
+            let _ = state.stream.send_data(data, false);
+            streams.push_back(state); // round-robin：放队尾
+        }
     }
 }
 
-// 单批次最多处理 WriteCmd 数量：32 平衡吞吐与尾延迟
+/// 处理一条 WriteCmd，更新 streams 队列
+/// Headers → push_front（控制面优先）
+/// Register → push_back（DATA 轮转）
+fn handle_cmd(cmd: WriteCmd, streams: &mut std::collections::VecDeque<StreamState>) {
+    match cmd {
+        WriteCmd::Headers { mut respond, res, end_stream, inline_body, trailers, stream_tx } => {
+            if end_stream {
+                let _ = respond.send_response(res, true);
+                return;
+            }
+            let mut stream = match respond.send_response(res, false) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if let Some(bytes) = inline_body {
+                // 小文件：HEADERS + DATA 在同一 handle_cmd 里处理
+                // inline body 通常已在初始窗口内，直接发
+                let len = bytes.len();
+                if len > 0 {
+                    stream.reserve_capacity(len);
+                    // 尝试同步发：初始窗口 16MB，通常立即有 capacity
+                    if stream.capacity() >= len {
+                        let _ = stream.send_data(bytes, false);
+                    } else {
+                        // 极罕见：窗口不足，退化为忽略（小文件不应触发）
+                        let _ = stream.send_data(bytes.slice(..stream.capacity()), false);
+                    }
+                }
+                let _ = stream.send_trailers(trailers);
+            } else {
+                let _ = stream_tx.send(stream);
+            }
+        }
+        WriteCmd::Register { stream, body_rx, done_tx } => {
+            streams.push_back(StreamState {
+                stream,
+                body_rx,
+                done_tx,
+                pending: None,
+            });
+        }
+    }
+}
+
+// 单批次最多 drain WriteCmd 数量
 const WRITER_BATCH_SIZE: usize = 32;
 
 /// Http/2 dispatcher
@@ -417,62 +561,81 @@ where
         }
     }
 
-    // 4. 大文件：通过 oneshot 接收 writer loop 返回的 SendStream，然后流式发 DATA
-    // trailers 保留在 handler 里，writer loop 对大文件只负责发 HEADERS + 返回 SendStream
+    // 4. 大文件：
+    //   a. 先发 HEADERS（writer loop 返回 SendStream）
+    //   b. handler 开一个 mpsc body channel，把 SendStream + body_rx 注册给 writer loop
+    //   c. handler 异步读 body 并逐片发给 body_tx，writer loop round-robin 调度 DATA
+    //   d. writer loop 发完所有数据后通过 done_rx 通知 handler 退出
+
+    // a. 发 HEADERS
     let (stream_tx, stream_rx) = oneshot::channel::<::h2::SendStream<Bytes>>();
     if write_tx.send(WriteCmd::Headers {
         respond, res,
         end_stream: false,
         inline_body: None,
-        trailers: HeaderMap::with_capacity(0), // 大文件 trailers 由 handler 自己发
+        trailers: HeaderMap::with_capacity(0),
         stream_tx,
     }).is_err() {
-        return; // 连接已关闭
+        return;
     }
-
-    // 等待 writer loop 发完 HEADERS，返回 SendStream
-    let mut stream = match stream_rx.await {
+    let stream = match stream_rx.await {
         Ok(s) => s,
-        Err(_) => return, // writer loop 已退出（连接关闭）
+        Err(_) => return,
     };
 
-    // 5. 大文件流式发 DATA：capacity() 先判断，有窗口直接发，无窗口才 await
+    // b. 创建 body channel + done channel，注册给 writer loop
+    // body channel 有界（BODY_CHANNEL_CAP），作为背压：writer 消费慢时 handler 暂停生产
+    let (body_tx, body_rx) = mpsc::channel::<DataChunk>(BODY_CHANNEL_CAP);
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+    if write_tx.send(WriteCmd::Register { stream, body_rx, done_tx }).is_err() {
+        return;
+    }
+
+    // c. handler 读 body 并按 CHUNK_SIZE 分片发给 body_tx
     let mut body = pin!(body);
-    loop {
+    'outer: loop {
         let chunk = match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-            Some(Ok(c)) => c,
-            Some(Err(_)) => return,
+            Some(Ok(c)) if !c.is_empty() => c,
+            Some(Ok(_)) => continue,
+            Some(Err(_)) => break,
             None => break,
         };
-        if chunk.is_empty() { continue; }
-
-        let mut offset = 0usize;
-        let chunk_len = chunk.len();
-        while offset < chunk_len {
-            let cap = stream.capacity();
-            if cap > 0 {
-                let n = cmp::min(cap, chunk_len - offset);
-                let bytes = chunk.slice(offset..offset + n);
-                if stream.send_data(bytes, false).is_err() { return; }
-                offset += n;
-                continue;
+        // 按 CHUNK_SIZE 分片，每片独立发送（固定大小保证 round-robin 公平性）
+        let mut offset = 0;
+        while offset < chunk.len() {
+            let end = cmp::min(offset + CHUNK_SIZE, chunk.len());
+            let slice = chunk.slice(offset..end);
+            offset = end;
+            let is_last = offset >= chunk.len();
+            // 非最后一片，或还有更多 body
+            let dc = DataChunk { data: slice, end_stream: false, trailers: HeaderMap::with_capacity(0) };
+            if body_tx.send(dc).await.is_err() {
+                break 'outer; // writer loop 已关闭（连接断开）
             }
-            stream.reserve_capacity(cmp::min(chunk_len - offset, CHUNK_SIZE));
-            match poll_fn(|cx| stream.poll_capacity(cx)).await {
-                Some(Ok(_)) => {}
-                Some(Err(_)) | None => return,
-            }
+            let _ = is_last; // suppress unused warning
         }
     }
-    // body 全部发完，发 trailers 结束 stream（END_STREAM）
-    let _ = stream.send_trailers(trailers);
+    // d. 发最后一片（end_stream=true，携带 trailers）
+    // 无论 body 正常结束还是出错，都要发 end_stream 让 writer loop 关闭流
+    let _ = body_tx.send(DataChunk {
+        data: Bytes::new(),
+        end_stream: true,
+        trailers,
+    }).await;
+    // 等 writer loop 发完（确保连接不会在数据发完前被 keep-alive 关掉）
+    let _ = done_rx.await;
 }
 
 // 小文件内联阈值：≤ 64KB，HEADERS + DATA 在 writer loop 里连续处理
 const SMALL_BODY_INLINE: usize = 64 * 1024;
 
-// 大文件 chunk 大小：256KB
-const CHUNK_SIZE: usize = 256 * 1024;
+// 大文件 DATA chunk 大小：16KB（固定小片，保证 round-robin 公平性）
+// 参考 Go net/http2：每次 writeScheduler 只调度一个 frame（默认 16KB）
+const CHUNK_SIZE: usize = 16 * 1024;
 
-// 单连接最多同时在途的 handler 数量：超过则 RST_STREAM，客户端会重试
+// body channel 容量：writer 消费慢时限制 handler 堆积，提供背压
+// 4 片 × 16KB = 64KB per stream，内存可控
+const BODY_CHANNEL_CAP: usize = 4;
+
+// 单连接最多同时在途的 handler 数量（0=不限制，由协议层 max_concurrent_streams 控制）
 const MAX_PENDING_PER_CONN: usize = 256;

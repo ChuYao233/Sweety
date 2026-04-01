@@ -129,8 +129,8 @@ mod service {
     impl<'r, S, C, ReqB, ResB, Err> Service<WebContext<'r, C, ReqB>> for EraserService<EraseReqBody, S>
     where
         S: for<'rs> Service<WebContext<'rs, C>, Response = WebResponse<ResB>, Error = Err>,
-        ReqB: BodyStream<Chunk = Bytes> + Default + 'static,
-        ResB: BodyStream<Chunk = Bytes> + 'static,
+        ReqB: BodyStream<Chunk = Bytes> + Default + Send + 'static,
+        ResB: BodyStream<Chunk = Bytes> + Send + 'static,
     {
         type Response = WebResponse;
         type Error = Err;
@@ -147,7 +147,7 @@ mod service {
     impl<S, Req, ResB> Service<Req> for EraserService<EraseResBody, S>
     where
         S: Service<Req, Response = WebResponse<ResB>>,
-        ResB: BodyStream<Chunk = Bytes> + 'static,
+        ResB: BodyStream<Chunk = Bytes> + Send + 'static,
     {
         type Response = WebResponse;
         type Error = S::Error;

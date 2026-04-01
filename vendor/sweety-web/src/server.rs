@@ -174,8 +174,8 @@ where
         S::Response: ReadyService + Service<Request<RequestExt<RequestBody>>, Response = Response<ResB>> + 'static,
         S::Error: fmt::Debug,
         <S::Response as Service<Request<RequestExt<RequestBody>>>>::Error: fmt::Debug,
-        ResB: Stream<Item = Result<Bytes, BE>> + 'static,
-        BE: fmt::Debug + 'static,
+        ResB: Stream<Item = Result<Bytes, BE>> + Send + 'static,
+        BE: fmt::Debug + Send + 'static,
     {
         let config = self.config;
         let service = self.service.clone().enclosed(HttpServiceBuilder::with_config(config));
@@ -189,8 +189,8 @@ where
         S::Response: ReadyService + Service<Request<RequestExt<RequestBody>>, Response = Response<ResB>> + 'static,
         S::Error: fmt::Debug,
         <S::Response as Service<Request<RequestExt<RequestBody>>>>::Error: fmt::Debug,
-        ResB: Stream<Item = Result<Bytes, BE>> + 'static,
-        BE: fmt::Debug + 'static,
+        ResB: Stream<Item = Result<Bytes, BE>> + Send + 'static,
+        BE: fmt::Debug + Send + 'static,
         L: IntoListener + 'static,
     {
         let config = self.config;
@@ -210,8 +210,8 @@ where
         S::Response: ReadyService + Service<Request<RequestExt<RequestBody>>, Response = Response<ResB>> + 'static,
         S::Error: fmt::Debug,
         <S::Response as Service<Request<RequestExt<RequestBody>>>>::Error: fmt::Debug,
-        ResB: Stream<Item = Result<Bytes, BE>> + 'static,
-        BE: fmt::Debug + 'static,
+        ResB: Stream<Item = Result<Bytes, BE>> + Send + 'static,
+        BE: fmt::Debug + Send + 'static,
     {
         let config = self.config;
 
@@ -266,8 +266,8 @@ where
         S::Response: ReadyService + Service<Request<RequestExt<RequestBody>>, Response = Response<ResB>> + 'static,
         S::Error: fmt::Debug,
         <S::Response as Service<Request<RequestExt<RequestBody>>>>::Error: fmt::Debug,
-        ResB: Stream<Item = Result<Bytes, BE>> + 'static,
-        BE: fmt::Debug + 'static,
+        ResB: Stream<Item = Result<Bytes, BE>> + Send + 'static,
+        BE: fmt::Debug + Send + 'static,
     {
         let service_config = self.config;
 
@@ -296,8 +296,8 @@ where
         S::Response: ReadyService + Service<Request<RequestExt<RequestBody>>, Response = Response<ResB>> + 'static,
         S::Error: fmt::Debug,
         <S::Response as Service<Request<RequestExt<RequestBody>>>>::Error: fmt::Debug,
-        ResB: Stream<Item = Result<Bytes, BE>> + 'static,
-        BE: fmt::Debug + 'static,
+        ResB: Stream<Item = Result<Bytes, BE>> + Send + 'static,
+        BE: fmt::Debug + Send + 'static,
     {
         let config = self.config;
         let service = self.service.clone().enclosed(HttpServiceBuilder::with_config(config));
@@ -316,8 +316,8 @@ where
         S::Response: ReadyService + Service<Request<RequestExt<RequestBody>>, Response = Response<ResB>> + 'static,
         S::Error: fmt::Debug,
         <S::Response as Service<Request<RequestExt<RequestBody>>>>::Error: fmt::Debug,
-        ResB: Stream<Item = Result<Bytes, BE>> + 'static,
-        BE: fmt::Debug + 'static,
+        ResB: Stream<Item = Result<Bytes, BE>> + Send + 'static,
+        BE: fmt::Debug + Send + 'static,
     {
         let service = self
             .service

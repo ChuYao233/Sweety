@@ -172,7 +172,7 @@ where
 
 impl<'r, C, B> Responder<WebContext<'r, C, B>> for WebSocket<B>
 where
-    B: BodyStream + 'static,
+    B: BodyStream + Send + 'static,
 {
     type Response = WebResponse;
     type Error = Infallible;

@@ -1,4 +1,5 @@
 ﻿use core::{fmt, marker::PhantomData, pin::pin};
+use std::sync::Arc;
 
 use futures_core::Stream;
 use sweety_io_compat::{
@@ -29,7 +30,7 @@ pub struct HttpService<
 > {
     pub(crate) config: HttpServiceConfig<HEADER_LIMIT, READ_BUF_LIMIT, WRITE_BUF_LIMIT>,
     pub(crate) date: DateTimeService,
-    pub(crate) service: S,
+    pub(crate) service: Arc<S>,
     pub(crate) tls_acceptor: A,
     /// 当前 service 绑定的是否为 TLS 端口（由 builder 在构建时写入）
     pub(crate) is_tls: bool,
@@ -48,7 +49,7 @@ impl<St, S, ReqB, A, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, con
         Self {
             config,
             date: DateTimeService::new(),
-            service,
+            service: Arc::new(service),
             tls_acceptor,
             is_tls,
             _body: PhantomData,
@@ -76,13 +77,13 @@ impl<S, ResB, BE, A, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, con
     Service<ServerStream>
     for HttpService<ServerStream, S, RequestBody, A, HEADER_LIMIT, READ_BUF_LIMIT, WRITE_BUF_LIMIT>
 where
-    S: Service<Request<RequestExt<RequestBody>>, Response = Response<ResB>>,
+    S: Service<Request<RequestExt<RequestBody>>, Response = Response<ResB>> + 'static,
     A: Service<TcpStream>,
     A::Response: AsyncIo + AsVersion,
     HttpServiceError<S::Error, BE>: From<A::Error>,
     S::Error: fmt::Debug,
-    ResB: Stream<Item = Result<Bytes, BE>>,
-    BE: fmt::Debug,
+    ResB: Stream<Item = Result<Bytes, BE>> + Send + 'static,
+    BE: fmt::Debug + Send + 'static,
 {
     type Response = ();
     type Error = HttpServiceError<S::Error, BE>;
@@ -94,7 +95,7 @@ where
 
         match io {
             #[cfg(feature = "http3")]
-            ServerStream::Udp(io, addr) => super::h3::Dispatcher::new(io, addr, &self.service)
+            ServerStream::Udp(io, addr) => super::h3::Dispatcher::new(io, addr, &*self.service)
                 .run()
                 .await
                 .map_err(From::from),
@@ -123,7 +124,7 @@ where
                         self.is_tls,
                         timer.as_mut(),
                         self.config,
-                        &self.service,
+                        &*self.service,
                         self.date.get(),
                     )
                     .await
@@ -146,8 +147,8 @@ where
                             self.is_tls,
                             timer.as_mut(),
                             self.config.keep_alive_timeout,
-                            &self.service,
-                            self.date.get(),
+                            Arc::clone(&self.service),
+                            self.date.get_rc(),
                         )
                         .run()
                         .await
@@ -173,7 +174,7 @@ where
                         false, // Unix socket 不是 TLS
                         timer.as_mut(),
                         self.config,
-                        &self.service,
+                        &*self.service,
                         self.date.get(),
                     )
                     .await

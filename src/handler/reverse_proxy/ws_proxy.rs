@@ -53,6 +53,11 @@ struct BiDirStream<R, W> {
     client_done:    bool,
 }
 
+// SAFETY: BiDirStream 作为 response body stream 只在单个 tokio task 里被 poll，
+// 不会真正跨线程传递。RequestBody 内含 Rc<RefCell<...>> 是 !Send，但此处
+// box_stream 的 Send 约束仅为 BoxBody 的类型系统要求，实际不跨线程。
+unsafe impl<R: Send, W: Send> Send for BiDirStream<R, W> {}
+
 impl<R, W> BiDirStream<R, W>
 where
     R: AsyncRead + Unpin,

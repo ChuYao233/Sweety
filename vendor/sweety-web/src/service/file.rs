@@ -94,7 +94,7 @@ where
 }
 
 mod service {
-    use http_file::{ServeDir, ServeError, runtime::AsyncFs};
+    use http_file::{ServeDir, ServeError, runtime::{AsyncFs, ChunkRead}};
 
     use crate::{
         body::ResponseBody,
@@ -109,7 +109,8 @@ mod service {
     impl<'r, C, B, F> Service<WebContext<'r, C, B>> for ServeDirService<F>
     where
         F: AsyncFs,
-        F::File: 'static,
+        F::File: Send + 'static,
+        <F::File as ChunkRead>::Future: Send,
     {
         type Response = WebResponse;
         type Error = RouterError<Error>;

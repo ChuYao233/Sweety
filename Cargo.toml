@@ -123,6 +123,7 @@ h2            = "0.4"
 bytes        = "1"
 flate2       = "1"
 async-compression = { version = "0.4", features = ["brotli", "tokio"] }
+async-stream      = "0.3"
 x509-parser  = { version = "0.16", default-features = false }
 anyhow       = "1"
 itoa         = "1"

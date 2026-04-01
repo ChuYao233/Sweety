@@ -21,16 +21,17 @@ use futures_util::Stream;
 use tokio::io::AsyncReadExt;
 
 /// 大文件流式传输块大小（1 MiB）
-/// 提升 HTTPS/H2 大文件吞吐：更大的块减少 channel 轮次，降低调度开销
-/// RTT=20ms 时：32 * 1MB = 32MB 在途数据，可跑满 ~1.6Gbps
+/// 提升 HTTPS/H2 大文件吸吐：更大的块减少 channel 轮次，降低调度开销
 pub const STREAM_CHUNK: usize = 1024 * 1024;
 
-/// 返回一个带背压的文件 stream（H2/通用路径）
+/// 小文件直接读取阈値（256 KiB）
+/// 小于此阈値时一次 read_to_end，避免 spawn + channel 开销
+pub const SMALL_FILE_THRESHOLD: u64 = 256 * 1024;
+
+/// 返回一个带背压的文件 stream（无 spawn、直接在调用任务里读取）
 ///
-/// 接受任意实现 `AsyncRead + Send + 'static` 的 reader（`File`、`Take<File>` 等）。
-/// 使用 bounded channel (capacity=2)：
-/// 生产者 task 读文件发 chunk，channel 满则挂起等待消费者拉取。
-/// H2 framer 每消费一帧才解除生产者阻塞，内存恒定 ≤ 2×STREAM_CHUNK。
+/// 不再歡用 tokio::spawn，而是用 async_stream 宏直接在 handler task 里展开。
+/// 消除 500 并发请求 = 500 额外 task 的调度开销，降低 P99 尾延迟抖动。
 pub fn file_stream_backpressure<R>(
     reader: R,
     len: u64,
@@ -38,41 +39,38 @@ pub fn file_stream_backpressure<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    // cap=32：最大在途数据 32×1MB=32MB
-    // RTT=20ms 时理论带宽上限 ~1.6Gbps，足以跑满千兆网卡
-    let (tx, rx) = tokio::sync::mpsc::channel::<IoResult<Bytes>>(32);
+    // 动态 chunk size：小文件用小块，大文件用 1MB
+    // 避免 1KB 文件分配 1MB buf
+    let chunk_size = if len <= 64 * 1024 {
+        16 * 1024usize  // 小文件：16KB chunk
+    } else if len <= 1024 * 1024 {
+        128 * 1024      // 中文件：128KB chunk
+    } else {
+        STREAM_CHUNK     // 大文件：1MB chunk
+    };
 
-    tokio::spawn(async move {
+    async_stream::stream! {
         let mut reader = reader;
         let mut remaining = len;
-        // 用 BytesMut 避免每次 read 后 copy_from_slice 的额外拷贝
-        let mut buf = bytes::BytesMut::with_capacity(STREAM_CHUNK);
+        let mut buf = bytes::BytesMut::with_capacity(chunk_size);
 
         while remaining > 0 {
-            let to_read = (remaining as usize).min(STREAM_CHUNK);
-
-            // 确保缓冲区有足够空间
+            let to_read = (remaining as usize).min(chunk_size);
             buf.resize(to_read, 0);
 
             match reader.read(&mut buf[..to_read]).await {
                 Ok(0) => break,
                 Ok(n) => {
                     remaining = remaining.saturating_sub(n as u64);
-                    // freeze 直接转 Bytes，零拷贝
-                    let chunk = buf.split_to(n).freeze();
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        return;
-                    }
+                    yield Ok(buf.split_to(n).freeze());
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
+                    yield Err(e);
+                    break;
                 }
             }
         }
-    });
-
-    tokio_stream::wrappers::ReceiverStream::new(rx)
+    }
 }
 
 /// Linux/macOS HTTP/1.1：`sendfile(2)` 零拷贝

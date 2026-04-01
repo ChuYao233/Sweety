@@ -13,23 +13,104 @@ use ::h2::{
     server::{Connection, SendResponse},
 };
 use futures_core::stream::Stream;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::LocalSet;
 use tracing::trace;
 use sweety_io_compat::io::{AsyncRead, AsyncWrite};
 use sweety_service::Service;
 use sweety_collection::futures::{Select as _, SelectOutput};
 
+use std::{rc::Rc, sync::Arc};
+
 use crate::{
     body::BodySize,
     bytes::Bytes,
     date::{DateTime, DateTimeHandle},
-    error::HttpServiceError,
     h2::{body::RequestBody, error::Error},
     http::{
         Extension, Request, RequestExt, Response, Version,
         header::{CONNECTION, CONTENT_LENGTH, DATE, HeaderMap, HeaderName, HeaderValue, TRAILER},
     },
-    util::{futures::Queue, timer::KeepAlive},
+    util::timer::KeepAlive,
 };
+
+// ── per-connection 写命令（WriteCmd）──────────────────────────────────────────
+//
+// 架构：Go net/http2 writeScheduler / Nginx event loop 单写线程模型
+//
+// 问题：h2 crate Connection 内部用 Arc<Mutex> 保护写状态，
+//       500 个 stream 并发调 send_response() 时锁竞争严重，
+//       HEADERS 发送延迟 → "awaiting headers timeout"
+//
+// 解法：每个 TCP 连接一个 writer loop（在 LocalSet 同一线程里运行），
+//       所有 stream 的写操作通过 mpsc channel 排队，writer 串行执行：
+//       1. send_response(HEADERS)
+//       2. send_data(DATA) - 小文件内联，大文件通过 oneshot 返回 SendStream
+//
+// SendResponse<B>: !Send，所以必须在同一线程（LocalSet）内流转。
+
+/// handler task → writer loop 的写命令
+enum WriteCmd {
+    /// 发送 HEADERS 帧（+ 可选内联 body）
+    ///
+    /// - `respond`     : 来自 io.accept() 的 SendResponse，writer 用它调 send_response
+    /// - `res`         : 已构造好的响应头（不含 body）
+    /// - `inline_body` : 小文件（<=SMALL_BODY_INLINE）已收集好的 body，None=大文件
+    /// - `trailers`    : 响应 trailers（小文件随 HEADERS 一起处理）
+    /// - `stream_tx`   : 大文件时 writer 通过此 oneshot 返回 SendStream，handler 继续发 DATA
+    Headers {
+        respond:      SendResponse<Bytes>,
+        res:          Response<()>,
+        /// true = 无 body（send_response 时 end_stream=true，不需要 DATA 帧）
+        /// false = 有 body（小文件走 inline_body，大文件走 stream_tx）
+        end_stream:   bool,
+        inline_body:  Option<Bytes>,
+        trailers:     HeaderMap,
+        stream_tx:    oneshot::Sender<::h2::SendStream<Bytes>>,
+    },
+}
+
+/// writer loop：接收 WriteCmd，串行处理所有连接级写操作
+/// 运行在 LocalSet 同一线程，持有 SendResponse（!Send），无锁竞争
+async fn conn_writer_loop(mut rx: mpsc::UnboundedReceiver<WriteCmd>) {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            WriteCmd::Headers { mut respond, res, end_stream, inline_body, trailers, stream_tx } => {
+                if end_stream {
+                    // 无 body：send_response(end_stream=true)，一帧完成
+                    let _ = respond.send_response(res, true);
+                    continue;
+                }
+
+                // 有 body：send_response(end_stream=false)
+                let mut stream = match respond.send_response(res, false) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                if let Some(bytes) = inline_body {
+                    // 小文件：HEADERS 发完后立即发 DATA + trailers
+                    // 两帧在同一 writer 循环里，等价于帧内联
+                    if !bytes.is_empty() {
+                        let len = bytes.len();
+                        stream.reserve_capacity(len);
+                        // 初始窗口 16MB 常规足够，poll_capacity 通常立即 Ready
+                        match poll_fn(|cx| stream.poll_capacity(cx)).await {
+                            Some(Ok(cap)) if cap > 0 => {
+                                let _ = stream.send_data(bytes.slice(..cmp::min(cap, len)), false);
+                            }
+                            _ => {}
+                        }
+                    }
+                    let _ = stream.send_trailers(trailers);
+                } else {
+                    // 大文件：返回 SendStream 给 handler task，handler 自己发 DATA
+                    let _ = stream_tx.send(stream);
+                }
+            }
+        }
+    }
+}
 
 /// Http/2 dispatcher
 pub(crate) struct Dispatcher<'a, TlsSt, S, ReqB> {
@@ -38,19 +119,19 @@ pub(crate) struct Dispatcher<'a, TlsSt, S, ReqB> {
     is_tls: bool,
     keep_alive: Pin<&'a mut KeepAlive>,
     ka_dur: Duration,
-    service: &'a S,
-    date: &'a DateTimeHandle,
+    service: Arc<S>,
+    date: Rc<DateTimeHandle>,
     _req_body: PhantomData<ReqB>,
 }
 
 impl<'a, TlsSt, S, ReqB, ResB, BE> Dispatcher<'a, TlsSt, S, ReqB>
 where
-    S: Service<Request<RequestExt<ReqB>>, Response = Response<ResB>>,
+    S: Service<Request<RequestExt<ReqB>>, Response = Response<ResB>> + 'static,
     S::Error: fmt::Debug,
-    ResB: Stream<Item = Result<Bytes, BE>>,
-    BE: fmt::Debug,
+    ResB: Stream<Item = Result<Bytes, BE>> + Send + 'static,
+    BE: fmt::Debug + Send + 'static,
     TlsSt: AsyncRead + AsyncWrite + Unpin,
-    ReqB: From<RequestBody>,
+    ReqB: From<RequestBody> + 'static,
 {
     pub(crate) fn new(
         io: &'a mut Connection<TlsSt, Bytes>,
@@ -58,8 +139,8 @@ where
         is_tls: bool,
         keep_alive: Pin<&'a mut KeepAlive>,
         ka_dur: Duration,
-        service: &'a S,
-        date: &'a DateTimeHandle,
+        service: Arc<S>,
+        date: Rc<DateTimeHandle>,
     ) -> Self {
         Self {
             io,
@@ -87,80 +168,69 @@ where
 
         let ping_pong = io.ping_pong().expect("first call to ping_pong should never fail");
 
-        // reset timer to keep alive.
         let deadline = date.now() + ka_dur;
         keep_alive.as_mut().update(deadline);
 
-        // timer for ping pong interval and keep alive.
         let mut ping_pong = H2PingPong {
             on_flight: false,
             keep_alive: keep_alive.as_mut(),
             ping_pong,
-            date,
+            date: Rc::clone(&date),
             ka_dur,
         };
 
-        let mut queue = Queue::new();
+        // ── per-connection writer channel ──────────────────────────────────────
+        // writer loop 在 LocalSet 内和 accept loop 并发运行，但在同一线程上，
+        // 保证 SendResponse<!Send> 和 SendStream<!Send> 不跨线程。
+        // 所有 stream 的 HEADERS 写操作串行经过此 channel，消除锁竞争。
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<WriteCmd>();
 
-        loop {
-            match io.accept().select(try_poll_queue(&mut queue, &mut ping_pong)).await {
-                SelectOutput::A(Some(Ok((req, tx)))) => {
-                    // Convert http::Request body type to crate::h2::Body
-                    // and reconstruct as HttpRequest.
-                    // RFC 8441：在 map 之前先读 extensions，避免 req 同时被 move 和 borrow
-                    let is_h2_ws = req.extensions().get::<::h2::ext::Protocol>()
-                        .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
-                        .unwrap_or(false);
-                    let req = req.map(|body| {
-                        let ext = if is_h2_ws { Extension::new_h2_ws(addr, is_tls) } else { Extension::new(addr, is_tls) };
-                        let body = ReqB::from(RequestBody::from(body));
-                        RequestExt::from_parts(body, ext)
-                    });
+        let local = LocalSet::new();
 
-                    queue.push(async move {
-                        let fut = service.call(req);
-                        h2_handler(fut, tx, date).await
-                    });
+        // writer loop：唯一操作 Connection 写侧的执行上下文
+        local.spawn_local(conn_writer_loop(write_rx));
+
+        // accept loop：只 accept 新 stream，spawn_local per-stream handler
+        let accept_result: Result<(), Error<S::Error, BE>> = local.run_until(async {
+            loop {
+                match io.accept().select(&mut ping_pong).await {
+                    SelectOutput::A(Some(Ok((req, respond)))) => {
+                        // RFC 8441：在 map 之前先读 extensions，避免 req 同时被 move 和 borrow
+                        let is_h2_ws = req.extensions().get::<::h2::ext::Protocol>()
+                            .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
+                            .unwrap_or(false);
+                        let req = req.map(|body| {
+                            let ext = if is_h2_ws { Extension::new_h2_ws(addr, is_tls) } else { Extension::new(addr, is_tls) };
+                            let body = ReqB::from(RequestBody::from(body));
+                            RequestExt::from_parts(body, ext)
+                        });
+
+                        let write_tx = write_tx.clone();
+                        let svc = Arc::clone(&service);
+                        let dt  = Rc::clone(&date);
+                        tokio::task::spawn_local(async move {
+                            h2_handler(svc.call(req), respond, &*dt, write_tx).await;
+                        });
+                    }
+                    SelectOutput::B(Ok(())) => {
+                        trace!("Connection keep-alive timeout. Shutting down");
+                        return Ok(());
+                    }
+                    SelectOutput::B(Err(e)) => return Err(From::from(e)),
+                    SelectOutput::A(None) => {
+                        trace!("Connection closed by remote. Shutting down");
+                        break;
+                    }
+                    SelectOutput::A(Some(Err(e))) => return Err(From::from(e)),
                 }
-                SelectOutput::B(SelectOutput::A(_)) => io.graceful_shutdown(),
-                SelectOutput::B(SelectOutput::B(Ok(_))) => {
-                    trace!("Connection keep-alive timeout. Shutting down");
-                    return Ok(());
-                }
-                SelectOutput::A(None) => {
-                    trace!("Connection closed by remote. Shutting down");
-                    break;
-                }
-                SelectOutput::A(Some(Err(e))) | SelectOutput::B(SelectOutput::B(Err(e))) => return Err(From::from(e)),
             }
-        }
+            Ok(())
+        }).await;
 
-        queue.drain().await;
+        // write_tx drop → writer loop channel 关闭 → writer loop 自然退出
+        drop(write_tx);
 
-        Ok(())
-    }
-}
-
-async fn try_poll_queue<F, E, S, B>(
-    queue: &mut Queue<F>,
-    ping_ping: &mut H2PingPong<'_>,
-) -> SelectOutput<(), Result<(), ::h2::Error>>
-where
-    F: Future<Output = Result<ConnectionState, E>>,
-    HttpServiceError<S, B>: From<E>,
-    S: fmt::Debug,
-    B: fmt::Debug,
-{
-    loop {
-        if queue.is_empty() {
-            return SelectOutput::B(ping_ping.await);
-        }
-
-        match queue.next2().await {
-            Ok(ConnectionState::KeepAlive) => {}
-            Ok(ConnectionState::Close) => return SelectOutput::A(()),
-            Err(e) => HttpServiceError::from(e).log("h2_dispatcher"),
-        }
+        accept_result
     }
 }
 
@@ -168,7 +238,7 @@ struct H2PingPong<'a> {
     on_flight: bool,
     keep_alive: Pin<&'a mut KeepAlive>,
     ping_pong: PingPong,
-    date: &'a DateTimeHandle,
+    date: Rc<DateTimeHandle>,
     ka_dur: Duration,
 }
 
@@ -214,41 +284,47 @@ impl Future for H2PingPong<'_> {
     }
 }
 
-enum ConnectionState {
-    KeepAlive,
-    Close,
-}
-
-// handle request/response and return if connection should go into graceful shutdown.
+/// per-stream handler（在 LocalSet 内 spawn_local）
+///
+/// 职责：
+/// 1. service.call() 获取响应
+/// 2. 构造响应头元数据
+/// 3. 收集小文件 body（在内存，通常同步）
+/// 4. 把 WriteCmd::Headers 发给 conn_writer_loop，handler 立即继续
+/// 5. 大文件：等 writer loop 返回 SendStream，然后流式发 DATA
+///
+/// HEADERS 发送完全由 writer loop 串行处理，消除并发锁竞争
 async fn h2_handler<Fut, B, SE, BE>(
     fut: Fut,
-    mut tx: SendResponse<Bytes>,
+    respond: SendResponse<Bytes>,
     date: &DateTimeHandle,
-) -> Result<ConnectionState, Error<SE, BE>>
+    write_tx: mpsc::UnboundedSender<WriteCmd>,
+)
 where
     Fut: Future<Output = Result<Response<B>, SE>>,
-    B: Stream<Item = Result<Bytes, BE>>,
-    BE: fmt::Debug,
+    B: Stream<Item = Result<Bytes, BE>> + 'static,
+    BE: fmt::Debug + 'static,
+    SE: fmt::Debug,
 {
-    // split response to header and body.
-    let (res, body) = fut.await.map_err(Error::Service)?.into_parts();
-    let mut res = Response::from_parts(res, ());
+    // 1. 调用 service，获取响应
+    let resp = match fut.await {
+        Ok(r) => r,
+        Err(e) => {
+            trace!("h2 service error: {:?}", e);
+            return;
+        }
+    };
 
-    // set response version.
+    let (res, body) = resp.into_parts();
+    let mut res = Response::from_parts(res, ());
     *res.version_mut() = Version::HTTP_2;
 
-    // check eof state of response body and make sure header is valid.
-    let is_eof = match BodySize::from_stream(&body) {
-        BodySize::None => {
-            debug_assert!(!res.headers().contains_key(CONTENT_LENGTH));
-            true
-        }
-        BodySize::Stream => {
-            debug_assert!(!res.headers().contains_key(CONTENT_LENGTH));
-            false
-        }
+    // 2. 构造响应头元数据
+    let body_size = BodySize::from_stream(&body);
+    let is_eof = match body_size {
+        BodySize::None  => { debug_assert!(!res.headers().contains_key(CONTENT_LENGTH)); true  }
+        BodySize::Stream => { debug_assert!(!res.headers().contains_key(CONTENT_LENGTH)); false }
         BodySize::Sized(n) => {
-            // add an content-length header if there is non provided.
             if !res.headers().contains_key(CONTENT_LENGTH) {
                 res.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from(n));
             }
@@ -257,63 +333,110 @@ where
     };
 
     let mut trailers = HeaderMap::with_capacity(0);
-
     while let Some(value) = res.headers_mut().remove(TRAILER) {
         let name = HeaderName::from_bytes(value.as_bytes()).unwrap();
         let value = res.headers_mut().remove(name.clone()).unwrap();
         trailers.append(name, value);
     }
-
     if !res.headers().contains_key(DATE) {
         let date = date.with_date(HeaderValue::from_bytes).unwrap();
         res.headers_mut().insert(DATE, date);
     }
+    // Connection: close 由 writer loop 处理（通过 graceful_shutdown 信号）
+    res.headers_mut().remove(CONNECTION);
 
-    // check response header to determine if user want connection be closed.
-    let state = res
-        .headers_mut()
-        .remove(CONNECTION)
-        .and_then(|v| {
-            v.as_bytes()
-                .eq_ignore_ascii_case(b"close")
-                .then_some(ConnectionState::Close)
-        })
-        .unwrap_or(ConnectionState::KeepAlive);
+    if is_eof {
+        // 无 body：end_stream=true，writer loop 用 send_response(true) 一帧完成
+        let (stream_tx, _) = oneshot::channel();
+        let _ = write_tx.send(WriteCmd::Headers {
+            respond, res,
+            end_stream: true,
+            inline_body: None,
+            trailers,
+            stream_tx,
+        });
+        return;
+    }
 
-    // send response and body(if there is one).
-    let mut stream = tx.send_response(res, is_eof)?;
-
-    if !is_eof {
-        let mut body = pin!(body);
-
-        while let Some(res) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-            let mut chunk = res.map_err(Error::Body)?;
-
-            while !chunk.is_empty() {
-                let len = chunk.len();
-
-                stream.reserve_capacity(cmp::min(len, CHUNK_SIZE));
-
-                // poll_capacity 返回 None 表示客户端已关闭 H2 stream（主动取消/断开）
-                // 优雅返回 CANCEL 错误，不 panic
-                let cap = match poll_fn(|cx| stream.poll_capacity(cx)).await {
-                    Some(r) => r?,
-                    None => return Err(::h2::Error::from(::h2::Reason::CANCEL).into()),
-                };
-
-                // Split chuck to writeable size and send to client.
-                let bytes = chunk.split_to(cmp::min(cap, len));
-
-                stream.send_data(bytes, false)?;
+    // 3. 小文件快路：收集 body，打包成 inline_body 随 HEADERS 一起发
+    //    HEADERS + DATA 在 writer loop 里连续处理，等价于合并帧
+    if let BodySize::Sized(n) = body_size {
+        if n as usize <= SMALL_BODY_INLINE {
+            let mut body = pin!(body);
+            let mut buf = crate::bytes::BytesMut::with_capacity(n as usize);
+            let mut body_err = false;
+            while let Some(r) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+                match r {
+                    Ok(c) => buf.extend_from_slice(&c),
+                    Err(_) => { body_err = true; break; }
+                }
             }
+            let inline = if body_err || buf.is_empty() { None } else { Some(buf.freeze()) };
+            let (stream_tx, _) = oneshot::channel();
+            let _ = write_tx.send(WriteCmd::Headers {
+                respond, res,
+                end_stream: false,
+                inline_body: inline,
+                trailers,
+                stream_tx,
+            });
+            return;
         }
     }
 
-    stream.send_trailers(trailers)?;
+    // 4. 大文件：通过 oneshot 接收 writer loop 返回的 SendStream，然后流式发 DATA
+    // trailers 保留在 handler 里，writer loop 对大文件只负责发 HEADERS + 返回 SendStream
+    let (stream_tx, stream_rx) = oneshot::channel::<::h2::SendStream<Bytes>>();
+    if write_tx.send(WriteCmd::Headers {
+        respond, res,
+        end_stream: false,
+        inline_body: None,
+        trailers: HeaderMap::with_capacity(0), // 大文件 trailers 由 handler 自己发
+        stream_tx,
+    }).is_err() {
+        return; // 连接已关闭
+    }
 
-    Ok(state)
+    // 等待 writer loop 发完 HEADERS，返回 SendStream
+    let mut stream = match stream_rx.await {
+        Ok(s) => s,
+        Err(_) => return, // writer loop 已退出（连接关闭）
+    };
+
+    // 5. 大文件流式发 DATA：capacity() 先判断，有窗口直接发，无窗口才 await
+    let mut body = pin!(body);
+    loop {
+        let chunk = match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+            Some(Ok(c)) => c,
+            Some(Err(_)) => return,
+            None => break,
+        };
+        if chunk.is_empty() { continue; }
+
+        let mut offset = 0usize;
+        let chunk_len = chunk.len();
+        while offset < chunk_len {
+            let cap = stream.capacity();
+            if cap > 0 {
+                let n = cmp::min(cap, chunk_len - offset);
+                let bytes = chunk.slice(offset..offset + n);
+                if stream.send_data(bytes, false).is_err() { return; }
+                offset += n;
+                continue;
+            }
+            stream.reserve_capacity(cmp::min(chunk_len - offset, CHUNK_SIZE));
+            match poll_fn(|cx| stream.poll_capacity(cx)).await {
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => return,
+            }
+        }
+    }
+    // body 全部发完，发 trailers 结束 stream（END_STREAM）
+    let _ = stream.send_trailers(trailers);
 }
 
-// 1MB 帧对齐 max_frame_size(1MB)，大文件时单个 chunk 只需 1 次 send_data 调用
-// 对标 Cloudflare/Caddy 的大帧策略，framer 调度开销降低 64 倍
-const CHUNK_SIZE: usize = 1024 * 1024;
+// 小文件内联阈值：≤ 64KB，HEADERS + DATA 在 writer loop 里连续处理
+const SMALL_BODY_INLINE: usize = 64 * 1024;
+
+// 大文件 chunk 大小：256KB
+const CHUNK_SIZE: usize = 256 * 1024;

@@ -16,7 +16,7 @@ use core::{
 
 use std::{borrow::Cow, error};
 
-use futures_core::stream::{LocalBoxStream, Stream};
+use futures_core::stream::{BoxStream, Stream};
 use pin_project_lite::pin_project;
 
 use super::{
@@ -238,7 +238,7 @@ where
 }
 
 /// type erased stream body.
-pub struct BoxBody(LocalBoxStream<'static, Result<Bytes, BodyError>>);
+pub struct BoxBody(BoxStream<'static, Result<Bytes, BodyError>>);
 
 impl Default for BoxBody {
     fn default() -> Self {
@@ -250,7 +250,7 @@ impl BoxBody {
     #[inline]
     pub fn new<B, T, E>(body: B) -> Self
     where
-        B: Stream<Item = Result<T, E>> + 'static,
+        B: Stream<Item = Result<T, E>> + Send + 'static,
         T: Into<Bytes>,
         E: Into<BodyError>,
     {
@@ -333,7 +333,7 @@ impl ResponseBody {
     #[inline]
     pub fn box_stream<B, T, E>(stream: B) -> Self
     where
-        B: Stream<Item = Result<T, E>> + 'static,
+        B: Stream<Item = Result<T, E>> + Send + 'static,
         T: Into<Bytes>,
         E: Into<BodyError>,
     {
@@ -387,7 +387,7 @@ impl<B> ResponseBody<B> {
     #[inline]
     pub fn into_boxed<T, E>(self) -> ResponseBody
     where
-        B: Stream<Item = Result<T, E>> + 'static,
+        B: Stream<Item = Result<T, E>> + Send + 'static,
         T: Into<Bytes>,
         E: error::Error + Send + Sync + 'static,
     {

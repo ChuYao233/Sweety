@@ -471,7 +471,7 @@ where
         R::Response:
             ReadyService + for<'r> Service<WebContext<'r, C>, Response = WebResponse<ResB>, Error = SE> + 'static,
         SE: for<'r> Service<WebContext<'r, C>, Response = WebResponse, Error = Infallible> + 'static,
-        ResB: Stream<Item = Result<Bytes, BE>> + 'static,
+        ResB: Stream<Item = Result<Bytes, BE>> + Send + 'static,
         BE: error::Error + Send + Sync + 'static,
         CF: IntoCtx<Ctx = C> + 'static,
         C: 'static,

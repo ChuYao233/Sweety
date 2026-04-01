@@ -71,6 +71,11 @@ impl DateTimeService {
     pub fn get(&self) -> &DateTimeHandle {
         self.state.deref()
     }
+
+    #[inline]
+    pub fn get_rc(&self) -> Rc<DateTimeHandle> {
+        Rc::clone(&self.state)
+    }
 }
 
 pub(crate) type DateTimeHandle = RefCell<DateTimeState>;

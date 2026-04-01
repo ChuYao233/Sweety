@@ -20,14 +20,14 @@ pub type H2Service<St, S, A, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: us
 impl<St, S, ResB, BE, A, TlsSt, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE_BUF_LIMIT: usize>
     Service<(St, SocketAddr)> for H2Service<St, S, A, HEADER_LIMIT, READ_BUF_LIMIT, WRITE_BUF_LIMIT>
 where
-    S: Service<Request<RequestExt<RequestBody>>, Response = Response<ResB>>,
+    S: Service<Request<RequestExt<RequestBody>>, Response = Response<ResB>> + 'static,
     S::Error: fmt::Debug,
     A: Service<St, Response = TlsSt>,
     St: AsyncIo,
     TlsSt: AsyncIo,
     HttpServiceError<S::Error, BE>: From<A::Error>,
-    ResB: Stream<Item = Result<Bytes, BE>>,
-    BE: fmt::Debug,
+    ResB: Stream<Item = Result<Bytes, BE>> + Send + 'static,
+    BE: fmt::Debug + Send + 'static,
 {
     type Response = ();
     type Error = HttpServiceError<S::Error, BE>;
@@ -79,8 +79,8 @@ where
             true, // H2 service 只在 TLS accept 后创建
             timer,
             self.config.keep_alive_timeout,
-            &self.service,
-            self.date.get(),
+            std::sync::Arc::clone(&self.service),
+            self.date.get_rc(),
         );
 
         dispatcher.run().await?;

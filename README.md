@@ -9,7 +9,7 @@
 > **测试环境**：Intel J4105 四核四线程 @ 1.5GHz · 2GB RAM · Debian Linux
 > **测试工具**：[bombardier](https://github.com/codesenberg/bombardier) v1.2.6
 > **对比版本**：Nginx 1.28.1 vs Sweety v0.7.1
-> **协议**：HTTPS/2，TLS 1.3，Keep-Alive，证书 RSA 2048
+> **协议**：HTTPS/2，TLS 1.3，Keep-Alive，证书 ECDSA P-256
 >
 > **复现命令**：
 > ```bash

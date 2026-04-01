@@ -129,10 +129,16 @@ where
         self
     }
 
-    /// HTTP/2 \u5355\u8fde\u63a5\u6700\u5927\u540c\u65f6\u5728\u9014 handler \u6570\uff080 = \u4e0d\u9650\u5236\uff09
-    /// \u8d85\u9650\u65f6\u53d1 GOAWAY \u4f18\u96c5\u62d2\u7edd\u65b0\u6d41\uff0c\u540e\u7eed\u8bf7\u6c42\u5e94\u5728\u65b0\u8fde\u63a5\u4e0a\u91cd\u8bd5
+    /// HTTP/2 单连接最大同时在途 handler 数（0 = 不限制）
+    /// 超限时发 GOAWAY 优雅拒绝新流，后续请求应在新连接上重试
     pub fn h2_max_pending_per_conn(mut self, n: usize) -> Self {
         self.config = self.config.h2_max_pending_per_conn(n);
+        self
+    }
+
+    /// HTTP/2 RST 洪水防护：单连接最大并发 reset 流数（默认 200）
+    pub fn h2_max_concurrent_reset_streams(mut self, n: usize) -> Self {
+        self.config = self.config.h2_max_concurrent_reset_streams(n);
         self
     }
 

@@ -123,6 +123,11 @@ pub struct GlobalConfig {
     /// 0 表示不限制，依赖 h2_max_concurrent_streams 做协议级流控
     #[serde(default)]
     pub h2_max_pending_per_conn: usize,
+
+    /// HTTP/2 RST 洪水防护：单连接最大并发 reset 流数（默认 200）
+    /// h2 crate 默认值为 20，压测场景需要调高
+    #[serde(default = "default_h2_max_concurrent_reset_streams")]
+    pub h2_max_concurrent_reset_streams: usize,
 }
 
 impl Default for GlobalConfig {
@@ -148,6 +153,7 @@ impl Default for GlobalConfig {
             log_level: "info".into(),
             h2_max_concurrent_streams: default_h2_max_concurrent_streams(),
             h2_max_pending_per_conn: 0,
+            h2_max_concurrent_reset_streams: default_h2_max_concurrent_reset_streams(),
         }
     }
 }
@@ -317,12 +323,20 @@ pub struct TlsConfig {
     #[serde(default)]
     pub dns_provider: Option<DnsProviderConfig>,
 
+    /// 启用的 HTTP 协议列表，序列即优先级（客户端支持时优先应答列表第一个）
+    /// 可选属性："h3" / "h2" / "http/1.1"
+    /// 不填则默认全开 ["h3", "h2", "http/1.1"]（h3 优先通过 Alt-Svc 广播，TCP 侧 h2 优先）
+    /// 示例：
+    ///   protocols = ["h2", "http/1.1"]  # 禁用 HTTP/3
+    ///   protocols = ["h3", "h2"]        # 禁用 HTTP/1.1
+    ///   protocols = ["http/1.1"]        # 仅 H1（极次兼容模式）
+    #[serde(default = "default_protocols")]
+    pub protocols: Vec<String>,
+
     /// HTTP/3 QUIC 传输层调优（不填使用内置性能默认值）
     #[serde(default)]
     pub http3: Http3Config,
 }
-
-/// HTTP/3 QUIC 传输层调优参数
 ///
 /// 对应 quinn::TransportConfig 的关键字段，不配置则使用性能优化的默认值
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1027,6 +1041,7 @@ fn default_log_level() -> String { "info".into() }
 fn default_rewrite_flag() -> RewriteFlag { RewriteFlag::Last }
 fn default_worker_connections() -> usize { 51200 }
 fn default_h2_max_concurrent_streams() -> u32 { 102400 }
+fn default_h2_max_concurrent_reset_streams() -> usize { 200 }
 fn default_keepalive_timeout() -> u64 { 60 }
 fn default_fastcgi_connect_timeout() -> u64 { 5 }
 fn default_fastcgi_read_timeout() -> u64 { 60 }
@@ -1040,6 +1055,7 @@ fn default_tls_max_version() -> String { "tls1.3".into() }
 fn default_acme_renew_days() -> u64 { 30 }
 fn default_acme_provider() -> String { "letsencrypt".into() }
 fn default_acme_challenge() -> String { "http01".into() }
+fn default_protocols() -> Vec<String> { vec!["h3".into(), "h2".into(), "http/1.1".into()] }
 fn default_cache_max_entries() -> usize { 1000 }
 fn default_cache_ttl() -> u64 { 60 }
 fn default_cache_statuses() -> Vec<u16> { vec![200, 301, 302] }

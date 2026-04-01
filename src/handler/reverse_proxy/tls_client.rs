@@ -8,25 +8,26 @@ use rustls::ClientConfig as RustlsClientConfig;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-/// 构建 TLS 客户端配置
-///
-/// - `insecure = false`：使用 webpki 根证书验证服务端（生产推荐）
-/// - `insecure = true`：跳过所有证书验证（内网自签名证书 / 开发调试）
-pub fn build_tls_client_config(insecure: bool) -> Arc<RustlsClientConfig> {
-    if insecure {
-        build_insecure_config()
-    } else {
-        build_secure_config()
-    }
-}
+/// 全局单例 TLS 客户端配置（启用 session cache，跳过证书验证模式）
+static TLS_CLIENT_INSECURE: std::sync::OnceLock<Arc<RustlsClientConfig>> = std::sync::OnceLock::new();
+/// 全局单例 TLS 客户端配置（启用 session cache，标准证书验证模式）
+static TLS_CLIENT_SECURE:   std::sync::OnceLock<Arc<RustlsClientConfig>> = std::sync::OnceLock::new();
 
 /// 对已建立的 TCP 连接执行 TLS 握手，返回加密流
+///
+/// ClientConfig 全局单例：
+/// - 启用 session cache（ClientSessionMemoryCache 1024），允许 TLS session resumption
+/// - 避免每次请求新建 config 导致 session cache 失效
 pub async fn tls_connect(
     tcp: TcpStream,
     sni: &str,
     insecure: bool,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let config = build_tls_client_config(insecure);
+    let config = if insecure {
+        TLS_CLIENT_INSECURE.get_or_init(build_insecure_config).clone()
+    } else {
+        TLS_CLIENT_SECURE.get_or_init(build_secure_config).clone()
+    };
     let connector = TlsConnector::from(config);
     let server_name = rustls::pki_types::ServerName::try_from(sni.to_string())
         .map_err(|e| anyhow::anyhow!("无效的 TLS SNI '{}': {}", sni, e))?;
@@ -80,10 +81,12 @@ fn build_insecure_config() -> Arc<RustlsClientConfig> {
         }
     }
 
-    let cfg = RustlsClientConfig::builder()
+    let mut cfg = RustlsClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
+    // 启用 session cache，允许 TLS session resumption，避免每次全量握手
+    cfg.resumption = rustls::client::Resumption::in_memory_sessions(1024);
     Arc::new(cfg)
 }
 
@@ -91,8 +94,9 @@ fn build_insecure_config() -> Arc<RustlsClientConfig> {
 fn build_secure_config() -> Arc<RustlsClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let cfg = RustlsClientConfig::builder()
+    let mut cfg = RustlsClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
+    cfg.resumption = rustls::client::Resumption::in_memory_sessions(1024);
     Arc::new(cfg)
 }

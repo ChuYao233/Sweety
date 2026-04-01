@@ -55,11 +55,31 @@ impl TlsManager {
             .context("TLS 版本配置失败")?
             .with_no_client_auth()
             .with_cert_resolver(resolver.clone());
-        // h2 优先：客户端支持 HTTP/2 时优先协商 h2，不支持时降级到 http/1.1
-        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        // TLS 1.2 session cache：缓存 10240 个 session，减少重复握手开销
-        // TLS 1.3 session tickets 由 rustls 自动处理，无需额外配置
-        // session cache 65536：高并发时大量客户端复用 TLS session，避免重复握手
+        // 根据 protocols 列表构建 TCP TLS ALPN（不包含 h3，h3 走 QUIC UDP 不经过 TCP TLS）
+        // 序列即协商优先级：客户端支持多个时取第一个匹配项
+        // 合并所有站点的 protocols 控制该端口的协议开关
+        let mut alpn: Vec<Vec<u8>> = Vec::new();
+        for site in sites {
+            let protos = site.tls.as_ref()
+                .map(|t| t.protocols.as_slice())
+                .unwrap_or(&[]);
+            for p in protos {
+                let bytes: Vec<u8> = match p.as_str() {
+                    "h2"       => b"h2".to_vec(),
+                    "http/1.1" => b"http/1.1".to_vec(),
+                    _          => continue, // h3 跳过，h3 的 ALPN 在 QUIC 配置里单独设置
+                };
+                if !alpn.contains(&bytes) { alpn.push(bytes); }
+            }
+        }
+        // ALPN 为空说明 protocols 仅含 h3（h3 走 QUIC 不经过 TCP TLS）
+        // 此时 TCP 侧只保留 http/1.1 做最小引导：
+        // 浏览器首次 TCP 连接协商 HTTP/1.1，拿到 Alt-Svc: h3 响应头后立即切换 QUIC
+        // 若回退到 h2，浏览器会长期复用 h2 多路复用连接，不积极尝试 H3
+        if alpn.is_empty() {
+            alpn = vec![b"http/1.1".to_vec()];
+        }
+        cfg.alpn_protocols = alpn;
         cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(65536);
         Ok((cfg, resolver))
     }

@@ -51,21 +51,18 @@ where
             let mut b = ::h2::server::Builder::new();
             b.enable_connect_protocol()
                 // 连接级接收窗口：128MB
-                // BDP = 带宽 × RTT，千兆网卡 RTT=20ms → BDP=2.5MB，128MB 足够跑满多路并发流
                 .initial_connection_window_size(128 * 1024 * 1024)
-                // 流级接收窗口：16MB，单个大文件流不因 WINDOW_UPDATE 频繁停顿
+                // 流级接收窗口：16MB
                 .initial_window_size(16 * 1024 * 1024)
                 // 最大并发流：从配置读取（等价 Nginx http2_max_concurrent_streams）
                 .max_concurrent_streams(self.config.h2_max_concurrent_streams)
-                // 最大帧：1MB（规范允许最大 16MB）
-                // 大文件时 1MB chunk 只需 1 个帧，framer 调度开销降低 64 倍
-                // 对标 Cloudflare/Caddy 的大帧策略
+                // 最大帧：1MB
                 .max_frame_size(1024 * 1024)
                 // 最大头部列表：32KB
                 .max_header_list_size(32768)
-                // RST 洪水防护
-                .max_concurrent_reset_streams(1000)
-                // 发送缓冲：16MB，防止大文件发送时生产者频繁等待
+                // RST 洪水防护（从配置读取）
+                .max_concurrent_reset_streams(self.config.h2_max_concurrent_reset_streams)
+                // 发送缓冲：16MB
                 .max_send_buffer_size(16 * 1024 * 1024);
             b.handshake(PollIoAdapter(tls_stream))
         }

@@ -46,6 +46,7 @@
 | `acme_renew_days_before` | Renew N days before expiry |
 | `certs[]` | `{cert = "...", key = "..."}` static certs |
 | `min_version` / `max_version` | `tls1.2` / `tls1.3` |
+| `protocols` | Enabled HTTP protocols in priority order: `["h3", "h2", "http/1.1"]` (default all) |
 
 ## Upstreams (`[[sites.upstreams]]`)
 

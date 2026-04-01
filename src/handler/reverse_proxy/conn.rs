@@ -89,7 +89,9 @@ pub async fn forward_request(
             known_content_length, has_expect_continue,
             strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
             sub_filter, proxy_cache, client_proto,
-            read_timeout_secs, write_timeout_secs, proxy_buffering, attempt == 0).await
+            read_timeout_secs, write_timeout_secs, proxy_buffering, attempt == 0,
+            pool.clone(), key.clone(), created_at, req_count,
+            keepalive_requests, keepalive_time, keepalive_max_idle).await
         {
             Ok((resp, maybe_conn, _body_consumed)) => {
                 if let Some(c) = maybe_conn {
@@ -226,6 +228,14 @@ async fn send_recv_pooled(
     proxy_buffering: bool,
     // 是否允许在发送请求头失败时回退（第一次尝试 idle 连接时为 true）
     allow_retry_on_header_fail: bool,
+    // 流式路径读完后还连接用的参数
+    stream_pool: ConnPool,
+    stream_key: String,
+    stream_created_at: Instant,
+    stream_req_count: u64,
+    stream_ka_requests: u64,
+    stream_ka_time: u64,
+    stream_ka_max_idle: usize,
 ) -> Result<(WebResponse, Option<PooledConn>, bool), (anyhow::Error, bool)> {
     let read_timeout  = Duration::from_secs(if read_timeout_secs  > 0 { read_timeout_secs  } else { 60 });
     let write_timeout = Duration::from_secs(if write_timeout_secs > 0 { write_timeout_secs } else { 60 });
@@ -418,92 +428,107 @@ async fn send_recv_pooled(
             || http_status.is_informational();
 
         if no_body {
+            // no_body 但有连接可复用（上游 keep-alive）
+            let maybe_conn = if !resp_conn_close { Some(buf.into_inner()) } else { None };
             let mut resp = WebResponse::new(ResponseBody::none());
             *resp.status_mut() = http_status;
             apply_response_headers(&mut resp, &response_headers,
                 strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
-            return Ok((resp, None, true));
+            return Ok((resp, maybe_conn, true));
         }
 
-        // 用 bounded channel 流式转发：生产者读上游解码后数据，消费者写客户端
-        // cap=4：小容量将背压传递给上游——下游慢客户端时 channel 充往，生产者 await，停止读上游
-        // 等价 Nginx 的 read-write 强耦合背压语义
         let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
-        // per-chunk read timeout：等价 Nginx proxy_read_timeout 逐包语义
-        // 每次从上游读取数据的最大等待时间，超时即关闭连接（不是整体响应超时）
         let per_chunk_timeout = read_timeout;
+        // 上游 Connection: close 时不归还连接
+        let can_reuse = !resp_conn_close;
 
         if resp_is_chunked {
             // chunked 上游：解码后用 BytesMut.freeze() 零拷贝转 Bytes
+            // 读完整个 chunked 流后把连接归还到池
             tokio::spawn(async move {
                 let mut reader = buf;
                 let mut size_line = String::new();
-                loop {
+                let mut ok = true;
+                'outer: loop {
                     size_line.clear();
-                    // 逐包超时：每个 chunk size 行的读取都有独立超时
                     match tokio::time::timeout(per_chunk_timeout, reader.read_line(&mut size_line)).await {
-                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => { ok = false; break; }
                         Ok(Ok(_)) => {}
                     }
                     let size_str = size_line.trim().split(';').next().unwrap_or("0");
                     let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
                     if chunk_size == 0 {
+                        // 0-chunk: 读完结束行
                         let mut trailer = String::new();
                         let _ = reader.read_line(&mut trailer).await;
                         break;
                     }
-                    // BytesMut 直接读入，freeze() 零拷贝转 Bytes
                     let mut chunk_buf = bytes::BytesMut::with_capacity(chunk_size);
                     chunk_buf.resize(chunk_size, 0);
                     let mut offset = 0;
                     while offset < chunk_size {
-                        // 逐包超时：每次 read 都有独立超时
                         match tokio::time::timeout(per_chunk_timeout, reader.read(&mut chunk_buf[offset..])).await {
-                            Ok(Ok(0)) => break,
+                            Ok(Ok(0)) => { ok = false; break 'outer; }
                             Ok(Ok(n)) => offset += n,
-                            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                            Ok(Err(e)) => { let _ = tx.send(Err(e)).await; return; }
+                            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => { ok = false; break 'outer; }
+                            Ok(Err(e)) => { let _ = tx.send(Err(e)).await; ok = false; break 'outer; }
                             Err(_) => {
                                 let e = std::io::Error::new(std::io::ErrorKind::TimedOut, "上游响应体读取超时");
                                 let _ = tx.send(Err(e)).await;
-                                return;
+                                ok = false; break 'outer;
                             }
                         }
                     }
                     chunk_buf.truncate(offset);
-                    if tx.send(Ok(chunk_buf.freeze())).await.is_err() { break; }
-                    // 读 chunk 后面的 \r\n
+                    if tx.send(Ok(chunk_buf.freeze())).await.is_err() { ok = false; break; }
                     let mut crlf = [0u8; 2];
                     let _ = reader.read_exact(&mut crlf).await;
                 }
+                // ok 且上游未要求关闭：归还连接到池
+                if ok && can_reuse {
+                    stream_pool.release(
+                        &stream_key, reader.into_inner(),
+                        stream_created_at, stream_req_count + 1,
+                        stream_ka_requests, stream_ka_time, stream_ka_max_idle,
+                    );
+                }
             });
         } else {
-            // Content-Length 或 EOF 上游：BytesMut.freeze() 零拷贝透传
+            // Content-Length 或 EOF 上游
             let stream_len = resp_content_length.unwrap_or(usize::MAX);
+            let is_eof_mode = resp_content_length.is_none();
             let chunk_size = crate::handler::sendfile::STREAM_CHUNK;
             tokio::spawn(async move {
                 let mut reader = buf;
                 let mut remaining = stream_len;
                 let mut heap = bytes::BytesMut::with_capacity(chunk_size);
+                let mut ok = true;
                 loop {
                     if remaining == 0 { break; }
                     let to_read = remaining.min(chunk_size);
                     heap.resize(to_read, 0);
-                    // 逐包超时：每次 read 都有独立超时
                     match tokio::time::timeout(per_chunk_timeout, reader.read(&mut heap[..to_read])).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => {
                             remaining = remaining.saturating_sub(n);
-                            // split_to(n).freeze()：将前 n 字节的所有权转移，不复制
-                            if tx.send(Ok(heap.split_to(n).freeze())).await.is_err() { break; }
+                            if tx.send(Ok(heap.split_to(n).freeze())).await.is_err() { ok = false; break; }
                         }
-                        Ok(Err(e)) => { let _ = tx.send(Err(e)).await; break; }
+                        Ok(Err(e)) => { let _ = tx.send(Err(e)).await; ok = false; break; }
                         Err(_) => {
                             let e = std::io::Error::new(std::io::ErrorKind::TimedOut, "上游响应体读取超时");
                             let _ = tx.send(Err(e)).await;
-                            break;
+                            ok = false; break;
                         }
                     }
+                }
+                // Content-Length 模式 + 无错误 + 上游未要求关闭：归还连接到池
+                // EOF 模式（is_eof_mode）上游自动关连接，不归还
+                if ok && !is_eof_mode && can_reuse {
+                    stream_pool.release(
+                        &stream_key, reader.into_inner(),
+                        stream_created_at, stream_req_count + 1,
+                        stream_ka_requests, stream_ka_time, stream_ka_max_idle,
+                    );
                 }
             });
         }

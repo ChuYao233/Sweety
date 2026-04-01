@@ -197,6 +197,7 @@ impl SweetyServer {
         if cfg.global.h2_max_pending_per_conn > 0 {
             server = server.h2_max_pending_per_conn(cfg.global.h2_max_pending_per_conn);
         }
+        server = server.h2_max_concurrent_reset_streams(cfg.global.h2_max_concurrent_reset_streams);
 
         // 绑定各站点监听端口（HTTP 明文）
         let http_ports = collect_http_ports(&cfg);
@@ -859,11 +860,16 @@ fn collect_tls_ports_grouped(
 }
 
 /// 收集 HTTP/3 QUIC 端口及对应 TLS 配置（取每端口第一个站点的证书）
+/// 仅收集 protocols 列表中包含 "h3" 的站点对应的端口
 fn collect_h3_ports(cfg: &AppConfig) -> Vec<(u16, &crate::config::model::TlsConfig)> {
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for site in &cfg.sites {
         if let Some(tls) = &site.tls {
+            // protocols 不含 h3 则不绑定 QUIC 端口（等价 Nginx 不配置 listen ... quic）
+            if !tls.protocols.iter().any(|p| p == "h3") {
+                continue;
+            }
             for &p in &site.listen_tls {
                 if seen.insert(p) {
                     result.push((p, tls));

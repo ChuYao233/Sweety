@@ -1,6 +1,7 @@
 # Sweety
 
 高性能、单文件部署的多站点 Web 服务器，纯 Rust 编写。
+Sweety 试图兼顾 nginx 级别的可调优能力，以及 Caddy 式的最小配置体验。
 
 底层 HTTP 栈 fork 自 [xitca-web](https://github.com/HFQR/xitca-web)，自主维护于 `vendor/` 目录，包含多项生产场景性能修复和优化。
 

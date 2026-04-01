@@ -112,6 +112,17 @@ pub struct GlobalConfig {
     /// 也可通过环境变量 RUST_LOG 覆盖（环境变量优先级更高）
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// HTTP/2 单连接最大并发流数（等价 Nginx http2_max_concurrent_streams，默认 1000）
+    /// 超出后服务端发送 GOAWAY，客户端会新开连接
+    #[serde(default = "default_h2_max_concurrent_streams")]
+    pub h2_max_concurrent_streams: u32,
+
+    /// HTTP/2 单连接最大同时在途 handler 数量（默认 0 = 不限制）
+    /// 超出后服务端发送 GOAWAY 优雅拒绝新流，等价 Nginx 连接队列限制
+    /// 0 表示不限制，依赖 h2_max_concurrent_streams 做协议级流控
+    #[serde(default)]
+    pub h2_max_pending_per_conn: usize,
 }
 
 impl Default for GlobalConfig {
@@ -135,6 +146,8 @@ impl Default for GlobalConfig {
             prometheus_enabled: true,
             prometheus_path: "/metrics".into(),
             log_level: "info".into(),
+            h2_max_concurrent_streams: default_h2_max_concurrent_streams(),
+            h2_max_pending_per_conn: 0,
         }
     }
 }
@@ -1013,6 +1026,7 @@ fn default_prometheus_path() -> String { "/metrics".into() }
 fn default_log_level() -> String { "info".into() }
 fn default_rewrite_flag() -> RewriteFlag { RewriteFlag::Last }
 fn default_worker_connections() -> usize { 51200 }
+fn default_h2_max_concurrent_streams() -> u32 { 102400 }
 fn default_keepalive_timeout() -> u64 { 60 }
 fn default_fastcgi_connect_timeout() -> u64 { 5 }
 fn default_fastcgi_read_timeout() -> u64 { 60 }

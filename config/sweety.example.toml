@@ -76,6 +76,16 @@ prometheus_path = "/metrics"
 # 也可通过环境变量 RUST_LOG 覆盖（环境变量优先）
 log_level = "info"
 
+# HTTP/2 单连接最大并发流数
+# 等价 Nginx http2_max_concurrent_streams
+# 高并发小请求（API/静态资源）可适当调大，默认 102400
+h2_max_concurrent_streams = 102400
+
+# HTTP/2 单连接最大同时在途 handler 数（应用级背压）
+# 超出时发 GOAWAY 优雅拒绝新流，客户端会新开连接重试
+# 0 = 不限制（依赖 h2_max_concurrent_streams 协议级流控）
+h2_max_pending_per_conn = 0
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 站点 1：静态网站（HTTPS + ACME 自动证书 + Brotli/gzip 压缩）
 # 展示：TLS 所有子项、gzip/brotli、HSTS、force_https、error_page、try_files

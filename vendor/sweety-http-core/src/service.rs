@@ -147,6 +147,7 @@ where
                             self.is_tls,
                             timer.as_mut(),
                             self.config.keep_alive_timeout,
+                            self.config.h2_max_pending_per_conn,
                             Arc::clone(&self.service),
                             self.date.get_rc(),
                         )

@@ -55,8 +55,8 @@ where
                 .initial_connection_window_size(128 * 1024 * 1024)
                 // 流级接收窗口：16MB，单个大文件流不因 WINDOW_UPDATE 频繁停顿
                 .initial_window_size(16 * 1024 * 1024)
-                // 最大并发流：1000
-                .max_concurrent_streams(1000)
+                // 最大并发流：从配置读取（等价 Nginx http2_max_concurrent_streams）
+                .max_concurrent_streams(self.config.h2_max_concurrent_streams)
                 // 最大帧：1MB（规范允许最大 16MB）
                 // 大文件时 1MB chunk 只需 1 个帧，framer 调度开销降低 64 倍
                 // 对标 Cloudflare/Caddy 的大帧策略
@@ -79,6 +79,7 @@ where
             true, // H2 service 只在 TLS accept 后创建
             timer,
             self.config.keep_alive_timeout,
+            self.config.h2_max_pending_per_conn,
             std::sync::Arc::clone(&self.service),
             self.date.get_rc(),
         );

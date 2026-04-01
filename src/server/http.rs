@@ -192,6 +192,12 @@ impl SweetyServer {
         );
         server = server.keep_alive_timeout(ka_timeout);
 
+        // HTTP/2 配置（对标 Nginx http2_max_concurrent_streams）
+        server = server.h2_max_concurrent_streams(cfg.global.h2_max_concurrent_streams);
+        if cfg.global.h2_max_pending_per_conn > 0 {
+            server = server.h2_max_pending_per_conn(cfg.global.h2_max_pending_per_conn);
+        }
+
         // 绑定各站点监听端口（HTTP 明文）
         let http_ports = collect_http_ports(&cfg);
         for port in &http_ports {

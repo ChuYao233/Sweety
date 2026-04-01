@@ -123,6 +123,19 @@ where
         self
     }
 
+    /// HTTP/2 \u5355\u8fde\u63a5\u6700\u5927\u5e76\u53d1\u6d41\u6570\uff08\u7b49\u4ef7 Nginx http2_max_concurrent_streams\uff0c\u9ed8\u8ba4 1000\uff09
+    pub fn h2_max_concurrent_streams(mut self, n: u32) -> Self {
+        self.config = self.config.h2_max_concurrent_streams(n);
+        self
+    }
+
+    /// HTTP/2 \u5355\u8fde\u63a5\u6700\u5927\u540c\u65f6\u5728\u9014 handler \u6570\uff080 = \u4e0d\u9650\u5236\uff09
+    /// \u8d85\u9650\u65f6\u53d1 GOAWAY \u4f18\u96c5\u62d2\u7edd\u65b0\u6d41\uff0c\u540e\u7eed\u8bf7\u6c42\u5e94\u5728\u65b0\u8fde\u63a5\u4e0a\u91cd\u8bd5
+    pub fn h2_max_pending_per_conn(mut self, n: usize) -> Self {
+        self.config = self.config.h2_max_pending_per_conn(n);
+        self
+    }
+
     /// Change max size for request head.
     ///
     /// Request has a bigger head than it would be reject with error.

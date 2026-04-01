@@ -24,6 +24,10 @@ pub struct HttpServiceConfig<
     pub(crate) request_head_timeout: Duration,
     pub(crate) tls_accept_timeout: Duration,
     pub(crate) peek_protocol: bool,
+    /// HTTP/2 单连接最大并发流数（协议级，对标 Nginx http2_max_concurrent_streams）
+    pub(crate) h2_max_concurrent_streams: u32,
+    /// HTTP/2 单连接最大同时在途 handler 数（应用级，0 = 不限制）
+    pub(crate) h2_max_pending_per_conn: usize,
 }
 
 impl Default for HttpServiceConfig {
@@ -44,6 +48,8 @@ impl HttpServiceConfig {
             // Nginx ssl_handshake_timeout 默认 60s，此处取中间值
             tls_accept_timeout: Duration::from_secs(30),
             peek_protocol: false,
+            h2_max_concurrent_streams: 102400,
+            h2_max_pending_per_conn: 0,
         }
     }
 }
@@ -116,6 +122,19 @@ impl<const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE_BUF_LIM
         self.mutate_const_generic::<HEADER_LIMIT_2, READ_BUF_LIMIT, WRITE_BUF_LIMIT>()
     }
 
+    /// HTTP/2 单连接最大并发流数（协议级限流，对标 Nginx http2_max_concurrent_streams）
+    pub fn h2_max_concurrent_streams(mut self, n: u32) -> Self {
+        self.h2_max_concurrent_streams = n;
+        self
+    }
+
+    /// HTTP/2 单连接最大同时在途 handler 数（应用级背压，0 = 不限制）
+    /// 超出时发送 GOAWAY 优雅拒绝新流，等价 Nginx 连接队列限制
+    pub fn h2_max_pending_per_conn(mut self, n: usize) -> Self {
+        self.h2_max_pending_per_conn = n;
+        self
+    }
+
     /// Enable peek into connection to figure out it's protocol regardless the outcome
     /// of alpn negotiation.
     ///
@@ -141,6 +160,8 @@ impl<const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE_BUF_LIM
             request_head_timeout: self.request_head_timeout,
             tls_accept_timeout: self.tls_accept_timeout,
             peek_protocol: self.peek_protocol,
+            h2_max_concurrent_streams: self.h2_max_concurrent_streams,
+            h2_max_pending_per_conn: self.h2_max_pending_per_conn,
         }
     }
 }

@@ -134,6 +134,8 @@ pub(crate) struct Dispatcher<'a, TlsSt, S, ReqB> {
     is_tls: bool,
     keep_alive: Pin<&'a mut KeepAlive>,
     ka_dur: Duration,
+    /// 应用级 pending 限制（0 = 不限制），超限时发 GOAWAY 优雅拒绝新流
+    max_pending: usize,
     service: Arc<S>,
     date: Rc<DateTimeHandle>,
     _req_body: PhantomData<ReqB>,
@@ -154,6 +156,7 @@ where
         is_tls: bool,
         keep_alive: Pin<&'a mut KeepAlive>,
         ka_dur: Duration,
+        max_pending: usize,
         service: Arc<S>,
         date: Rc<DateTimeHandle>,
     ) -> Self {
@@ -163,6 +166,7 @@ where
             is_tls,
             keep_alive,
             ka_dur,
+            max_pending,
             service,
             date,
             _req_body: PhantomData,
@@ -176,6 +180,7 @@ where
             is_tls,
             mut keep_alive,
             ka_dur,
+            max_pending,
             service,
             date,
             ..
@@ -200,9 +205,8 @@ where
         // 所有 stream 的 HEADERS 写操作串行经过此 channel，消除锁竞争。
         let (write_tx, write_rx) = mpsc::unbounded_channel::<WriteCmd>();
 
-        // connection-level 限流：追踪 in-flight handler 数量
-        // 超过 MAX_PENDING_PER_CONN 时，accept loop 暂停接受新 stream
-        // h2 crate 的流控会自动通知对端停止发送新 stream
+        // connection-level in-flight 计数（仅监控，不限流）
+        // 流控依赖协议层 max_concurrent_streams，不在应用层 RST
         let pending_count = Rc::new(std::cell::Cell::new(0usize));
 
         let local = LocalSet::new();
@@ -229,10 +233,11 @@ where
                         let svc = Arc::clone(&service);
                         let dt  = Rc::clone(&date);
                         let pc  = Rc::clone(&pending_count);
-                        // 超过限制时跳过 accept 等下一轮（h2 流控会自动通知对端）
-                        if pc.get() >= MAX_PENDING_PER_CONN {
-                            // 直接 drop respond，h2 发 RST_STREAM，客户端会重试
-                            continue;
+                        // 应用级背压：超过 max_pending 时发 GOAWAY，优雅拒绝新流
+                        // max_pending=0 表示不限制，依赖协议层 max_concurrent_streams
+                        if max_pending > 0 && pc.get() >= max_pending {
+                            io.graceful_shutdown();
+                            // 仍然处理已 accept 的这个流，不丢弃
                         }
                         pc.set(pc.get() + 1);
                         tokio::task::spawn_local(async move {

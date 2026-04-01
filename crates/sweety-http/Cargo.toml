@@ -14,8 +14,8 @@ tracing  = "0.1"
 bytes    = "1"
 
 # TLS
-rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls   = { version = "0.26", default-features = false, features = ["ring"] }
+rustls         = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+tokio-rustls   = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 
 # xitca-web 实现层（通过 workspace patch 指向本地 vendor）
 xitca-web = { version = "0.7", features = [

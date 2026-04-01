@@ -113,8 +113,10 @@ pub struct GlobalConfig {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
-    /// HTTP/2 单连接最大并发流数（等价 Nginx http2_max_concurrent_streams，默认 1000）
+    /// HTTP/2 单连接最大并发流数（等价 Nginx http2_max_concurrent_streams，默认 32）
     /// 超出后服务端发送 GOAWAY，客户端会新开连接
+    /// 生产建议：32-64，让多条连接分散到多个 worker 线程并行 TLS 加密
+    /// 设过大（如 102400）会导致所有流挤在一条连接上，TLS 串行于单核
     #[serde(default = "default_h2_max_concurrent_streams")]
     pub h2_max_concurrent_streams: u32,
 
@@ -1040,7 +1042,7 @@ fn default_prometheus_path() -> String { "/metrics".into() }
 fn default_log_level() -> String { "info".into() }
 fn default_rewrite_flag() -> RewriteFlag { RewriteFlag::Last }
 fn default_worker_connections() -> usize { 51200 }
-fn default_h2_max_concurrent_streams() -> u32 { 102400 }
+fn default_h2_max_concurrent_streams() -> u32 { 128 }
 fn default_h2_max_concurrent_reset_streams() -> usize { 200 }
 fn default_keepalive_timeout() -> u64 { 60 }
 fn default_fastcgi_connect_timeout() -> u64 { 5 }

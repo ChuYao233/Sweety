@@ -191,7 +191,7 @@ pub async fn handle_sweety(
     };
 
     // ── 请求体 ────────────────────────────────────────────────────────────
-    let max_body = (ctx.state().cfg.global.client_max_body_size as u64) * 1024 * 1024;
+    let max_body = (ctx.state().cfg.load().global.client_max_body_size as u64) * 1024 * 1024;
     let content_length = ctx.req().headers()
         .get(sweety_web::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())

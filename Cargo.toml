@@ -22,11 +22,11 @@ tokio        = { version = "1", features = ["full"] }
 anyhow       = "1"
 tracing      = "0.1"
 bytes        = "1"
-rustls       = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls       = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 sweety-web   = { path = "vendor/sweety-web" }
 sweety-io    = { path = "vendor/sweety-io-v5", features = ["quic"] }
-quinn        = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
+quinn        = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio", "aws-lc-rs"] }
 
 [package]
 name        = "sweety"
@@ -74,10 +74,10 @@ sweety-web = { path = "vendor/sweety-web", features = [
 ] }
 
 # ── TLS / 证书 ────────────────────────────────
-# rustls 纯 Rust TLS，使用 ring 后端（无 C 依赖）
-rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# rustls TLS，使用 aws-lc-rs 后端（高性能，对标 OpenSSL AES-NI）
+rustls         = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 rustls-pemfile  = "2"
-tokio-rustls    = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-rustls    = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 # TLS 客户端根证书（反向代理证书验证）
 webpki-roots    = "0.26"
 # ACME 自动证书（HTTP-01，instant-acme）
@@ -86,8 +86,8 @@ instant-acme   = "0.7"
 http-ws        = { version = "0.3", features = ["stream"] }
 # http 基础类型（WebSocket handler 需要）
 http           = "1"
-# 证书生成（CSR/自签名，ring 后端）
-rcgen          = { version = "0.13", default-features = false, features = ["ring"] }
+# 证书生成（CSR/自签名，aws-lc-rs 后端）
+rcgen          = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 
 # ── 序列化 / 配置 ─────────────────────────────
 serde       = { version = "1", features = ["derive"] }
@@ -103,7 +103,7 @@ notify = "6"
 
 # ── 日志 ──────────────────────────────────────
 tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "registry"] }
 
 # ── 并发数据结构 ──────────────────────────────
 dashmap = "6"
@@ -124,6 +124,8 @@ bytes        = "1"
 flate2       = "1"
 async-compression = { version = "0.4", features = ["brotli", "tokio"] }
 async-stream      = "0.3"
+# mmap 零拷贝大文件传输（文件直接映射到进程地址空间，绕过 read() 内核→用户态拷贝）
+memmap2           = "0.9"
 x509-parser  = { version = "0.16", default-features = false }
 anyhow       = "1"
 itoa         = "1"
@@ -146,7 +148,7 @@ sha1         = "0.10"
 # sendfile(2) syscall（Linux/macOS 零拷贝静态文件传输）
 libc         = "0.2"
 # Quinn QUIC 传输层（HTTP/3），版本与 sweety-io 0.5.1 内部使用的版本一致
-quinn        = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
+quinn        = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio", "aws-lc-rs"] }
 
 # ─────────────────────────────────────────────
 # 平台特定依赖

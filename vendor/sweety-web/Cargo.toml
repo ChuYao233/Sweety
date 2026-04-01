@@ -82,7 +82,7 @@ rate-limit = ["http-rate"]
 rustls = [
     "__server",
     "sweety-http-core/rustls",
-    "sweety-tls/rustls-no-crypto",
+    "sweety-tls/rustls",
 ]
 serde = ["dep:serde"]
 tower-http-compat = [

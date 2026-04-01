@@ -187,8 +187,12 @@ impl Future for H2PingPong<'_> {
 
 // 小文件内联阈值：≤ 32KB（H2 初始窗口 65535，32KB 以内无需等窗口）
 const SMALL_BODY_INLINE: usize = 32 * 1024;
-// DATA chunk 大小：16KB，与 H2 最大帧对齐
-const CHUNK_SIZE: usize = 16_384;
+// mmap stream 每块大小（与 sendfile.rs 的 STREAM_CHUNK 对齐）
+const CHUNK_SIZE: usize = 256 * 1024;
+// 大文件流水线窗口：允许提前读入并排队发送的最大字节数
+// 等于 max_send_buffer_size(1MB)，超过此量才等 poll_capacity 背压
+// 这样读文件和网络发送完全重叠，消除串行 RTT 等待
+const PIPELINE_WINDOW: usize = 1024 * 1024;
 
 async fn h2_handler<B, BE>(
     resp: Response<B>,
@@ -293,28 +297,51 @@ where
         }
     }
 
-    // 大文件/流式：先发 HEADERS，逐片 poll body + poll_capacity
-    // io.accept() 每轮都 poll Connection，poll_capacity waker 能被 WINDOW_UPDATE 唤醒
+    // 大文件/流式：流水线发送
+    //
+    // 原理：reserve_capacity(PIPELINE_WINDOW) 预申请大窗口，h2 crate 持有发送队列
+    //   capacity() > 0 时直接发，无需 await（零延迟）
+    //   capacity() == 0 时 poll_capacity 等下一个 WINDOW_UPDATE，期间 tokio 调度其他任务
+    //   读文件（mmap 纯内存）与网络发送重叠，消除串行 RTT 等待
     let mut stream = match respond.send_response(res, false) {
         Ok(s) => s,
         Err(_) => return Ok(keep_alive),
     };
     let mut body = pin!(body);
 
-    while let Some(chunk) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-        let mut chunk = match chunk {
-            Ok(c) => c,
-            Err(_) => break,
+    // 预申请大窗口：让 h2 crate 立即开始追踪，尽早触发对端 WINDOW_UPDATE
+    stream.reserve_capacity(PIPELINE_WINDOW);
+
+    loop {
+        // 读一块文件（mmap：纯内存，几乎立即 Ready）
+        let chunk = match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+            None | Some(Err(_)) => break,
+            Some(Ok(c)) if c.is_empty() => break,
+            Some(Ok(c)) => c,
         };
-        while !chunk.is_empty() {
-            let want = cmp::min(chunk.len(), CHUNK_SIZE);
-            stream.reserve_capacity(want);
-            let cap = match poll_fn(|cx| stream.poll_capacity(cx)).await {
-                Some(Ok(c)) => c,
-                _ => return Ok(keep_alive),
-            };
-            let send = chunk.split_to(cmp::min(cap, want));
-            let _ = stream.send_data(send, false);
+
+        let mut remaining = chunk;
+
+        loop {
+            let cap = stream.capacity();
+            if cap > 0 {
+                // 有窗口：同步发送，不 await
+                let n = cmp::min(cap, remaining.len());
+                let to_send = remaining.split_to(n);
+                let _ = stream.send_data(to_send, false);
+                // 维持 reserve 请求，让 h2 crate 持续追踪窗口需求
+                stream.reserve_capacity(PIPELINE_WINDOW);
+                if remaining.is_empty() { break; }
+            } else {
+                // 窗口耗尽：等 WINDOW_UPDATE（此时 tokio 可调度其他连接）
+                match poll_fn(|cx| stream.poll_capacity(cx)).await {
+                    Some(Ok(_)) => {} // 有新窗口，回到顶部重试
+                    _ => {
+                        // 连接/流已关闭（RST 或 GOAWAY）
+                        return Ok(keep_alive);
+                    }
+                }
+            }
         }
     }
 

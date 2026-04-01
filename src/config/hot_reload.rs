@@ -11,6 +11,7 @@ use anyhow;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
 
+use arc_swap::ArcSwap;
 use super::{loader::load_config, model::{AppConfig, SiteConfig}};
 use crate::dispatcher::vhost::VHostRegistry;
 use crate::server::tls::{SniResolver, TlsManager};
@@ -23,6 +24,8 @@ pub struct HotReloadContext {
     pub sni_resolvers: HashMap<u16, Arc<SniResolver>>,
     /// 每个 TLS 端口绑定的站点名列表（用于 diff 时定位 resolver）
     pub port_sites: HashMap<u16, Vec<String>>,
+    /// AppConfig 原子指针（热重载时 store 新配置，新请求立即生效）
+    pub cfg_swap: Arc<ArcSwap<AppConfig>>,
 }
 
 /// 启动配置热重载监听（在独立 std::thread 中运行 tokio 单线程运行时）
@@ -173,8 +176,29 @@ async fn watch_loop(
     }
 }
 
-/// 对比新旧配置，只更新有变化的站点
+/// 对比新旧配置，只更新有变化的站点；同时热更新 global 配置
 fn apply_diff(old: &AppConfig, new: &AppConfig, ctx: &HotReloadContext) {
+    // ── Global 配置热更新 ────────────────────────────────────────────────────
+    // 将新的 AppConfig 原子写入 cfg_swap，新请求立刻使用新配置
+    // 不影响已建立连接的行为（h2_max_concurrent_streams 等连接级参数对新连接生效）
+    ctx.cfg_swap.store(Arc::new(new.clone()));
+
+    // log_level 热更新：通过全局 tracing reload handle 动态切换过滤级别
+    if old.global.log_level != new.global.log_level {
+        if let Err(e) = set_log_level(&new.global.log_level) {
+            warn!("热重载：log_level 更新失败（{}），继续使用旧级别", e);
+        } else {
+            info!("热重载：日志级别已更新为 {}", new.global.log_level);
+        }
+    }
+
+    // 提示：以下 global 配置对新连接/新请求立即生效（通过 cfg_swap），无需重启：
+    //   gzip / gzip_comp_level / gzip_min_length
+    //   client_max_body_size / keepalive_timeout（已建立连接不受影响）
+    // 以下 global 配置需重启才能生效（连接/线程池/端口在启动时固化）：
+    //   worker_threads / worker_connections / max_connections
+    //   h2_max_concurrent_streams（新连接生效，旧连接不受影响）
+    //   listen / listen_tls 端口绑定
     // 检测端口变更：端口绑定在进程启动时完成，运行时无法热更新（与 Nginx reload 行为一致）
     let old_http: HashSet<u16> = old.sites.iter().flat_map(|s| s.listen.iter().copied()).collect();
     let new_http: HashSet<u16> = new.sites.iter().flat_map(|s| s.listen.iter().copied()).collect();
@@ -318,6 +342,38 @@ fn preflight_tls(cfg: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+
+// ─────────────────────────────────────────────
+// log_level 热更新
+// ─────────────────────────────────────────────
+
+/// 全局 tracing EnvFilter reload handle，由 main.rs 在 tracing 初始化时注入
+static LOG_RELOAD_HANDLE: std::sync::OnceLock<
+    tracing_subscriber::reload::Handle<
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::Registry,
+    >
+> = std::sync::OnceLock::new();
+
+/// 由 main.rs 调用，注入 reload handle（仅调用一次）
+pub fn set_log_reload_handle(
+    handle: tracing_subscriber::reload::Handle<
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::Registry,
+    >
+) {
+    let _ = LOG_RELOAD_HANDLE.set(handle);
+}
+
+/// 热重载时调用，动态修改 tracing 日志级别
+fn set_log_level(level: &str) -> anyhow::Result<()> {
+    let handle = LOG_RELOAD_HANDLE.get()
+        .ok_or_else(|| anyhow::anyhow!("log reload handle 未初始化"))?;
+    let filter = tracing_subscriber::EnvFilter::try_new(level)
+        .map_err(|e| anyhow::anyhow!("无效的日志级别 '{}': {}", level, e))?;
+    handle.reload(filter)
+        .map_err(|e| anyhow::anyhow!("reload 日志级别失败: {}", e))
+}
 
 // ─────────────────────────────────────────────
 // 单元测试

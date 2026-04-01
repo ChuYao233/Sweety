@@ -16,17 +16,88 @@
 //! - 内存占用恒定 ≤ 2 × 256KB = 512KB，无论文件多大
 
 use std::io::Result as IoResult;
+use std::sync::Arc;
 use bytes::Bytes;
 use futures_util::Stream;
 use tokio::io::AsyncReadExt;
 
-/// 大文件流式传输块大小（1 MiB）
-/// 提升 HTTPS/H2 大文件吸吐：更大的块减少 channel 轮次，降低调度开销
-pub const STREAM_CHUNK: usize = 1024 * 1024;
+/// 大文件流式传输块大小（256 KiB）
+/// h2 crate 内部按 max_frame_size(16KB) 自动拆帧，这里给大块减少调度开销
+pub const STREAM_CHUNK: usize = 256 * 1024;
 
-/// 小文件直接读取阈値（256 KiB）
-/// 小于此阈値时一次 read_to_end，避免 spawn + channel 开销
+/// 小文件直接读取阈值（256 KiB）
+/// 小于此阈值时一次 read_to_end，避免 spawn + channel 开销
 pub const SMALL_FILE_THRESHOLD: u64 = 256 * 1024;
+
+/// mmap 阈值：大于此大小的文件用 mmap 零拷贝传输
+/// 小于此就用普通 stream read（避免 mmap 常驻内存的开销）
+pub const MMAP_THRESHOLD: u64 = 256 * 1024;
+
+/// 保持 mmap 内存映射活跃的 RAII 包装器
+/// Arc 允许多个 Bytes 切片共享同一块 mmap 内存
+struct MmapHolder(memmap2::Mmap);
+unsafe impl Send for MmapHolder {}
+unsafe impl Sync for MmapHolder {}
+
+/// 将文件用 mmap 映射后切成 Bytes 切片流，零内核→用户态拷贝
+///
+/// # 原理
+/// - mmap 后文件数据在 page cache 里，用户态只有指针映射
+/// - `Bytes::from_owner` 让 Bytes 直接引用 mmap 内存，没有额外拷贝
+/// - H1 write_buf 里的 `Bytes` 描述符指向 page cache，内核 DMA 直接发送
+#[allow(dead_code)]
+pub fn mmap_file_stream(
+    file: std::fs::File,
+    file_size: u64,
+) -> impl Stream<Item = IoResult<Bytes>> + Send + 'static {
+    async_stream::stream! {
+        if file_size == 0 { return; }
+        let chunk_size = STREAM_CHUNK;
+        let total = file_size as usize;
+        let mut offset = 0usize;
+        while offset < total {
+            let end = (offset + chunk_size).min(total);
+            let len  = end - offset;
+            // 每次只 mmap 当前 chunk（256KB），yield 后 Arc 归零立刻 unmap
+            // 内存恒定在 chunk_size × 并发流数，不随文件大小增长
+            let mmap = match unsafe {
+                memmap2::MmapOptions::new()
+                    .offset(offset as u64)
+                    .len(len)
+                    .map(&file)
+            } {
+                Ok(m) => Arc::new(MmapHolder(m)),
+                Err(e) => { yield Err(e); return; }
+            };
+            // 告知内核顺序预读本 chunk，减少缺页延迟
+            #[cfg(target_os = "linux")]
+            let _ = mmap.0.advise(memmap2::Advice::Sequential);
+            let bytes = bytes::Bytes::from_owner(MmapSlice {
+                _owner: mmap.clone(),
+                ptr: mmap.0.as_ptr(),
+                len,
+            });
+            offset = end;
+            yield Ok(bytes);
+            // bytes drop 后 mmap Arc 引用归零，内核立刻 unmap 这段 256KB
+        }
+    }
+}
+
+/// mmap 切片的 Bytes owner （持有 Arc<MmapHolder> 保证内存不被释放）
+struct MmapSlice {
+    _owner: Arc<MmapHolder>,
+    ptr:    *const u8,
+    len:    usize,
+}
+unsafe impl Send for MmapSlice {}
+unsafe impl Sync for MmapSlice {}
+
+impl AsRef<[u8]> for MmapSlice {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
 
 /// 返回一个带背压的文件 stream（无 spawn、直接在调用任务里读取）
 ///

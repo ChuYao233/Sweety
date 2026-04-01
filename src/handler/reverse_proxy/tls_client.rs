@@ -75,13 +75,16 @@ fn build_insecure_config() -> Arc<RustlsClientConfig> {
         }
 
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider()
+            rustls::crypto::aws_lc_rs::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes()
         }
     }
 
-    let mut cfg = RustlsClientConfig::builder()
+    let mut cfg = RustlsClientConfig::builder_with_provider(
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    )
+        .with_safe_default_protocol_versions().unwrap()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
@@ -94,7 +97,10 @@ fn build_insecure_config() -> Arc<RustlsClientConfig> {
 fn build_secure_config() -> Arc<RustlsClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut cfg = RustlsClientConfig::builder()
+    let mut cfg = RustlsClientConfig::builder_with_provider(
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    )
+        .with_safe_default_protocol_versions().unwrap()
         .with_root_certificates(root_store)
         .with_no_client_auth();
     cfg.resumption = rustls::client::Resumption::in_memory_sessions(1024);

@@ -18,6 +18,17 @@ use crate::config::model::{AppConfig, SiteConfig, TlsConfig};
 
 pub use sni_resolver::SniResolver;
 
+/// 全局 TLS session cache 单例
+/// 所有 ServerConfig 共享同一个 cache，跨 worker 线程复用 TLS session
+/// 65536 条：高并发时大量客户端复用 session，避免重复完整握手
+static GLOBAL_SESSION_CACHE: std::sync::OnceLock<Arc<dyn rustls::server::StoresServerSessions>> = std::sync::OnceLock::new();
+
+fn global_session_cache() -> Arc<dyn rustls::server::StoresServerSessions> {
+    GLOBAL_SESSION_CACHE
+        .get_or_init(|| rustls::server::ServerSessionMemoryCache::new(65536))
+        .clone()
+}
+
 /// TLS 管理器（静态方法集合）
 pub struct TlsManager;
 
@@ -80,7 +91,7 @@ impl TlsManager {
             alpn = vec![b"http/1.1".to_vec()];
         }
         cfg.alpn_protocols = alpn;
-        cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(65536);
+        cfg.session_storage = global_session_cache();
         Ok((cfg, resolver))
     }
 
@@ -318,9 +329,9 @@ fn resolve_tls_versions(sites: &[&SiteConfig]) -> Vec<&'static rustls::Supported
 /// AES-128 吞吐量比 AES-256 高约 20-30%，安全性对 Web 场景完全足够
 /// Nginx/OpenSSL 默认也优先 AES-128-GCM
 fn make_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
-    use rustls::crypto::ring as ring_crypto;
+    use rustls::crypto::aws_lc_rs as aws_crypto;
     use rustls::CipherSuite::*;
-    let default = ring_crypto::default_provider();
+    let default = aws_crypto::default_provider();
     // 将 AES-128-GCM 套件提前，其余保持原顺序
     let mut suites = default.cipher_suites.clone();
     suites.sort_by_key(|s| match s.suite() {
@@ -365,7 +376,7 @@ fn load_pem_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig> {
         .with_single_cert(certs, key)
         .context("构建 Rustls ServerConfig 失败")?;
     // session cache 65536：高并发时大量客户端复用 TLS session，避免重复握手
-    config.session_storage = rustls::server::ServerSessionMemoryCache::new(65536);
+    config.session_storage = global_session_cache();
 
     info!("TLS 证书加载成功: {}", cert_path.display());
     Ok(config)
@@ -409,7 +420,9 @@ fn generate_self_signed(domain: &str) -> Result<ServerConfig> {
         rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())
     );
 
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_provider(make_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .context("TLS 版本配置失败")?
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
         .context("构建自签名 ServerConfig 失败")?;
@@ -494,7 +507,7 @@ fn build_quinn_config_from_pem(cert_path: &Path, key_path: &Path) -> Result<swee
         .with_single_cert(certs, key)
         .context("构建 QUIC Rustls ServerConfig 失败")?;
     tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
-    tls_cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(65536);
+    tls_cfg.session_storage = global_session_cache();
 
     quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg)
         .map(|qc| sweety_io::net::QuicConfig::with_crypto(std::sync::Arc::new(qc)))
@@ -517,7 +530,9 @@ fn build_quinn_config_self_signed(domain: &str) -> Result<sweety_io::net::QuicCo
         rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())
     );
 
-    let mut tls_cfg = ServerConfig::builder()
+    let mut tls_cfg = ServerConfig::builder_with_provider(make_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .context("QUIC TLS 版本配置失败")?
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
         .context("构建自签名 QUIC ServerConfig 失败")?;
@@ -1111,7 +1126,7 @@ fn build_certified_keys(tls: &TlsConfig, server_names: &[String]) -> Vec<rustls:
 
 /// 生成自签名 CertifiedKey（不是 ServerConfig），ACME 占位用
 fn generate_self_signed_key(domain: &str) -> Result<rustls::sign::CertifiedKey> {
-    use rustls::crypto::ring as ring_crypto;
+    use rustls::crypto::aws_lc_rs as aws_crypto;
 
     let subject_alt_names = if domain.is_empty() {
         vec!["localhost".to_string()]
@@ -1127,7 +1142,7 @@ fn generate_self_signed_key(domain: &str) -> Result<rustls::sign::CertifiedKey> 
         rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())
     );
 
-    let signing_key = ring_crypto::sign::any_supported_type(&key_der)
+    let signing_key = aws_crypto::sign::any_supported_type(&key_der)
         .context("自签名私鑰不支持")?;
 
     Ok(rustls::sign::CertifiedKey::new(vec![cert_der], signing_key))
@@ -1154,7 +1169,7 @@ fn load_certified_key_from_path(
         .with_context(|| format!("解析私钥失败: {}", key_path.display()))?;
 
     // any_supported_type 内部已处理 RSA / ECDSA / Ed25519（PKCS#8）
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der)
+    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key_der)
         .map_err(|e| anyhow::anyhow!("私钥类型不支持（RSA/ECDSA/Ed25519）: {:?}", e))?;
 
     info!("TLS 证书加载成功: {}", cert_path.display());

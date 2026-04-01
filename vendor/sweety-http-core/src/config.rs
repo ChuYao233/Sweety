@@ -2,13 +2,13 @@
 
 use core::time::Duration;
 
-/// 请求读缓冲区上限：256KB
+/// 请求读缓冲区上限：32KB（对标 Nginx client_header_buffer_size 32k）
 /// 超过此限制触发强制让出，防止小内存被恶意请求占满
-pub const DEFAULT_READ_BUF_LIMIT: usize = 256 * 1024;
+pub const DEFAULT_READ_BUF_LIMIT: usize = 32 * 1024;
 
-/// 响应写缓冲区上限：512KB
-/// 对标 Nginx send_buffer_size，大文件传输高吸吐
-pub const DEFAULT_WRITE_BUF_LIMIT: usize = 512 * 1024;
+/// 响应写缓冲区上限：64KB（对标 Nginx ssl_buffer_size 16k + H1 管道拆包余量）
+/// H2 大文件靠 pipeline loop 背压分批，不依赖大 write buffer
+pub const DEFAULT_WRITE_BUF_LIMIT: usize = 64 * 1024;
 
 /// 请求头部字段数上限：96（对标 Nginx large_client_header_buffers）
 pub const DEFAULT_HEADER_LIMIT: usize = 96;

@@ -30,7 +30,8 @@ version = "1.4"
 
 [dependencies.quinn]
 version = "0.11"
-features = ["ring"]
+default-features = false
+features = ["aws-lc-rs", "runtime-tokio", "rustls"]
 optional = true
 
 [dependencies.tokio]

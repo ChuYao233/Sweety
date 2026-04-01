@@ -18,6 +18,7 @@ use sweety_web::{
 };
 
 
+use arc_swap::ArcSwap;
 use crate::config::model::{AppConfig, HandlerType};
 use crate::config::hot_reload::{HotReloadContext, start_hot_reload};
 use crate::dispatcher::vhost::VHostRegistry;
@@ -50,6 +51,7 @@ impl SweetyServer {
     /// 启动服务器（阻塞直到收到停止信号）
     pub fn run(self) -> io::Result<()> {
         let cfg = Arc::new(self.cfg);
+        let cfg_swap = Arc::new(ArcSwap::from(cfg.clone()));
         let metrics = Arc::new(GlobalMetrics::new());
         let registry = Arc::new(VHostRegistry::from_config(&cfg.sites));
 
@@ -149,7 +151,7 @@ impl SweetyServer {
         let state = AppState {
             registry: registry.clone(),
             metrics: metrics.clone(),
-            cfg: cfg.clone(),
+            cfg: cfg_swap.clone(),
             h3_ports: Arc::new(h3_port_set),
             conn_pool,
             sni_resolvers: Arc::new(port_resolvers),
@@ -295,12 +297,12 @@ impl SweetyServer {
 
         // 启动配置热重载后台线程（监听配置文件及证书目录变更，只更新变化站点，不断连）
         if let Some(config_path) = self.config_path {
-            // 从 state.sni_resolvers 克隆一份 HashMap（直接解包 Arc）
             let resolvers_map: HashMap<u16, Arc<SniResolver>> = (*state.sni_resolvers).clone();
             let hot_ctx = HotReloadContext {
                 registry: registry.clone(),
                 sni_resolvers: resolvers_map,
                 port_sites: collect_port_sites(&cfg),
+                cfg_swap: cfg_swap.clone(),
             };
             start_hot_reload(config_path, cfg.clone(), hot_ctx);
         }
@@ -318,8 +320,8 @@ pub struct AppState {
     pub registry: Arc<VHostRegistry>,
     /// 全局指标（每请求必访）
     pub metrics: Arc<GlobalMetrics>,
-    /// 应用配置（每请求必访）
-    pub cfg: Arc<AppConfig>,
+    /// 应用配置（每请求必访，支持热重载原子替换）
+    pub cfg: Arc<ArcSwap<AppConfig>>,
     /// 最大并发连接数（0 = 不限制）
     pub max_connections: usize,
     /// 最大请求体字节数（预计算，避免每请求乘法；0 = 不限制）

@@ -156,6 +156,7 @@ impl Extension {
         }))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn new_h2_ws(addr: SocketAddr, is_tls: bool) -> Self {
         Self(Box::new(_Extension {
             addr,

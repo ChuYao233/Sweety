@@ -50,20 +50,20 @@ where
         let mut conn = {
             let mut b = ::h2::server::Builder::new();
             b.enable_connect_protocol()
-                // 连接级接收窗口：128MB
-                .initial_connection_window_size(128 * 1024 * 1024)
-                // 流级接收窗口：16MB
+                // 连接级接收窗口：64MB（大窗口让客户端减少 WINDOW_UPDATE 次数，提升大文件吞吐）
+                .initial_connection_window_size(64 * 1024 * 1024)
+                // 流级接收窗口：16MB（单流足够大，避免 stall）
                 .initial_window_size(16 * 1024 * 1024)
                 // 最大并发流：从配置读取（等价 Nginx http2_max_concurrent_streams）
                 .max_concurrent_streams(self.config.h2_max_concurrent_streams)
-                // 最大帧：1MB
-                .max_frame_size(1024 * 1024)
+                // 最大帧：16384（RFC 7540 默认值，超出客户端协商值会触发 FRAME_SIZE_ERROR）
+                .max_frame_size(16384)
                 // 最大头部列表：32KB
                 .max_header_list_size(32768)
                 // RST 洪水防护（从配置读取）
                 .max_concurrent_reset_streams(self.config.h2_max_concurrent_reset_streams)
-                // 发送缓冲：16MB
-                .max_send_buffer_size(16 * 1024 * 1024);
+                // 发送缓冲：1MB（平衡吞吐与内存，100 并发 × 1MB = 100MB 上限）
+                .max_send_buffer_size(1024 * 1024);
             b.handshake(PollIoAdapter(tls_stream))
         }
         .timeout(timer.as_mut())

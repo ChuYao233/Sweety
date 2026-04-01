@@ -33,21 +33,29 @@ use crate::dispatcher::vhost::SiteInfo;
 use crate::middleware::cache::{generate_etag, to_unix_secs, mime_type_for, default_cache_control};
 use crate::server::http::AppState;
 
-/// gzip 压缩的文件大小上限（4 MB）——超过此值直接流式传输，不做内存压缩
-const GZIP_MAX_INLINE: u64 = 4 * 1024 * 1024;
-/// 内存文件缓存大小上限：只缓存 ≤ 256KB 的小文件
-const FILE_CACHE_MAX_BYTES: u64 = 256 * 1024;
-/// 最多缓存条数
-const FILE_CACHE_MAX_ENTRIES: usize = 4096;
+/// gzip/brotli 内存压缩文件大小上限（512 KB）
+/// 超过此值直接流式传输，内存压缩成本过高且意义不大
+/// 对齐 Nginx gzip_min_length + 完全内存压缩的默认范围
+const GZIP_MAX_INLINE: u64 = 512 * 1024;
+/// 内存文件缓存大小上限：只缓存 ≤ 32KB 的小文件（对标 Nginx open_file_cache 的 fd+stat 缓存策略）
+/// 超过此阈值的文件改用 mmap 零拷贝流式传输，不占用堆内存
+const FILE_CACHE_MAX_BYTES: u64 = 32 * 1024;
+/// 最多缓存条数（2048 × 32KB ≈ 64MB 最坏情况）
+const FILE_CACHE_MAX_ENTRIES: usize = 2048;
 
 /// 文件内存缓存条目（预缓存所有响应头 HeaderValue，缓存命中时零分配）
 #[derive(Clone)]
 struct FileCacheEntry {
+    /// 原始文件内存（未压缩）
     data:          Bytes,
+    /// gzip 预压缩结果（None 表示未压缩或超过阈値）
+    gz:            Option<Bytes>,
+    /// brotli 预压缩结果
+    br:            Option<Bytes>,
     modified_secs: u64,
     // 预构建的响应头（缓存命中时直接插入，零 from_str 分配）
     hv_content_type:  HeaderValue,
-    hv_content_length: HeaderValue,
+    hv_content_length: HeaderValue,  // 原始大小
     hv_etag:          HeaderValue,
     hv_last_modified: HeaderValue,
     hv_cache_control: HeaderValue,
@@ -149,12 +157,6 @@ pub async fn handle_sweety(
         if let Some(entry) = cache_get(&fast_key) {
             let modified_secs = entry.modified_secs;
             let etag_str = entry.hv_etag.to_str().unwrap_or("");
-            let data     = entry.data.clone();
-            let hv_ct    = entry.hv_content_type.clone();
-            let hv_cl    = entry.hv_content_length.clone();
-            let hv_et    = entry.hv_etag.clone();
-            let hv_lm    = entry.hv_last_modified.clone();
-            let hv_cc    = entry.hv_cache_control.clone();
 
             // 304 协商缓存
             let if_none_match     = req_headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok());
@@ -167,14 +169,43 @@ pub async fn handle_sweety(
                 *resp.status_mut() = StatusCode::NOT_MODIFIED;
                 return resp;
             }
+
+            // 选择最优编码：br > gz > 原始
+            let accept_enc = req_headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or("");
+            let (body_bytes, enc) = if accept_enc.contains("br") {
+                if let Some(br) = &entry.br {
+                    (br.clone(), Some("br"))
+                } else {
+                    (entry.data.clone(), None)
+                }
+            } else if accept_enc.contains("gzip") {
+                if let Some(gz) = &entry.gz {
+                    (gz.clone(), Some("gzip"))
+                } else {
+                    (entry.data.clone(), None)
+                }
+            } else {
+                (entry.data.clone(), None)
+            };
+
             // 直接插入预构建的头，零 from_str 分配
-            let mut resp = WebResponse::new(ResponseBody::from(data));
+            let mut resp = WebResponse::new(ResponseBody::from(body_bytes.clone()));
             let h = resp.headers_mut();
-            h.insert(CONTENT_TYPE,   hv_ct);
-            h.insert(CONTENT_LENGTH, hv_cl);
-            h.insert(ETAG,           hv_et);
-            h.insert(LAST_MODIFIED,  hv_lm);
-            h.insert(CACHE_CONTROL,  hv_cc);
+            h.insert(CONTENT_TYPE,   entry.hv_content_type.clone());
+            // 压缩后 Content-Length 需重新计算
+            if enc.is_some() {
+                if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_bytes.len())) {
+                    h.insert(CONTENT_LENGTH, v);
+                }
+            } else {
+                h.insert(CONTENT_LENGTH, entry.hv_content_length.clone());
+            }
+            h.insert(ETAG,           entry.hv_etag.clone());
+            h.insert(LAST_MODIFIED,  entry.hv_last_modified.clone());
+            h.insert(CACHE_CONTROL,  entry.hv_cache_control.clone());
+            if let Some(e) = enc {
+                if let Ok(v) = HeaderValue::from_str(e) { h.insert(CONTENT_ENCODING, v); }
+            }
             return resp;
         }
         // 缓存未命中：做完整安全检查，然后读文件并缓存
@@ -182,6 +213,28 @@ pub async fn handle_sweety(
         let file_path = match resolve_safe_path_fast(root, path, canonical_root_ref) {
             Some(p) => p,
             None => return make_error(StatusCode::FORBIDDEN, "Forbidden"),
+        };
+        let meta = match tokio::fs::metadata(&file_path).await {
+            Ok(m) => m,
+            Err(_) => return make_error(StatusCode::NOT_FOUND, ""),
+        };
+
+        // 目录：按 site.index 列表查找默认文档
+        let file_path = if meta.is_dir() {
+            let mut found: Option<PathBuf> = None;
+            for name in &site.index {
+                let candidate = file_path.join(name);
+                if candidate.is_file() {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            match found {
+                Some(p) => p,
+                None => return make_error(StatusCode::FORBIDDEN, "Directory listing not allowed"),
+            }
+        } else {
+            file_path
         };
         let meta = match tokio::fs::metadata(&file_path).await {
             Ok(m) => m,
@@ -225,15 +278,51 @@ pub async fn handle_sweety(
                 }
             }
             let bytes = Bytes::from(data);
-            // 写入缓存时预构建所有 HeaderValue，后续命中直接用零分配
             let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let mime = mime_type_for(ext);
+
+            // 写入缓存时预计算 gzip/brotli 压缩（仅对可压缩 mime 类型）
+            // 后续请求缓存命中时直接返回预压缩内容，无需重复读文件和压缩
+            let global = &ctx.state().cfg.load().global;
+            let gzip_enabled = site.gzip.unwrap_or(global.gzip);
+            let min_bytes = (global.gzip_min_length as u64) * 1024;
+            let gzip_level = site.gzip_comp_level.unwrap_or(global.gzip_comp_level);
+            let already_compressed = matches!(ext,
+                "gz" | "br" | "zst" | "zip" | "png" | "jpg" | "jpeg"
+                | "gif" | "webp" | "avif" | "mp4" | "webm" | "woff" | "woff2"
+                | "bin" | "dat" | "raw" | "iso" | "exe" | "dll" | "so"
+            );
+            let compressible_mime = mime.starts_with("text/")
+                || mime == "application/json"
+                || mime == "application/javascript"
+                || mime == "application/x-javascript"
+                || mime == "application/xml"
+                || mime == "application/xhtml+xml"
+                || mime == "application/rss+xml"
+                || mime == "application/atom+xml"
+                || mime == "image/svg+xml";
+            let should_precompress = gzip_enabled && !already_compressed && compressible_mime
+                && file_size >= min_bytes && file_size <= GZIP_MAX_INLINE;
+
+            let (gz_bytes, br_bytes) = if should_precompress {
+                let raw = bytes.clone();
+                let raw2 = bytes.clone();
+                let gz = tokio::task::spawn_blocking(move || gzip_compress(&raw, gzip_level))
+                    .await.ok().and_then(|r| r.ok());
+                let br = brotli_compress(&raw2).await.ok();
+                (gz, br)
+            } else {
+                (None, None)
+            };
+
             let modified_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(modified_secs);
             let http_date = httpdate::fmt_http_date(modified_time);
             let cc = location.cache_control.as_deref().unwrap_or_else(|| default_cache_control(ext));
             let mut cl_buf = itoa::Buffer::new();
             let entry = FileCacheEntry {
                 data:               bytes.clone(),
+                gz:                 gz_bytes,
+                br:                 br_bytes,
                 modified_secs,
                 hv_content_type:    HeaderValue::from_str(mime).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
                 hv_content_length:  HeaderValue::from_str(cl_buf.format(file_size)).unwrap_or_else(|_| HeaderValue::from_static("0")),
@@ -241,7 +330,17 @@ pub async fn handle_sweety(
                 hv_last_modified:   HeaderValue::from_str(&http_date).unwrap_or_else(|_| HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")),
                 hv_cache_control:   HeaderValue::from_str(cc).unwrap_or_else(|_| HeaderValue::from_static("public, max-age=3600")),
             };
-            // 先 clone 各头值，再 move entry 进缓存（避免整个 entry 二次 clone）
+            // 获取请求的 Accept-Encoding，选择最优编码后写缓存并直接返回
+            let accept_enc2 = req_headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or("");
+            let (resp_bytes, enc_hv) = if accept_enc2.contains("br") {
+                if let Some(b) = &entry.br { (b.clone(), Some(HeaderValue::from_static("br"))) }
+                else { (entry.data.clone(), None) }
+            } else if accept_enc2.contains("gzip") {
+                if let Some(g) = &entry.gz { (g.clone(), Some(HeaderValue::from_static("gzip"))) }
+                else { (entry.data.clone(), None) }
+            } else {
+                (entry.data.clone(), None)
+            };
             let hv_ct = entry.hv_content_type.clone();
             let hv_cl = entry.hv_content_length.clone();
             let hv_et = entry.hv_etag.clone();
@@ -250,27 +349,34 @@ pub async fn handle_sweety(
             // 同时插入 canonical key 和 fast_key，保证两条查询路径都能命中
             cache_insert(file_path.clone(), entry.clone());
             if file_path != fast_key { cache_insert(fast_key.clone(), entry); }
-            let mut resp = WebResponse::new(ResponseBody::from(bytes));
+            let mut resp = WebResponse::new(ResponseBody::from(resp_bytes.clone()));
             let h = resp.headers_mut();
             h.insert(CONTENT_TYPE,   hv_ct);
-            h.insert(CONTENT_LENGTH, hv_cl);
+            if enc_hv.is_some() {
+                if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(resp_bytes.len())) {
+                    h.insert(CONTENT_LENGTH, v);
+                }
+            } else {
+                h.insert(CONTENT_LENGTH, hv_cl);
+            }
             h.insert(ETAG,           hv_et);
             h.insert(LAST_MODIFIED,  hv_lm);
             h.insert(CACHE_CONTROL,  hv_cc);
+            if let Some(enc) = enc_hv { h.insert(CONTENT_ENCODING, enc); }
             return resp;
         }
 
-        // 大文件（> FILE_CACHE_MAX_BYTES）：直接流式传输（不缓存内容）
-        debug!("提供静态文件: {} size={}", file_path.display(), file_size);
-        let file = match tokio::fs::File::open(&file_path).await {
+        // 大文件（> FILE_CACHE_MAX_BYTES）：tokio::fs 分块流式读取
+        // 内存恒定在 PIPELINE_WINDOW(1MB) 量级，不随文件大小或并发数增长
+        debug!("提供静态文件(stream): {} size={}", file_path.display(), file_size);
+        let tk_file = match tokio::fs::File::open(&file_path).await {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("打开文件失败 {}: {}", file_path.display(), e);
                 return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
             }
         };
-        // 大文件不压缩，直接流式传输
-        return stream_file_response(file, &file_path, file_size, &etag_val, modified_secs, location);
+        return stream_file_response_async(tk_file, &file_path, file_size, &etag_val, modified_secs, location);
     }
 
     // ── HEAD / Range 路径：必须读 metadata ────────────────────────────────────
@@ -278,6 +384,28 @@ pub async fn handle_sweety(
     let file_path = match resolve_safe_path_fast(root, path, canonical_root_ref) {
         Some(p) => p,
         None => return make_error(StatusCode::FORBIDDEN, "Forbidden"),
+    };
+    let meta = match tokio::fs::metadata(&file_path).await {
+        Ok(m) => m,
+        Err(_) => return make_error(StatusCode::NOT_FOUND, ""),
+    };
+
+    // 目录：按 site.index 列表查找默认文档
+    let file_path = if meta.is_dir() {
+        let mut found: Option<PathBuf> = None;
+        for name in &site.index {
+            let candidate = file_path.join(name);
+            if candidate.is_file() {
+                found = Some(candidate);
+                break;
+            }
+        }
+        match found {
+            Some(p) => p,
+            None => return make_error(StatusCode::FORBIDDEN, "Directory listing not allowed"),
+        }
+    } else {
+        file_path
     };
     let meta = match tokio::fs::metadata(&file_path).await {
         Ok(m) => m,
@@ -320,136 +448,50 @@ pub async fn handle_sweety(
 
     debug!("提供静态文件: {} size={} range={:?}", file_path.display(), file_size, range);
 
-    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-    // 打开文件（大文件 / Range / HEAD）
-    let mut file = match tokio::fs::File::open(&file_path).await {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!("打开文件失败 {}: {}", file_path.display(), e);
-            return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
-        }
-    };
+    let _ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     if let Some((range_start, range_end)) = range {
-        // ── Range 请求：seek + Take 限制范围，流式传输 ──────────────────
+        // ── Range 请求：seek + 限长读取，内存恒定 ──────────────────────────
         let range_len = range_end - range_start + 1;
-        if file.seek(SeekFrom::Start(range_start)).await.is_err() {
+        let mut tk_file = match tokio::fs::File::open(&file_path).await {
+            Ok(f) => f,
+            Err(e) => { tracing::error!("打开文件失败 {}: {}", file_path.display(), e); return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""); }
+        };
+        if tk_file.seek(SeekFrom::Start(range_start)).await.is_err() {
             return make_error(StatusCode::RANGE_NOT_SATISFIABLE, "");
         }
-        // Range 请求也用背压 stream，防止 H2 flow control buffer 溢出
-        let limited = file.take(range_len);
+        let limited = tk_file.take(range_len);
         let stream = crate::handler::sendfile::file_stream_backpressure(limited, range_len);
         let body = ResponseBody::box_stream(stream);
         let mut resp = WebResponse::new(body);
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
         set_file_headers(resp.headers_mut(), &file_path, range_len, &etag_val, modified_secs, location);
-        // Content-Range 用 push_str 拼接，避免 format! 堆分配
         let mut cr = String::with_capacity(32);
-        cr.push_str("bytes ");
-        cr.push_str(itoa::Buffer::new().format(range_start));
-        cr.push('-');
-        cr.push_str(itoa::Buffer::new().format(range_end));
-        cr.push('/');
-        cr.push_str(itoa::Buffer::new().format(file_size));
-        if let Ok(v) = HeaderValue::from_str(&cr) {
-            resp.headers_mut().insert(CONTENT_RANGE, v);
-        }
+        cr.push_str("bytes "); cr.push_str(itoa::Buffer::new().format(range_start));
+        cr.push('-'); cr.push_str(itoa::Buffer::new().format(range_end));
+        cr.push('/'); cr.push_str(itoa::Buffer::new().format(file_size));
+        if let Ok(v) = HeaderValue::from_str(&cr) { resp.headers_mut().insert(CONTENT_RANGE, v); }
         resp
     } else {
-        // ── 普通请求 ────────────────────────────────────────────────────────────────
-        let global = &ctx.state().cfg.global;
-        let gzip_enabled = site.gzip.unwrap_or(global.gzip);
-        let gzip_level = site.gzip_comp_level.unwrap_or(global.gzip_comp_level);
-        let min_bytes = (global.gzip_min_length as u64) * 1024;
-        let accept_enc = req_headers
-            .get(ACCEPT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let accept_br = accept_enc.contains("br");
-        let accept_gz = accept_enc.contains("gzip");
-        let already_compressed = matches!(ext,
-            "gz" | "br" | "zst" | "zip" | "png" | "jpg" | "jpeg"
-            | "gif" | "webp" | "avif" | "mp4" | "webm" | "woff" | "woff2"
-            | "bin" | "dat" | "raw" | "iso" | "exe" | "dll" | "so"
-        );
-        // mime type 白名单：只压缩文本类型（等价 Nginx gzip_types 默认值）
-        // 二进制格式（图片/视频/字体）已用 already_compressed 排除，但部分扩展名无法完全覆盖
-        // 通过 mime 白名单二次过滤，确保只对可压缩文本内容压缩
-        let mime = crate::middleware::cache::mime_type_for(ext);
-        let compressible_mime = mime.starts_with("text/")
-            || mime == "application/json"
-            || mime == "application/javascript"
-            || mime == "application/x-javascript"
-            || mime == "application/xml"
-            || mime == "application/xhtml+xml"
-            || mime == "application/rss+xml"
-            || mime == "application/atom+xml"
-            || mime == "image/svg+xml";
-        let can_compress = gzip_enabled && !already_compressed && compressible_mime
-            && file_size >= min_bytes && file_size <= GZIP_MAX_INLINE;
-
-        // Brotli 优先（压缩率比 gzip 高 20-30%）
-        if can_compress && accept_br {
-            let mut raw = Vec::with_capacity(file_size as usize);
-            if let Err(e) = file.read_to_end(&mut raw).await {
-                tracing::error!("读取文件失败 {}: {}", file_path.display(), e);
+        // ── 普通请求（大文件，> FILE_CACHE_MAX_BYTES）────────────────────────────────
+        // 大文件不做内存压缩：压缩需要把整个文件读进内存，内存开销过高
+        // 小文件（≤ FILE_CACHE_MAX_BYTES）在缓存写入时已预计算 gz/br，缓存命中时直接返回
+        // 大文件直接 tokio::fs 分块流式传输
+        let tk_file = match tokio::fs::File::open(&file_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("打开文件失败 {}: {}", file_path.display(), e);
                 return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
             }
-            match brotli_compress(&raw).await {
-                Ok(compressed) => {
-                    let clen = compressed.len() as u64;
-                    let mut resp = WebResponse::new(ResponseBody::from(compressed));
-                    set_file_headers(resp.headers_mut(), &file_path, clen, &etag_val, modified_secs, location);
-                    resp.headers_mut().insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
-                    return resp;
-                }
-                Err(_) => {
-                    // Brotli 失败降级到 gzip 或直接流式
-                    match tokio::fs::File::open(&file_path).await {
-                        Ok(f2) => return stream_file_response(f2, &file_path, file_size, &etag_val, modified_secs, location),
-                        Err(_) => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
-                    }
-                }
-            }
-        }
-
-        // gzip：客户端不支持 br 时的降级选项
-        if can_compress && accept_gz {
-            let mut raw = Vec::with_capacity(file_size as usize);
-            if let Err(e) = file.read_to_end(&mut raw).await {
-                tracing::error!("读取文件失败 {}: {}", file_path.display(), e);
-                return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
-            }
-            let compress_result = tokio::task::spawn_blocking(move || gzip_compress(&raw, gzip_level)).await;
-            match compress_result.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::Other, "task panic"))) {
-                Ok(compressed) => {
-                    let clen = compressed.len() as u64;
-                    let mut resp = WebResponse::new(ResponseBody::from(compressed));
-                    set_file_headers(resp.headers_mut(), &file_path, clen, &etag_val, modified_secs, location);
-                    resp.headers_mut().insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-                    return resp;
-                }
-                Err(_) => {
-                    match tokio::fs::File::open(&file_path).await {
-                        Ok(f2) => return stream_file_response(f2, &file_path, file_size, &etag_val, modified_secs, location),
-                        Err(_) => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
-                    }
-                }
-            }
-        }
-
-        // 大文件 / 不压缩 / 已压缩格式：ReaderStream 流式传输
-        stream_file_response(file, &file_path, file_size, &etag_val, modified_secs, location)
+        };
+        stream_file_response_async(tk_file, &file_path, file_size, &etag_val, modified_secs, location)
     }
 }
 
-/// 把打开的文件包装为流式 ResponseBody
-///
-/// - 使用带背压的 bounded channel stream（容量 = 2）
-/// - 生产者每发一个 256KB chunk 就 await，等消费者（H2 framer）拉取后才继续读
-/// - 内存恒定 ≤ 2 × 256KB = 512KB，无论文件多大，H2 flow control buffer 不溢出
-fn stream_file_response(
+
+/// tokio::fs 分块流式读取：内存恒定在 chunk_size 量级，不随文件大小增长
+/// file_stream_backpressure 的 chunk_size 动态适配，H2 flow control 背压控制节奏
+fn stream_file_response_async(
     file: tokio::fs::File,
     file_path: &Path,
     file_size: u64,

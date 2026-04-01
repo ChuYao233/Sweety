@@ -86,6 +86,10 @@ enum Commands {
 }
 
 fn main() {
+    // instant-acme / reqwest 等传递依赖同时引入了 ring 和 aws-lc-rs，
+    // rustls 无法自动选择，必须在最早点手动安装全局 provider
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
     let config = &cli.config;
     let pid_file = &cli.pid_file;
@@ -191,7 +195,14 @@ fn cmd_run(config: &PathBuf) {
     let cfg = load_cfg_or_exit(config);
     let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.global.log_level));
-    tracing_subscriber::fmt().with_env_filter(log_filter).init();
+    // reload 模式初始化：返回 handle 注入到热重载模块，支持 log_level 动态切换
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    let (reload_filter, reload_handle) = tracing_subscriber::reload::Layer::new(log_filter);
+    tracing_subscriber::registry()
+        .with(reload_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    sweety_lib::config::hot_reload::set_log_reload_handle(reload_handle);
 
     // 安装全局 panic hook：将 panic 信息路由到 tracing error！日志
     // 默认 panic 只输出到 stderr，日志系统感知不到；hook 后可写入日志文件、监控系统

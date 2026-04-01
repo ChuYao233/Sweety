@@ -251,3 +251,96 @@ where
         self.0.read(buf)
     }
 }
+
+/// 带内部写缓冲的 IO 适配器，用于 H2 连接写路径优化。
+///
+/// 原理：h2 crate 每个 DATA 帧（16KB）独立调用 `poll_write`，若直接写 TLS 则每帧
+/// 触发一次加密 + 一次系统调用。本适配器先把多帧攒入内部缓冲，`poll_flush` 时
+/// 一次性写出，让多帧合并进更少的 TLS record，减少加密次数和 syscall 开销。
+pub struct BufPollIoAdapter<T: AsyncIo> {
+    inner: T,
+    wbuf:  Vec<u8>,
+    /// 缓冲水位线：超过此值就立刻 drain，防止内存无限增长
+    capacity: usize,
+}
+
+impl<T: AsyncIo> BufPollIoAdapter<T> {
+    /// 创建带写缓冲的适配器，`cap` 为写缓冲容量（建议 128KB～256KB）
+    pub fn new(inner: T, cap: usize) -> Self {
+        Self { inner, wbuf: Vec::with_capacity(cap), capacity: cap }
+    }
+
+    /// drain 内部写缓冲到底层 IO（非阻塞，写多少算多少）
+    fn drain_wbuf(&mut self) -> io::Result<()> {
+        let mut written = 0;
+        while written < self.wbuf.len() {
+            match io::Write::write(&mut self.inner, &self.wbuf[written..]) {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    self.wbuf.drain(..written);
+                    return Err(e);
+                }
+            }
+        }
+        self.wbuf.drain(..written);
+        Ok(())
+    }
+}
+
+impl<T: AsyncIo> AsyncRead for BufPollIoAdapter<T> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            ready!(this.inner.poll_ready(Interest::READABLE, cx))?;
+            match io::Read::read(&mut this.inner, buf.initialize_unfilled()) {
+                Ok(n) => { buf.advance(n); return Poll::Ready(Ok(())); }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+impl<T: AsyncIo> AsyncWrite for BufPollIoAdapter<T> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        // 先把数据攒入写缓冲
+        this.wbuf.extend_from_slice(buf);
+        // 缓冲超过水位线时立刻 drain，防止内存过大
+        if this.wbuf.len() >= this.capacity {
+            loop {
+                ready!(this.inner.poll_ready(Interest::WRITABLE, cx))?;
+                match this.drain_wbuf() {
+                    Ok(()) => break,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+            }
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // flush：先把写缓冲全部写出，再 flush 底层 IO
+        while !this.wbuf.is_empty() {
+            ready!(this.inner.poll_ready(Interest::WRITABLE, cx))?;
+            this.drain_wbuf()?;
+        }
+        // 底层 flush（触发 rustls 把所有加密好的 record 发到 socket）
+        loop {
+            ready!(this.inner.poll_ready(Interest::WRITABLE, cx))?;
+            match io::Write::flush(&mut this.inner) {
+                Ok(()) => return Poll::Ready(Ok(())),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncIo::poll_shutdown(Pin::new(&mut self.get_mut().inner), cx)
+    }
+}

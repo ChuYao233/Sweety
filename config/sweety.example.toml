@@ -81,6 +81,11 @@ log_level = "info"
 # 高并发小请求（API/静态资源）可适当调大，默认 102400
 h2_max_concurrent_streams = 102400
 
+# HTTP/2 RST 洪水防护：单连接最大并发 reset 流数
+# h2 crate 默认值 20，压测/高并发场景需要调高，否则出现 "locally-reset streams reached limit" 警告
+# 建议压测时设为 4096，生产环境根据实际并发量调整
+h2_max_concurrent_reset_streams = 4096
+
 # HTTP/2 单连接最大同时在途 handler 数（应用级背压）
 # 超出时发 GOAWAY 优雅拒绝新流，客户端会新开连接重试
 # 0 = 不限制（依赖 h2_max_concurrent_streams 协议级流控）

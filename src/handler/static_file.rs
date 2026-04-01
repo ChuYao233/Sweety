@@ -53,11 +53,21 @@ struct FileCacheEntry {
     hv_cache_control: HeaderValue,
 }
 
-/// 全局文件内存缓存（DashMap：无锁并发读写，高并发下不需要 RwLock）
+/// 全局 L2 文件缓存（DashMap：无锁分片读写，多线程共享）
 static FILE_CACHE: OnceLock<DashMap<PathBuf, FileCacheEntry>> = OnceLock::new();
 
 fn file_cache() -> &'static DashMap<PathBuf, FileCacheEntry> {
     FILE_CACHE.get_or_init(|| DashMap::with_capacity(FILE_CACHE_MAX_ENTRIES))
+}
+
+#[inline]
+fn cache_get(key: &PathBuf) -> Option<FileCacheEntry> {
+    file_cache().get(key).map(|e| e.clone())
+}
+
+#[inline]
+fn cache_insert(key: PathBuf, entry: FileCacheEntry) {
+    file_cache().insert(key, entry);
 }
 
 /// 启动文件变更监听：文件修改/删除时直接淡化 FILE_CACHE 对应条目
@@ -119,64 +129,32 @@ pub async fn handle_sweety(
         }
     };
 
-    // 安全路径解析（防目录穿越）
-    // 使用预计算的 canonical_root，跳过每请求 root.canonicalize() 系统调用
-    let canonical_root_ref = site.canonical_root.as_deref();
-    let file_path = match resolve_safe_path_fast(root, path, canonical_root_ref) {
-        Some(p) => p,
-        None => return make_error(StatusCode::FORBIDDEN, "Forbidden"),
-    };
-
-    // 目录：尝试默认文档（用 tokio::fs::metadata 避免阻塞 worker 线程）
-    let meta = tokio::fs::metadata(&file_path).await;
-    let was_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-    let file_path = if was_dir {
-        match find_index(&file_path, &site.index).await {
-            Some(p) => p,
-            None => return make_error(StatusCode::FORBIDDEN, "Directory listing disabled"),
-        }
-    } else {
-        file_path
-    };
-
-    // 文件不存在时应用 try_files（等价 Nginx try_files $uri $uri/ /index.html）
-    // 目录路径已找到 index 文件，跳过此检查；非目录路径用已有 meta 判断
-    let file_path = if !was_dir && !meta.as_ref().map(|m| m.is_file()).unwrap_or(false) {
-        if !location.try_files.is_empty() {
-            match try_files_resolve_inner(root, path, &location.try_files, &site.index).await {
-                TryFilesResult::File(p) => p,
-                TryFilesResult::Code(code) => {
-                    return make_error(StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND), "");
-                }
-                TryFilesResult::NotFound => {
-                    return make_error(StatusCode::NOT_FOUND, "Not Found");
-                }
-            }
-        } else {
-            return make_error(StatusCode::NOT_FOUND, "Not Found");
-        }
-    } else {
-        file_path
-    };
-
-    // ── 小文件内存缓存（单层，热路径：完全跳过 metadata + open 系统调用）─────────
-    // 仅对普通 GET（非 Range、非 HEAD）的小文件启用；Range / HEAD / 大文件走下方磁盘路径
     let is_range_req = req_headers.get(sweety_web::http::header::RANGE).is_some();
     let is_head      = method.eq_ignore_ascii_case("HEAD");
 
+    // ── 小文件内存缓存热路径 ────────────────────────────────────────────────────
+    // 热路径：先用无 canonicalize 的快速路径构建 key 查缓存
+    // 缓存 key 在写入时已经是 canonical path，查缓存只需 root.join + cache.get
+    // 命中时完全跳过 canonicalize/stat/open 系统调用
     if !is_head && !is_range_req {
-        let cache = file_cache();
-        if let Some(entry) = cache.get(&file_path) {
+        // 快速 `..` 检查（不做 syscall）
+        let path_only = path.split('?').next().unwrap_or(path);
+        let has_traversal = path_only.split('/').any(|s| s == "..");
+        if has_traversal {
+            return make_error(StatusCode::FORBIDDEN, "Forbidden");
+        }
+        let relative = path_only.trim_start_matches('/');
+        let fast_key = root.join(relative);
+
+        if let Some(entry) = cache_get(&fast_key) {
             let modified_secs = entry.modified_secs;
-            let hv_ct  = entry.hv_content_type.clone();
-            let hv_cl  = entry.hv_content_length.clone();
-            let hv_et  = entry.hv_etag.clone();
-            let hv_lm  = entry.hv_last_modified.clone();
-            let hv_cc  = entry.hv_cache_control.clone();
-            // etag 直接从预构建的 HeaderValue 拿 str，避免单独 clone String
-            let etag_str = hv_et.to_str().unwrap_or("");
-            let data   = entry.data.clone();
-            drop(entry); // 尽早释放 DashMap 读槽
+            let etag_str = entry.hv_etag.to_str().unwrap_or("");
+            let data     = entry.data.clone();
+            let hv_ct    = entry.hv_content_type.clone();
+            let hv_cl    = entry.hv_content_length.clone();
+            let hv_et    = entry.hv_etag.clone();
+            let hv_lm    = entry.hv_last_modified.clone();
+            let hv_cc    = entry.hv_cache_control.clone();
 
             // 304 协商缓存
             let if_none_match     = req_headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok());
@@ -199,7 +177,12 @@ pub async fn handle_sweety(
             h.insert(CACHE_CONTROL,  hv_cc);
             return resp;
         }
-        // 缓存未命中：先读 metadata 确认大小，≤ FILE_CACHE_MAX_BYTES 则读入内存并缓存
+        // 缓存未命中：做完整安全检查，然后读文件并缓存
+        let canonical_root_ref = site.canonical_root.as_deref();
+        let file_path = match resolve_safe_path_fast(root, path, canonical_root_ref) {
+            Some(p) => p,
+            None => return make_error(StatusCode::FORBIDDEN, "Forbidden"),
+        };
         let meta = match tokio::fs::metadata(&file_path).await {
             Ok(m) => m,
             Err(e) => {
@@ -231,12 +214,15 @@ pub async fn handle_sweety(
                 }
             };
             // 超出条数上限时淘汰最旧 1/4
-            if cache.len() >= FILE_CACHE_MAX_ENTRIES {
-                let to_remove: Vec<_> = cache.iter()
-                    .take(FILE_CACHE_MAX_ENTRIES / 4)
-                    .map(|e| e.key().clone())
-                    .collect();
-                for k in to_remove { cache.remove(&k); }
+            {
+                let l2 = file_cache();
+                if l2.len() >= FILE_CACHE_MAX_ENTRIES {
+                    let to_remove: Vec<_> = l2.iter()
+                        .take(FILE_CACHE_MAX_ENTRIES / 4)
+                        .map(|e| e.key().clone())
+                        .collect();
+                    for k in to_remove { l2.remove(&k); }
+                }
             }
             let bytes = Bytes::from(data);
             // 写入缓存时预构建所有 HeaderValue，后续命中直接用零分配
@@ -261,7 +247,9 @@ pub async fn handle_sweety(
             let hv_et = entry.hv_etag.clone();
             let hv_lm = entry.hv_last_modified.clone();
             let hv_cc = entry.hv_cache_control.clone();
-            cache.insert(file_path.clone(), entry);
+            // 同时插入 canonical key 和 fast_key，保证两条查询路径都能命中
+            cache_insert(file_path.clone(), entry.clone());
+            if file_path != fast_key { cache_insert(fast_key.clone(), entry); }
             let mut resp = WebResponse::new(ResponseBody::from(bytes));
             let h = resp.headers_mut();
             h.insert(CONTENT_TYPE,   hv_ct);
@@ -286,6 +274,11 @@ pub async fn handle_sweety(
     }
 
     // ── HEAD / Range 路径：必须读 metadata ────────────────────────────────────
+    let canonical_root_ref = site.canonical_root.as_deref();
+    let file_path = match resolve_safe_path_fast(root, path, canonical_root_ref) {
+        Some(p) => p,
+        None => return make_error(StatusCode::FORBIDDEN, "Forbidden"),
+    };
     let meta = match tokio::fs::metadata(&file_path).await {
         Ok(m) => m,
         Err(e) => {

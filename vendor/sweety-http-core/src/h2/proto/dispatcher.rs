@@ -637,5 +637,3 @@ const CHUNK_SIZE: usize = 16 * 1024;
 // 4 片 × 16KB = 64KB per stream，内存可控
 const BODY_CHANNEL_CAP: usize = 4;
 
-// 单连接最多同时在途的 handler 数量（0=不限制，由协议层 max_concurrent_streams 控制）
-const MAX_PENDING_PER_CONN: usize = 256;

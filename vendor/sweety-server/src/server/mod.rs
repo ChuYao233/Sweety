@@ -20,6 +20,7 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
 };
 
+use tracing::{error, info};
 use crate::{builder::Builder, worker};
 
 pub struct Server {
@@ -101,19 +102,16 @@ impl Server {
             .worker_threads(server_threads)
             .build()?;
 
-        let fut = async {
-            listeners
-                .into_iter()
-                .flat_map(|(name, listeners)| listeners.into_iter().map(move |l| l().map(|l| (name.to_owned(), l))))
-                .collect::<Result<Vec<_>, io::Error>>()
-        };
-
-        // use a spawned thread to work around possible nest runtime issue.
-        // *. Server::new is most likely already inside a tokio runtime.
-        let listeners = thread::scope(|s| s.spawn(|| rt.block_on(fut)).join()).unwrap()?;
+        // listeners 现在是 Arc<Fn()> 工厂字典，不在主线程里 bind
+        // 将工厂字典包成 Arc 传给每个 worker
+        let listeners = Arc::new(listeners);
 
         let is_graceful_shutdown = Arc::new(AtomicBool::new(false));
         let is_graceful_shutdown2 = is_graceful_shutdown.clone();
+
+        // on_worker_start / factories / shutdown 需要跨多个 worker 线程共享，用 Arc 包装
+        let on_worker_start = Arc::new(on_worker_start);
+        let factories       = Arc::new(factories);
 
         let worker_handles = thread::Builder::new()
             .name(String::from("sweety-server-worker-shared-scope"))
@@ -122,18 +120,44 @@ impl Server {
 
                 // TODO: wait for startup error(including panic) and return as io::Error on call site.
                 // currently the error only show when shared scope thread is joined with handle.
+                info!("sweety-server: 启动 {worker_threads} 个 worker 线程");
                 thread::scope(|scope| {
                     for idx in 0..worker_threads {
-                        let thread = thread::Builder::new().name(format!("sweety-server-worker-{idx}"));
+                        let thread             = thread::Builder::new().name(format!("sweety-server-worker-{idx}"));
+                        let listeners          = Arc::clone(&listeners);
+                        let factories          = Arc::clone(&factories);
+                        let on_worker_start    = Arc::clone(&on_worker_start);
+                        let is_graceful_shutdown = Arc::clone(&is_graceful_shutdown);
 
-                        let task = || async {
+                        let task = move || async move {
                             on_worker_start().await;
+
+                            // SO_REUSEPORT per-worker bind：每个 worker 调用工厂函数，各自 bind 独立 fd
+                            // 内核通过 SO_REUSEPORT 把连接平均分散到各 worker
+                            let worker_listeners: Vec<(String, crate::net::ListenerDyn)> = {
+                                let mut v = Vec::new();
+                                for (name, factories) in listeners.iter() {
+                                    for factory in factories {
+                                        match factory() {
+                                            Ok(l) => {
+                                                info!("worker-{idx}: listener [{name}] bind 成功");
+                                                v.push((name.clone(), l));
+                                            }
+                                            Err(e) => {
+                                                error!("worker-{idx}: listener [{name}] bind 失败: {e}");
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                                v
+                            };
 
                             let mut handles = Vec::new();
                             let mut services = Vec::new();
 
                             for (name, factory) in factories.iter() {
-                                match factory.call((name, &listeners)).await {
+                                match factory.call((name, &worker_listeners)).await {
                                     Ok((h, s)) => {
                                         handles.extend(h);
                                         services.push(s);

@@ -12,7 +12,9 @@ use crate::{
     server::{IntoServiceObj, Server, ServerFuture, ServiceObj},
 };
 
-type ListenerFn = Box<dyn FnOnce() -> io::Result<ListenerDyn> + Send>;
+/// per-worker listener 工厂：每个 worker 调用一次，各自 bind 独立 fd
+/// 必须是 Fn（而非 FnOnce），才能被 N 个 worker 各自调用一次
+pub(crate) type ListenerFn = Arc<dyn Fn() -> io::Result<ListenerDyn> + Send + Sync>;
 
 pub struct Builder {
     pub(crate) server_threads: usize,
@@ -144,12 +146,29 @@ impl Builder {
         N: AsRef<str>,
         F: IntoServiceObj<St>,
         St: TryFrom<Stream> + 'static,
-        L: IntoListener + 'static,
+        L: IntoListener + Send + 'static,
     {
+        // 非 TCP bind 类 listener（UnixSocket / QUIC 等）：只 bind 一次，结果缓存在 Arc 里
+        // 多个 worker 调用工厂时返回同一个 Arc clone，共享同一个 fd accept
+        // Unix/QUIC 不支持 SO_REUSEPORT，内核支持多进程同时 accept 同一个 socket
+        let cached: std::sync::Mutex<Option<ListenerDyn>> = std::sync::Mutex::new(None);
+        let listener = std::sync::Mutex::new(Some(listener));
+        let factory: ListenerFn = Arc::new(move || {
+            let mut guard = cached.lock().unwrap();
+            if let Some(ref l) = *guard {
+                return Ok(Arc::clone(l));
+            }
+            // 第一次调用：真正 bind
+            let l = listener.lock().unwrap().take()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "listener already consumed"))?;
+            let built = l.into_listener().map(|l| Arc::new(l) as ListenerDyn)?;
+            *guard = Some(Arc::clone(&built));
+            Ok(built)
+        });
         self.listeners
             .entry(name.as_ref().to_string())
             .or_default()
-            .push(Box::new(|| listener.into_listener().map(|l| Arc::new(l) as _)));
+            .push(factory);
 
         self.factories.insert(name.as_ref().to_string(), service.into_object());
 
@@ -182,34 +201,70 @@ impl Builder {
         self._bind(name, addr, service)
     }
 
-    fn _bind<N, F, St>(self, name: N, addr: net::SocketAddr, service: F) -> io::Result<Self>
+    fn _bind<N, F, St>(mut self, name: N, addr: net::SocketAddr, service: F) -> io::Result<Self>
     where
         N: AsRef<str>,
         F: IntoServiceObj<St>,
         St: TryFrom<Stream> + 'static,
     {
-        let listener = net::TcpListener::bind(addr)?;
+        // 先验证地址可用（避免配置错误到 worker 启动时才发现）
+        // 用 SO_REUSEPORT 探测 bind 是否成功，探测完立即关闭
+        {
+            let probe = socket2::Socket::new(
+                socket2::Domain::for_address(addr),
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            probe.set_reuse_address(true)?;
+            #[cfg(unix)]
+            probe.set_reuse_port(true)?;
+            probe.bind(&addr.into())?;
+            // 探测完关闭，worker 各自 bind
+        }
 
-        let socket = socket2::SockRef::from(&listener);
-        // SO_REUSEADDR：允许端口快速复用（预防 TIME_WAIT 卡住）
-        socket.set_reuse_address(true)?;
-        // SO_REUSEPORT：多个 worker 直接监听同一端口，内核负载均衡（对标 Nginx reuseport）
-        #[cfg(unix)]
-        socket.set_reuse_port(true)?;
-        // TCP_NODELAY：禁用 Nagle 算法，降低小包延迟（对标 Nginx tcp_nodelay on）
-        socket.set_nodelay(true)?;
-        // TCP keepalive：75s 空闲后发送探测（防止防火墙断开空闲连接）
-        let ka = socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(75))
-            .with_interval(std::time::Duration::from_secs(15));
-        socket.set_tcp_keepalive(&ka)?;
-        // SO_RCVBUF/SO_SNDBUF 1MB：对标 Nginx listen backlog + kernel buffer 调优
-        // 提升大吞吐/高并发场景的内核 socket 缓冲区，减少背压
-        let _ = socket.set_recv_buffer_size(1024 * 1024);
-        let _ = socket.set_send_buffer_size(1024 * 1024);
-        socket.listen(self.backlog as _)?;
+        let backlog = self.backlog;
 
-        Ok(self.listen(name, listener, service))
+        // SO_REUSEPORT per-worker bind：工厂闭包在每个 worker 线程里被调用一次
+        // 每次调用都 bind 同一 addr，内核通过 SO_REUSEPORT 把连接分散到各 worker
+        // 效果等价于 Nginx worker_processes + reuseport：N 个 socket fd，N 个独立 accept queue
+        let factory: ListenerFn = Arc::new(move || -> io::Result<ListenerDyn> {
+            use sweety_io_compat::net::TcpListener as AsyncTcpListener;
+
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(addr),
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            // SO_REUSEADDR + SO_REUSEPORT：允许多个 worker 绑定同一端口
+            socket.set_reuse_address(true)?;
+            #[cfg(unix)]
+            socket.set_reuse_port(true)?;
+            // TCP_NODELAY：禁用 Nagle 算法，降低小包延迟
+            socket.set_nodelay(true)?;
+            socket.set_nonblocking(true)?;
+            // TCP keepalive
+            let ka = socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(75))
+                .with_interval(std::time::Duration::from_secs(15));
+            socket.set_tcp_keepalive(&ka)?;
+            // SO_RCVBUF/SO_SNDBUF 1MB
+            let _ = socket.set_recv_buffer_size(1024 * 1024);
+            let _ = socket.set_send_buffer_size(1024 * 1024);
+            socket.bind(&addr.into())?;
+            socket.listen(backlog as _)?;
+
+            let std_listener: net::TcpListener = socket.into();
+            let listener = AsyncTcpListener::from_std(std_listener)?;
+            Ok(Arc::new(listener) as ListenerDyn)
+        });
+
+        self.listeners
+            .entry(name.as_ref().to_string())
+            .or_default()
+            .push(factory);
+        self.factories.insert(name.as_ref().to_string(), service.into_object());
+
+        Ok(self)
     }
 }
 
@@ -260,12 +315,17 @@ impl Builder {
 
         self = self._bind(name.as_ref(), addr, service)?;
 
-        let builder = sweety_io_compat::net::QuicListenerBuilder::new(addr, config).backlog(self.backlog);
-
+        let builder = std::sync::Mutex::new(Some(
+            sweety_io_compat::net::QuicListenerBuilder::new(addr, config).backlog(self.backlog)
+        ));
         self.listeners
             .get_mut(name.as_ref())
             .unwrap()
-            .push(Box::new(|| builder.into_listener().map(|l| Arc::new(l) as _)));
+            .push(Arc::new(move || {
+                let b = builder.lock().unwrap().take()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "quic listener already consumed"))?;
+                b.into_listener().map(|l| Arc::new(l) as _)
+            }));
 
         Ok(self)
     }

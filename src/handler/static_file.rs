@@ -380,7 +380,20 @@ pub async fn handle_sweety(
             | "gif" | "webp" | "avif" | "mp4" | "webm" | "woff" | "woff2"
             | "bin" | "dat" | "raw" | "iso" | "exe" | "dll" | "so"
         );
-        let can_compress = gzip_enabled && !already_compressed
+        // mime type 白名单：只压缩文本类型（等价 Nginx gzip_types 默认值）
+        // 二进制格式（图片/视频/字体）已用 already_compressed 排除，但部分扩展名无法完全覆盖
+        // 通过 mime 白名单二次过滤，确保只对可压缩文本内容压缩
+        let mime = crate::middleware::cache::mime_type_for(ext);
+        let compressible_mime = mime.starts_with("text/")
+            || mime == "application/json"
+            || mime == "application/javascript"
+            || mime == "application/x-javascript"
+            || mime == "application/xml"
+            || mime == "application/xhtml+xml"
+            || mime == "application/rss+xml"
+            || mime == "application/atom+xml"
+            || mime == "image/svg+xml";
+        let can_compress = gzip_enabled && !already_compressed && compressible_mime
             && file_size >= min_bytes && file_size <= GZIP_MAX_INLINE;
 
         // Brotli 优先（压缩率比 gzip 高 20-30%）

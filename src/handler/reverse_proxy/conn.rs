@@ -293,7 +293,7 @@ async fn send_recv_pooled(
     //   若 100  → 读掉空行 → pipe body → 读真实状态行
     //   若非100 → has_expect_continue=true 说明上游直接拒绝（417等），不发 body
     //   无 Expect → 先 pipe body → 再读状态行
-    let (mut buf, status_code) = if has_body && has_expect_continue {
+    let (mut buf, status_code, upstream_http10) = if has_body && has_expect_continue {
         // 发头后等上游决策，BufReader 在此建立，后续所有读取都通过它
         let mut buf = BufReader::new(conn);
         let mut status_line = String::new();
@@ -318,12 +318,14 @@ async fn send_recv_pooled(
                 Ok(Ok(_)) => {}
             }
             let real_code = parse_status_code(&status_line);
+            let http10 = status_line.starts_with("HTTP/1.0");
             tracing::debug!("上游 100→{} ← {} {}", real_code, method, path);
-            (buf, real_code)
+            (buf, real_code, http10)
         } else {
             // 上游直接拒绝（417 等），不发 body
+            let http10 = status_line.starts_with("HTTP/1.0");
             tracing::debug!("上游拒绝 {} ← {} {} (expect_continue)", code, method, path);
-            (buf, code)
+            (buf, code, http10)
         }
     } else {
         // 无 Expect：先 pipe body（若有），再建 BufReader 读响应
@@ -345,13 +347,16 @@ async fn send_recv_pooled(
             Ok(Ok(_)) => {}
         }
         let code = parse_status_code(&status_line);
+        let http10 = status_line.starts_with("HTTP/1.0");
         tracing::debug!("上游 {} ← {} {}", code, method, path);
-        (buf, code)
+        (buf, code, http10)
     };
 
     let mut resp_content_length: Option<usize> = None;
     let mut resp_is_chunked = false;
-    let mut resp_conn_close = false;
+    // HTTP/1.0 默认 close；同时检测 Trailer 头字段（指示有 chunked trailer）
+    let mut resp_conn_close = upstream_http10;
+    let mut resp_has_trailer = false;
     let mut response_headers: Vec<(String, String)> = Vec::with_capacity(24);
     // 复用 line 缓冲，避免每行都堆分配
     let mut line = String::with_capacity(128);
@@ -371,6 +376,10 @@ async fn send_recv_pooled(
             if k.eq_ignore_ascii_case("content-length") { resp_content_length = v.parse().ok(); }
             if k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked") {
                 resp_is_chunked = true;
+            }
+            // Trailer 头：指示 chunked body 后有 trailer 头字段（RFC 7230）
+            if k.eq_ignore_ascii_case("trailer") {
+                resp_has_trailer = true;
             }
             // 上游要求关闭连接时不归还
             if k.eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("close") {
@@ -517,15 +526,16 @@ async fn send_recv_pooled(
     }
 
     // ── 读取响应体（支持 chunked / Content-Length / EOF）───────────────────
-    let body_bytes = if resp_is_chunked {
-        read_chunked_body(&mut buf).await.map_err(|e| (e, true))?
+    let (body_bytes, trailer_headers) = if resp_is_chunked {
+        let (b, t) = read_chunked_body(&mut buf, resp_has_trailer).await.map_err(|e| (e, true))?;
+        (b, t)
     } else if let Some(len) = resp_content_length {
-        read_exact_body(&mut buf, len).await.map_err(|e| (e, true))?
+        (read_exact_body(&mut buf, len).await.map_err(|e| (e, true))?, Vec::new())
     } else {
         resp_conn_close = true; // EOF 模式：读完即关
         let mut b = Vec::new();
         let _ = buf.read_to_end(&mut b).await;
-        b
+        (b, Vec::new())
     };
 
     let maybe_conn = if !resp_conn_close { Some(buf.into_inner()) } else { drop(buf); None };
@@ -562,6 +572,8 @@ async fn send_recv_pooled(
     *resp.status_mut() = http_status;
     apply_response_headers(&mut resp, &response_headers,
         strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
+    // chunked trailer 头透传给客户端（RFC 7230 §4.1.2）
+    append_trailer_headers(&mut resp, &trailer_headers);
     if !no_body {
         if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_len)) {
             resp.headers_mut().insert(CONTENT_LENGTH, v);
@@ -596,10 +608,17 @@ where R: AsyncRead + Unpin {
 
 /// 解码 Transfer-Encoding: chunked 响应体
 ///
-/// 格式：`<hex_size>\r\n<data>\r\n` ... `0\r\n\r\n`
-pub async fn read_chunked_body<R>(buf: &mut BufReader<R>) -> Result<Vec<u8>>
+/// 格式：`<hex_size>\r\n<data>\r\n` ... `0\r\n\r\n[trailer-headers]\r\n`
+///
+/// `collect_trailers = true` 时收集 0-chunk 后面的 trailer 头（RFC 7230 §4.1.2），
+/// 返回 `(body_bytes, trailer_headers)`。
+pub async fn read_chunked_body<R>(
+    buf: &mut BufReader<R>,
+    collect_trailers: bool,
+) -> Result<(Vec<u8>, Vec<(String, String)>)>
 where R: AsyncRead + Unpin {
     let mut body = Vec::new();
+    let mut trailers: Vec<(String, String)> = Vec::new();
     loop {
         // 读取 chunk size 行（16进制）
         let mut size_line = String::new();
@@ -612,9 +631,28 @@ where R: AsyncRead + Unpin {
         let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
 
         if chunk_size == 0 {
-            // 最后一个 chunk，读取并丢弃 trailing headers
-            let mut trailer = String::new();
-            let _ = buf.read_line(&mut trailer).await;
+            // 0-chunk 后面是可选的 trailer 头（RFC 7230 §4.1.2）
+            if collect_trailers {
+                let mut tline = String::new();
+                loop {
+                    tline.clear();
+                    match buf.read_line(&mut tline).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let trimmed = tline.trim();
+                    if trimmed.is_empty() { break; } // 空行表示 trailer 结束
+                    if let Some(colon) = trimmed.find(':') {
+                        let k = trimmed[..colon].trim().to_string();
+                        let v = trimmed[colon + 1..].trim().to_string();
+                        trailers.push((k, v));
+                    }
+                }
+            } else {
+                // 无 trailer：只读掉 CRLF
+                let mut skip = String::new();
+                let _ = buf.read_line(&mut skip).await;
+            }
             break;
         }
 
@@ -635,7 +673,22 @@ where R: AsyncRead + Unpin {
         let mut crlf = String::new();
         let _ = buf.read_line(&mut crlf).await;
     }
-    Ok(body)
+    Ok((body, trailers))
+}
+
+/// 将 chunked trailer 头 append 到响应（hop-by-hop 头除外）
+/// 等价 Nginx proxy_pass 的 trailer 透传行为
+fn append_trailer_headers(resp: &mut WebResponse, trailers: &[(String, String)]) {
+    use sweety_web::http::header::HeaderName;
+    for (k, v) in trailers {
+        if super::response::is_hop_by_hop(k) { continue; }
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            resp.headers_mut().append(name, val);
+        }
+    }
 }
 
 /// 对文本类型响应体做 URL 替换（处理上游硬编码 URL 的情况）

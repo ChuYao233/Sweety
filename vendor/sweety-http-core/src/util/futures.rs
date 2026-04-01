@@ -25,6 +25,10 @@ mod queue {
             self.0.is_empty()
         }
 
+        pub(crate) fn len(&self) -> usize {
+            self.0.len()
+        }
+
         pub(crate) async fn next2(&mut self) -> F::Output {
             self.0
                 .next()

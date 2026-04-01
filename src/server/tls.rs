@@ -450,6 +450,10 @@ fn apply_transport_config(
 }
 
 /// 从 PEM 文件构建 quinn::ServerConfig（用于 HTTP/3）
+///
+/// HTTP/3 QUIC 握手要求 TLS ALPN 必须包含 "h3"，
+/// quinn::ServerConfig::with_single_cert 不自动设置 ALPN，
+/// 必须先构建 rustls::ServerConfig 并注入 alpn_protocols，再转为 quinn::ServerConfig。
 fn build_quinn_config_from_pem(cert_path: &Path, key_path: &Path) -> Result<sweety_io::net::QuicConfig> {
     let cert_bytes = std::fs::read(cert_path)
         .with_context(|| format!("读取证书失败: {}", cert_path.display()))?;
@@ -462,13 +466,19 @@ fn build_quinn_config_from_pem(cert_path: &Path, key_path: &Path) -> Result<swee
         .with_context(|| format!("读取私钥失败: {}", key_path.display()))?;
     let key = load_private_key(&key_bytes)?;
 
-    let server_config = sweety_io::net::QuicConfig::with_single_cert(certs, key)
-        .context("构建 Quinn ServerConfig 失败")?;
+    // 构建 rustls ServerConfig 并注入 h3 ALPN
+    let mut tls_cfg = ServerConfig::builder_with_provider(make_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .context("QUIC TLS 版本配置失败")?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("构建 QUIC Rustls ServerConfig 失败")?;
+    tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
+    tls_cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(65536);
 
-    // quinn 0.11 + rustls：0-RTT 通过 rustls session ticket 自动支持
-    // 客户端重连时 QUIC 层自动使用 early data，无需额外配置
-
-    Ok(server_config)
+    quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg)
+        .map(|qc| sweety_io::net::QuicConfig::with_crypto(std::sync::Arc::new(qc)))
+        .context("构建 Quinn ServerConfig 失败")
 }
 
 /// 生成自签名证书构建 quinn::ServerConfig（ACME 证书未就绪时临时使用）
@@ -487,7 +497,14 @@ fn build_quinn_config_self_signed(domain: &str) -> Result<sweety_io::net::QuicCo
         rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())
     );
 
-    sweety_io::net::QuicConfig::with_single_cert(vec![cert_der], key_der)
+    let mut tls_cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .context("构建自签名 QUIC ServerConfig 失败")?;
+    tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
+
+    quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg)
+        .map(|qc| sweety_io::net::QuicConfig::with_crypto(std::sync::Arc::new(qc)))
         .context("构建 Quinn 自签名 ServerConfig 失败")
 }
 

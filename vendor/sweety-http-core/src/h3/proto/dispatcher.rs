@@ -54,34 +54,47 @@ where
 
         // construct h3 connection from quinn connection.
         let conn = h3_quinn::Connection::new(conn);
-        let mut conn = server::Connection::new(conn).await?;
+        let mut builder = server::builder();
+        // 防 header 爆炸攻击（等价 H2 SETTINGS_MAX_HEADER_LIST_SIZE），单请求头总大小 64KB
+        builder.max_field_section_size(65536);
+        let mut conn = builder.build(conn).await?;
 
         let mut queue = Queue::new();
+        // 单连接并发流上限（等价 H2 max_concurrent_streams）
+        const MAX_CONCURRENT: usize = 256;
 
-        // accept loop
         loop {
+            // 超过并发上限时只处理已有流，不 accept 新流，背压由此传到客户端
+            if queue.len() >= MAX_CONCURRENT {
+                match queue.next2().await {
+                    Err(e) => HttpServiceError::from(e).log("h3_handler"),
+                    Ok(()) => {}
+                }
+                continue;
+            }
+
             match conn.accept().select(queue.next()).await {
                 SelectOutput::A(Ok(Some((req, stream)))) => {
                     let (tx, rx) = stream.split();
-
-                    // Reconstruct Request to attach crate body type.
                     let req = req.map(|_| {
                         let body = ReqB::from(RequestBody(rx));
                         RequestExt::from_parts(body, Extension::new(self.addr, true))
                     });
-
                     queue.push(async move {
                         let fut = self.service.call(req);
                         h3_handler(fut, tx).await
                     });
                 }
                 SelectOutput::A(Ok(None)) => break,
-                SelectOutput::A(Err(e)) => return Err(e.into()),
-                SelectOutput::B(res) => {
-                    if let Err(e) = res {
-                        HttpServiceError::from(e).log("h3_dispatcher");
+                SelectOutput::A(Err(e)) => {
+                    // h3 官方推荐：StreamError 仅影响当前流，ConnectionError 才断连接
+                    match e.get_error_level() {
+                        ::h3::error::ErrorLevel::StreamError => continue,
+                        ::h3::error::ErrorLevel::ConnectionError => break,
                     }
                 }
+                SelectOutput::B(Err(e)) => HttpServiceError::from(e).log("h3_handler"),
+                SelectOutput::B(Ok(())) => {}
             }
         }
 

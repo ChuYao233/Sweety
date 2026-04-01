@@ -1,10 +1,11 @@
 ﻿//! 反向代理处理器
 //! 支持：HTTP / HTTPS / WS / WSS + gzip / chunked 透传
 //! 子模块职责：
-//!   lb.rs         — 负载均衡、节点状态、健康检查
-//!   tls_client.rs — TLS 客户端连接
-//!   conn.rs       — HTTP 连接层（发请求/读响应）
-//!   response.rs   — 响应头透传、Cookie/Location 改写
+//!   lb.rs           — 负载均衡、节点状态、健康检查
+//!   tls_client.rs   — TLS 客户端连接
+//!   conn.rs         — HTTP/1.1 连接层（发请求/读响应）
+//!   upstream_h2.rs  — HTTP/2 上游连接池（h2c / h2 over TLS）
+//!   response.rs     — 响应头透传、Cookie/Location 改写
 
 pub mod circuit_breaker;
 pub mod conn;
@@ -13,6 +14,7 @@ pub mod lb;
 pub mod pool;
 pub mod response;
 pub mod tls_client;
+pub mod upstream_h2;
 pub mod ws_proxy;
 
 use tracing::error;
@@ -185,6 +187,29 @@ pub async fn handle_sweety(
             proxy_redirect_from, proxy_redirect_to,
             is_ws_h2,
         ).await
+    } else if node.http2 {
+        // ── HTTP/2 上游路径（h2c 或 h2 over TLS）────────────────────────────
+        let h2_pool = ctx.state().h2_pools.get_or_create(
+            &node.addr, node.tls, &node.tls_sni, node.tls_insecure,
+            8, // 每节点最多 8 条 H2 连接，每条多路复用 stream
+            pool.connect_timeout,
+        );
+        match forward_request_h2(
+            h2_pool,
+            method, path, upstream_host,
+            &client_headers, client_ip_str_ref, scheme_str,
+            request_body,
+            strip_cookie_secure, proxy_cookie_domain,
+            proxy_redirect_from, proxy_redirect_to,
+            pool.read_timeout,
+        ).await {
+            Ok(r) => { node.record_success(); r }
+            Err(e) => {
+                node.record_failure();
+                error!("H2 反向代理失败 → {}: {}", node.addr, e);
+                response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 H2 {} 失败: {}", node.addr, e))
+            }
+        }
     } else {
         // 将 proxy_cache 引用传入 conn 层，在有完整 body bytes 时导入缓存
         let cache_ref = proxy_cache.as_ref().map(|c| (c, &cache_key));
@@ -321,4 +346,137 @@ fn apply_extra_headers(
             resp.headers_mut().insert(name, val);
         }
     }
+}
+
+/// HTTP/2 上游转发
+///
+/// - 全量 collect 请求体（gRPC 通常较小；大文件上传走 H1 路径）
+/// - 响应体流式透传（bounded channel，背压传递给客户端）
+#[allow(clippy::too_many_arguments)]
+async fn forward_request_h2(
+    pool: std::sync::Arc<upstream_h2::H2NodePool>,
+    method: &str,
+    path: &str,
+    host: &str,
+    extra_headers: &[(String, String)],
+    client_ip: &str,
+    scheme: &str,
+    req_body: sweety_web::body::RequestBody,
+    strip_cookie_secure: bool,
+    proxy_cookie_domain: Option<&str>,
+    proxy_redirect_from: Option<&str>,
+    proxy_redirect_to: Option<&str>,
+    read_timeout_secs: u64,
+) -> anyhow::Result<WebResponse> {
+    use bytes::Bytes;
+    use futures_util::StreamExt;
+    use sweety_web::body::ResponseBody;
+    use sweety_web::http::header::{HeaderName, HeaderValue, CONTENT_LENGTH};
+
+    let read_timeout = std::time::Duration::from_secs(if read_timeout_secs > 0 { read_timeout_secs } else { 60 });
+
+    // 构造 HTTP/2 请求
+    use sweety_web::http::{Version, request::Builder as ReqBuilder};
+    let uri_str = format!("https://{}{}", host, path);
+    let uri: sweety_web::http::Uri = uri_str.parse().unwrap_or_else(|_| {
+        format!("https://localhost{}", path).parse().unwrap()
+    });
+
+    let mut builder = ReqBuilder::new()
+        .method(method)
+        .uri(uri)
+        .version(Version::HTTP_2);
+
+    // 透传请求头，跳过 hop-by-hop
+    for (k, v) in extra_headers {
+        if response::is_hop_by_hop(k) { continue; }
+        if k.eq_ignore_ascii_case("content-length") { continue; }
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            builder = builder.header(name, val);
+        }
+    }
+    builder = builder
+        .header("x-real-ip", client_ip)
+        .header("x-forwarded-for", client_ip)
+        .header("x-forwarded-proto", scheme);
+
+    // 全量 collect 请求体（H2 stream 层已有流量控制）
+    let body_bytes: Option<Bytes> = {
+        let mut body = req_body;
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(b) => buf.extend_from_slice(&b),
+                Err(_) => break,
+            }
+        }
+        if buf.is_empty() { None } else { Some(buf.freeze()) }
+    };
+
+    let req = builder.body(()).map_err(|e| anyhow::anyhow!("h2 build request: {e}"))?;
+    let (parts, recv_stream) = pool.send(req, body_bytes).await?;
+
+    let status = StatusCode::from_u16(parts.status.as_u16()).unwrap_or(StatusCode::OK);
+
+    // 收集响应头（透传给客户端）
+    let mut resp_headers: Vec<(String, String)> = Vec::with_capacity(parts.headers.len());
+    for (k, v) in &parts.headers {
+        if let Ok(vs) = v.to_str() {
+            resp_headers.push((k.as_str().to_string(), vs.to_string()));
+        }
+    }
+
+    // 304/204/205/1xx 无 body
+    let no_body = status == StatusCode::NOT_MODIFIED
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::RESET_CONTENT
+        || status.is_informational();
+
+    if no_body {
+        let mut resp = WebResponse::new(ResponseBody::none());
+        *resp.status_mut() = status;
+        response::apply_response_headers(&mut resp, &resp_headers,
+            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
+        return Ok(resp);
+    }
+
+    // 流式透传响应体（bounded channel，背压）
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
+    tokio::spawn(async move {
+        let mut stream = recv_stream;
+        loop {
+            match tokio::time::timeout(read_timeout, stream.data()).await {
+                Ok(Some(Ok(data))) => {
+                    let _ = stream.flow_control().release_capacity(data.len());
+                    if tx.send(Ok(data)).await.is_err() { break; }
+                }
+                Ok(Some(Err(e))) => {
+                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))).await;
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "h2 上游响应体读取超时"))).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let mut resp = WebResponse::new(ResponseBody::box_stream(stream));
+    *resp.status_mut() = status;
+    response::apply_response_headers(&mut resp, &resp_headers,
+        strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
+
+    // H2 响应无 Transfer-Encoding，保留 Content-Length（若上游提供）
+    resp.headers_mut().remove(sweety_web::http::header::TRANSFER_ENCODING);
+    if let Some(cl) = parts.headers.get(CONTENT_LENGTH) {
+        resp.headers_mut().insert(CONTENT_LENGTH, cl.clone());
+    }
+
+    Ok(resp)
 }

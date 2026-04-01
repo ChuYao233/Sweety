@@ -426,8 +426,9 @@ async fn send_recv_pooled(
         }
 
         // 用 bounded channel 流式转发：生产者读上游解码后数据，消费者写客户端
-        // cap=16：生产者（读上游）和消费者（写客户端）之间缓冲 16 个 chunk
-        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(16);
+        // cap=4：小容量将背压传递给上游——下游慢客户端时 channel 充往，生产者 await，停止读上游
+        // 等价 Nginx 的 read-write 强耦合背压语义
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
         // per-chunk read timeout：等价 Nginx proxy_read_timeout 逐包语义
         // 每次从上游读取数据的最大等待时间，超时即关闭连接（不是整体响应超时）
         let per_chunk_timeout = read_timeout;

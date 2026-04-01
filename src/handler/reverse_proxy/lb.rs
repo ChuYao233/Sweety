@@ -34,6 +34,8 @@ pub struct NodeState {
     pub tls_insecure: bool,
     /// 发给上游的 Host 头（不设则透传客户端 Host）
     pub upstream_host: Option<String>,
+    /// 是否用 HTTP/2 连接上游（h2c 或 h2 over TLS）
+    pub http2: bool,
     /// 断路器（None = 未配置，则全程无概履开销）
     pub circuit_breaker: Option<CircuitBreaker>,
 }
@@ -66,6 +68,7 @@ impl NodeState {
             tls_sni: sni,
             tls_insecure: node.tls_insecure,
             upstream_host: node.upstream_host.clone(),
+            http2: node.http2,
             circuit_breaker,
         }
     }

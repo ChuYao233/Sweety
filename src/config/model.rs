@@ -910,6 +910,12 @@ pub struct UpstreamNode {
     /// 用于防止上游因 Host 不匹配而重定向
     #[serde(default)]
     pub upstream_host: Option<String>,
+
+    /// 是否用 HTTP/2 连接上游（h2c 明文 或 h2 over TLS）
+    /// true + tls=false = h2c（HTTP/2 cleartext，上游需支持 h2c prior knowledge）
+    /// true + tls=true  = h2 over TLS（ALPN negotiation，常见于 gRPC 上游）
+    #[serde(default)]
+    pub http2: bool,
 }
 
 /// 健康检查配置

@@ -22,6 +22,7 @@ use crate::config::model::{AppConfig, HandlerType};
 use crate::config::hot_reload::{HotReloadContext, start_hot_reload};
 use crate::dispatcher::vhost::VHostRegistry;
 use crate::handler::reverse_proxy::pool::ConnPool;
+use crate::handler::reverse_proxy::upstream_h2::H2UpstreamPools;
 use crate::handler::fastcgi_pool::FcgiPool;
 use crate::middleware::access_log::{AccessLogEntry, AccessLogger, LogFormat};
 use crate::middleware::metrics::GlobalMetrics;
@@ -156,6 +157,7 @@ impl SweetyServer {
             active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_connections: cfg.global.max_connections,
             max_body_bytes: (cfg.global.client_max_body_size as u64) * 1024 * 1024,
+            h2_pools: Arc::new(crate::handler::reverse_proxy::upstream_h2::H2UpstreamPools::new()),
             fcgi_pool: Arc::new(FcgiPool::new(
                 32,   // 每地址最多 32 个 idle 连接
                 cfg.global.fastcgi_connect_timeout,
@@ -323,6 +325,8 @@ pub struct AppState {
     pub conn_pool: ConnPool,
     /// SNI 证书 Resolver 按端口索引（热重载时原地更新证书，不断连）
     pub sni_resolvers: Arc<HashMap<u16, Arc<SniResolver>>>,
+    /// HTTP/2 上游连接池（h2c / h2 over TLS）
+    pub h2_pools: Arc<H2UpstreamPools>,
     /// FastCGI 连接池（复用 PHP-FPM 连接）
     pub fcgi_pool: Arc<FcgiPool>,
     /// HTTP/3 QUIC 端口集合（用于注入 Alt-Svc 响应头）

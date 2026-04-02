@@ -51,6 +51,13 @@ macro_rules! default_aio_impl {
             ) -> ::core::task::Poll<::std::io::Result<()>> {
                 crate::io::AsyncWrite::poll_shutdown(::core::pin::Pin::new(&mut self.get_mut().0), cx)
             }
+
+            #[cfg(target_os = "linux")]
+            #[inline(always)]
+            fn raw_fd(&self) -> i32 {
+                use ::std::os::unix::io::AsRawFd;
+                self.0.as_raw_fd()
+            }
         }
 
         impl ::std::io::Read for $ty {

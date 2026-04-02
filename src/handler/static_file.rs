@@ -6,12 +6,12 @@
 //! - **都仅对 ≤ 4MB 小文件做内存压缩，大文件直接流式传输**
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::SystemTime;
 use bytes::Bytes;
 use dashmap::DashMap;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::io::AsyncReadExt;
 use tracing::debug;
 use sweety_web::{
     body::ResponseBody,
@@ -31,14 +31,62 @@ use crate::dispatcher::vhost::SiteInfo;
 use crate::middleware::cache::{generate_etag, to_unix_secs, mime_type_for, default_cache_control};
 use crate::server::http::AppState;
 
-/// gzip/brotli 内存压缩文件大小上限（512 KB）
-/// 超过此值直接流式传输，内存压缩成本过高且意义不大
-/// 对齐 Nginx gzip_min_length + 完全内存压缩的默认范围
-const GZIP_MAX_INLINE: u64 = 512 * 1024;
-/// 内存文件缓存大小上限：只缓存 ≤ 32KB 的小文件（对标 Nginx open_file_cache 的 fd+stat 缓存策略）
-/// 超过此阈值的文件改用 mmap 零拷贝流式传输，不占用堆内存
-const FILE_CACHE_MAX_BYTES: u64 = 32 * 1024;
-/// 最多缓存条数（2048 × 32KB ≈ 64MB 最坏情况）
+/// 构建缓存 key 字符串：root/relative，用于 DashMap<Arc<str>, _> 的零分配查询
+/// Arc<str>: Borrow<str>，所以 DashMap::get 可以直接接受 &str，命中时无需构造 Arc
+#[inline]
+fn make_cache_key(root: &Path, relative: &str) -> Arc<str> {
+    let root_str = root.to_str().unwrap_or("");
+    let mut s = String::with_capacity(root_str.len() + 1 + relative.len());
+    s.push_str(root_str);
+    if !relative.is_empty() {
+        s.push('/');
+        s.push_str(relative);
+    }
+    Arc::from(s.as_str())
+}
+
+/// 从完整路径构建缓存 key（canonical path 用）
+#[inline]
+fn make_cache_key_from_path(path: &Path) -> Arc<str> {
+    Arc::from(path.to_str().unwrap_or(""))
+}
+
+/// 零分配缓存查询：用栈上拼接的临时 &str 直接查询 DashMap<Arc<str>, _>，命中时无堆分配
+#[inline]
+fn cache_get_fast(root: &Path, relative: &str) -> Option<FileCacheEntry> {
+    let root_str = root.to_str().unwrap_or("");
+    // 用栈缓冲区拼接 key，避免堆分配（路径长度通常 < 256 字节）
+    let mut buf = [0u8; 512];
+    let root_b = root_str.as_bytes();
+    let rel_b  = relative.as_bytes();
+    let total  = root_b.len() + if rel_b.is_empty() { 0 } else { 1 + rel_b.len() };
+    if total <= buf.len() {
+        buf[..root_b.len()].copy_from_slice(root_b);
+        if !rel_b.is_empty() {
+            buf[root_b.len()] = b'/';
+            buf[root_b.len() + 1..total].copy_from_slice(rel_b);
+        }
+        // buf 内容来自 UTF-8 str 拼接，from_utf8 不会失败
+        if let Ok(key) = std::str::from_utf8(&buf[..total]) {
+            file_cache().get(key).map(|e| e.clone())
+        } else {
+            None
+        }
+    } else {
+        // 超长路径（极少见）回退到堆分配
+        let key = make_cache_key(root, relative);
+        file_cache().get(key.as_ref()).map(|e| e.clone())
+    }
+}
+
+/// gzip/brotli 内存压缩文件大小上限（1MB）
+const GZIP_MAX_INLINE: u64 = 1024 * 1024;
+/// 内存文件缓存大小上限：缓存 ≤ 64KB 的小文件
+/// 超过此阈值的文件改用 fd 缓存 + pread 流式传输
+const FILE_CACHE_MAX_BYTES: u64 = 64 * 1024;
+/// 文件缓存总字节数上限：64MB（含压缩副本约 2x，实际原始数据 ~32MB）
+const FILE_CACHE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+/// 最多缓存条数（上限）
 const FILE_CACHE_MAX_ENTRIES: usize = 2048;
 
 /// 文件内存缓存条目（预缓存所有响应头 HeaderValue，缓存命中时零分配）
@@ -60,9 +108,10 @@ struct FileCacheEntry {
 }
 
 /// 全局 L2 文件缓存（DashMap：无锁分片读写，多线程共享）
-static FILE_CACHE: OnceLock<DashMap<PathBuf, FileCacheEntry>> = OnceLock::new();
+/// key 为 Arc<str>（root/relative 拼接），Arc<str>: Borrow<str> 支持 &str 零分配查询
+static FILE_CACHE: OnceLock<DashMap<Arc<str>, FileCacheEntry>> = OnceLock::new();
 
-fn file_cache() -> &'static DashMap<PathBuf, FileCacheEntry> {
+fn file_cache() -> &'static DashMap<Arc<str>, FileCacheEntry> {
     FILE_CACHE.get_or_init(|| DashMap::with_capacity(FILE_CACHE_MAX_ENTRIES))
 }
 
@@ -70,7 +119,9 @@ fn file_cache() -> &'static DashMap<PathBuf, FileCacheEntry> {
 /// 对标 Nginx open_file_cache 机制
 #[derive(Clone)]
 struct FdCacheEntry {
+    #[allow(dead_code)]
     file_size:     u64,
+    #[allow(dead_code)]
     modified_secs: u64,
     /// Arc<std::fs::File> 允许多请求共享同一 fd，每次 dup2/pread 时无需持锁
     /// pread(2) 是无状态的，不需要 seek，天然支持多请求并发
@@ -80,17 +131,17 @@ struct FdCacheEntry {
 /// fd 缓存最多条目数（每条目一个 OS fd，不宜过多）
 const FD_CACHE_MAX_ENTRIES: usize = 512;
 
-static FD_CACHE: OnceLock<DashMap<PathBuf, FdCacheEntry>> = OnceLock::new();
+static FD_CACHE: OnceLock<DashMap<Arc<str>, FdCacheEntry>> = OnceLock::new();
 
-fn fd_cache() -> &'static DashMap<PathBuf, FdCacheEntry> {
+fn fd_cache() -> &'static DashMap<Arc<str>, FdCacheEntry> {
     FD_CACHE.get_or_init(|| DashMap::with_capacity(FD_CACHE_MAX_ENTRIES))
 }
 
 /// 从 fd 缓存获取：直接信任缓存（文件变化由 notify watcher 驱逐），消除每次 stat
 /// 返回 Arc<std::fs::File> 共享 fd，调用方用 pread(无 seek 竞争)或 dup 后 seek
 #[inline]
-fn fd_cache_get(path: &PathBuf) -> Option<FdCacheEntry> {
-    fd_cache().get(path).map(|e| e.clone())
+fn fd_cache_get(key: &str) -> Option<FdCacheEntry> {
+    fd_cache().get(key).map(|e| e.clone())
 }
 
 /// 从 fd 缓存获取或 open 文件（异步版，用于首次 open）
@@ -99,14 +150,15 @@ fn fd_cache_get(path: &PathBuf) -> Option<FdCacheEntry> {
 async fn fd_cache_get_or_open_arc(path: &PathBuf, file_size: u64, modified_secs: u64)
     -> Option<std::sync::Arc<std::fs::File>>
 {
-    if let Some(entry) = fd_cache_get(path) {
+    let key: Arc<str> = Arc::from(path.to_str().unwrap_or(""));
+    if let Some(entry) = fd_cache_get(&key) {
         return Some(entry.fd);
     }
     // 未命中：open 并插入缓存
     match std::fs::File::open(path) {
         Ok(f) => {
             let arc = std::sync::Arc::new(f);
-            fd_cache_insert_arc(path.clone(), arc.clone(), file_size, modified_secs);
+            fd_cache_insert_arc(key, arc.clone(), file_size, modified_secs);
             Some(arc)
         }
         Err(_) => None,
@@ -115,7 +167,7 @@ async fn fd_cache_get_or_open_arc(path: &PathBuf, file_size: u64, modified_secs:
 
 /// 插入 fd 缓存（Arc<std::fs::File> 版），LRU 满时淘汰前 1/4
 #[inline]
-fn fd_cache_insert_arc(path: PathBuf, fd: std::sync::Arc<std::fs::File>, file_size: u64, modified_secs: u64) {
+fn fd_cache_insert_arc(key: Arc<str>, fd: std::sync::Arc<std::fs::File>, file_size: u64, modified_secs: u64) {
     let cache = fd_cache();
     if cache.len() >= FD_CACHE_MAX_ENTRIES {
         let to_remove: Vec<_> = cache.iter()
@@ -124,21 +176,29 @@ fn fd_cache_insert_arc(path: PathBuf, fd: std::sync::Arc<std::fs::File>, file_si
             .collect();
         for k in to_remove { cache.remove(&k); }
     }
-    cache.insert(path, FdCacheEntry {
+    cache.insert(key, FdCacheEntry {
         file_size,
         modified_secs,
         fd,
     });
 }
 
-#[inline]
-fn cache_get(key: &PathBuf) -> Option<FileCacheEntry> {
-    file_cache().get(key).map(|e| e.clone())
-}
-
-#[inline]
-fn cache_insert(key: PathBuf, entry: FileCacheEntry) {
-    file_cache().insert(key, entry);
+fn cache_insert(key: Arc<str>, entry: FileCacheEntry) {
+    let cache = file_cache();
+    // 按总字节数淘汰：超过 FILE_CACHE_TOTAL_BYTES 时淘汰最旧 1/4
+    let total: usize = cache.iter().map(|e| {
+        e.data.len()
+            + e.gz.as_ref().map(|b| b.len()).unwrap_or(0)
+            + e.br.as_ref().map(|b| b.len()).unwrap_or(0)
+    }).sum();
+    if total + entry.data.len() > FILE_CACHE_TOTAL_BYTES || cache.len() >= FILE_CACHE_MAX_ENTRIES {
+        let to_remove: Vec<_> = cache.iter()
+            .take(FILE_CACHE_MAX_ENTRIES / 4)
+            .map(|e| e.key().clone())
+            .collect();
+        for k in to_remove { cache.remove(&k); }
+    }
+    cache.insert(key, entry);
 }
 
 /// 启动文件变更监听：文件修改/删除时直接淡化 FILE_CACHE 对应条目
@@ -157,8 +217,10 @@ pub fn start_file_cache_watcher(roots: Vec<PathBuf>) -> Option<RecommendedWatche
         let cache = file_cache();
         for path in &event.paths {
             // 直接移除命中的缓存条目，下次请求将重新从磁盘加载
-            if cache.remove(path).is_some() {
-                debug!("文件缓存已淡化: {}", path.display());
+            if let Some(key) = path.to_str() {
+                if cache.remove(key).is_some() {
+                    debug!("文件缓存已淡化: {}", path.display());
+                }
             }
         }
     });
@@ -216,9 +278,7 @@ pub async fn handle_sweety(
             return make_error(StatusCode::FORBIDDEN, "Forbidden");
         }
         let relative = path_only.trim_start_matches('/');
-        let fast_key = root.join(relative);
-
-        if let Some(entry) = cache_get(&fast_key) {
+        if let Some(entry) = cache_get_fast(root, relative) {
             let modified_secs = entry.modified_secs;
             let etag_str = entry.hv_etag.to_str().unwrap_or("");
 
@@ -243,16 +303,23 @@ pub async fn handle_sweety(
                     .and_then(|s| parse_range(s, file_size));
                 if let Some((range_start, range_end)) = range_hdr {
                     let range_len = range_end - range_start + 1;
-                    let etag_val_str = etag_str.to_owned();
                     let slice = entry.data.slice(range_start as usize..=range_end as usize);
                     let mut resp = WebResponse::new(ResponseBody::from(slice));
                     *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
-                    set_file_headers(resp.headers_mut(), &fast_key, range_len, &etag_val_str, modified_secs, location);
+                    let h = resp.headers_mut();
+                    // 直接用缓存里预构建的头，零分配
+                    h.insert(CONTENT_TYPE, entry.hv_content_type.clone());
+                    h.insert(ETAG, entry.hv_etag.clone());
+                    h.insert(LAST_MODIFIED, entry.hv_last_modified.clone());
+                    h.insert(CACHE_CONTROL, entry.hv_cache_control.clone());
+                    if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(range_len)) {
+                        h.insert(CONTENT_LENGTH, v);
+                    }
                     let mut cr = String::with_capacity(32);
                     cr.push_str("bytes "); cr.push_str(itoa::Buffer::new().format(range_start));
                     cr.push('-'); cr.push_str(itoa::Buffer::new().format(range_end));
                     cr.push('/'); cr.push_str(itoa::Buffer::new().format(file_size));
-                    if let Ok(v) = HeaderValue::from_str(&cr) { resp.headers_mut().insert(CONTENT_RANGE, v); }
+                    if let Ok(v) = HeaderValue::from_str(&cr) { h.insert(CONTENT_RANGE, v); }
                     return resp;
                 }
                 // Range 解析失败（超出范围等），回落到下方常规路径
@@ -354,17 +421,6 @@ pub async fn handle_sweety(
                     return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
                 }
             };
-            // 超出条数上限时淘汰最旧 1/4
-            {
-                let l2 = file_cache();
-                if l2.len() >= FILE_CACHE_MAX_ENTRIES {
-                    let to_remove: Vec<_> = l2.iter()
-                        .take(FILE_CACHE_MAX_ENTRIES / 4)
-                        .map(|e| e.key().clone())
-                        .collect();
-                    for k in to_remove { l2.remove(&k); }
-                }
-            }
             let bytes = Bytes::from(data);
             let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let mime = mime_type_for(ext);
@@ -435,8 +491,10 @@ pub async fn handle_sweety(
             let hv_lm = entry.hv_last_modified.clone();
             let hv_cc = entry.hv_cache_control.clone();
             // 同时插入 canonical key 和 fast_key，保证两条查询路径都能命中
-            cache_insert(file_path.clone(), entry.clone());
-            if file_path != fast_key { cache_insert(fast_key.clone(), entry); }
+            let canonical_key = make_cache_key_from_path(&file_path);
+            cache_insert(canonical_key.clone(), entry.clone());
+            let fast_key_str = make_cache_key(root, relative);
+            if fast_key_str != canonical_key { cache_insert(fast_key_str, entry); }
             let mut resp = WebResponse::new(ResponseBody::from(resp_bytes.clone()));
             let h = resp.headers_mut();
             h.insert(CONTENT_TYPE,   hv_ct);
@@ -476,15 +534,11 @@ pub async fn handle_sweety(
                 // 典型场景：视频分块请求（浏览器默认 128KB-1MB/块）
                 const PREAD_INLINE_MAX: u64 = 4 * 1024 * 1024;
                 let body = if range_len <= PREAD_INLINE_MAX {
-                    let len = range_len as usize;
-                    match tokio::task::spawn_blocking(move || {
-                        crate::handler::sendfile::pread_exact(&arc_fd, range_start, len)
-                    }).await {
-                        Ok(Ok(buf)) => ResponseBody::from(buf),
-                        _ => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
+                    match crate::handler::sendfile::async_read_range(&arc_fd, range_start, range_len as usize).await {
+                        Ok(buf) => ResponseBody::from(buf),
+                        Err(_) => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
                     }
                 } else {
-                    // 超大 Range（> 4MB）：流式传输避免内存峓发
                     let stream = crate::handler::sendfile::pread_stream(arc_fd, range_start, range_len);
                     ResponseBody::box_stream(stream)
                 };
@@ -590,15 +644,11 @@ pub async fn handle_sweety(
         // Range ≤ 4MB：单次 pread 读满到堆内存，零 stream 调度开销
         const PREAD_INLINE_MAX: u64 = 4 * 1024 * 1024;
         let body = if range_len <= PREAD_INLINE_MAX {
-            let len = range_len as usize;
-            match tokio::task::spawn_blocking(move || {
-                crate::handler::sendfile::pread_exact(&arc_fd, range_start, len)
-            }).await {
-                Ok(Ok(buf)) => ResponseBody::from(buf),
-                _ => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
+            match crate::handler::sendfile::async_read_range(&arc_fd, range_start, range_len as usize).await {
+                Ok(buf) => ResponseBody::from(buf),
+                Err(_) => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
             }
         } else {
-            // 超大 Range（> 4MB）：流式传输避免内存峓发
             let stream = crate::handler::sendfile::pread_stream(arc_fd, range_start, range_len);
             ResponseBody::box_stream(stream)
         };

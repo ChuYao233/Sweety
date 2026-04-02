@@ -315,23 +315,26 @@ impl Builder {
 
         self = self._bind(name.as_ref(), addr, service)?;
 
-        let builder = std::sync::Mutex::new(Some(
-            sweety_io_compat::net::QuicListenerBuilder::new(addr, config).backlog(self.backlog)
-        ));
+        let backlog = self.backlog;
+        let config = Arc::new(config);
+
+        // per-worker 工厂：每个 worker 独立 build QuicListener（SO_REUSEPORT）
         self.listeners
             .get_mut(name.as_ref())
             .unwrap()
             .push(Arc::new(move || {
-                let b = builder.lock().unwrap().take()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "quic listener already consumed"))?;
-                b.into_listener().map(|l| Arc::new(l) as _)
+                let cfg = (*config).clone();
+                sweety_io_compat::net::QuicListenerBuilder::new(addr, cfg)
+                    .backlog(backlog)
+                    .into_listener()
+                    .map(|l| Arc::new(l) as _)
             }));
 
         Ok(self)
     }
 
     pub fn bind_h3<N, A, F, St>(
-        self,
+        mut self,
         name: N,
         addr: A,
         config: sweety_io_compat::net::QuicConfig,
@@ -348,8 +351,26 @@ impl Builder {
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "Can not parse SocketAddr"))?;
 
-        let listener = sweety_io_compat::net::QuicListenerBuilder::new(addr, config).backlog(self.backlog);
+        let backlog = self.backlog;
+        let config = Arc::new(config);
 
-        Ok(self.listen(name, listener, service))
+        // per-worker 工厂：每个 worker 各自调用一次，各自 build 独立的 QuicListener
+        // QuicListenerBuilder::build 内部设置 SO_REUSEPORT，内核按四元组分发 UDP 数据包
+        // 效果等价于 Nginx worker_processes + reuseport on UDP：N 个独立 UDP fd，N 核并行收包
+        let factory: ListenerFn = Arc::new(move || {
+            let cfg = (*config).clone();
+            sweety_io_compat::net::QuicListenerBuilder::new(addr, cfg)
+                .backlog(backlog)
+                .into_listener()
+                .map(|l| Arc::new(l) as ListenerDyn)
+        });
+
+        self.listeners
+            .entry(name.as_ref().to_string())
+            .or_default()
+            .push(factory);
+        self.factories.insert(name.as_ref().to_string(), service.into_object());
+
+        Ok(self)
     }
 }

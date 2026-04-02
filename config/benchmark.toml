@@ -1,0 +1,97 @@
+# Sweety 压测/基准测试配置
+# 测试环境： 服务机器 阿里云 ecs.c9i.large 2C4G
+#           拉流机器 阿里云 ecs.c9i.xlarge 4C8G
+# 对标 Nginx 配置（worker_processes auto + keepalive_requests 100000）
+# 站点：172.24.174.28，HTTP/1.1 + HTTP/2 + HTTP/3，静态文件服务
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 全局配置
+# ═══════════════════════════════════════════════════════════════════════════════
+[global]
+# 等价 Nginx worker_processes auto（2C 机器 = 2 个 worker）
+worker_threads = 2
+
+# 等价 Nginx worker_connections 65535
+worker_connections = 65535
+
+# 不限制全局连接数（压测需要，生产建议设 10000-50000）
+max_connections = 0
+
+# 等价 Nginx keepalive_timeout 75
+keepalive_timeout = 75
+
+# 不限制请求体大小（等价 Nginx client_max_body_size 0）
+client_max_body_size = 0
+
+# 请求头缓冲区 32KB（等价 Nginx client_header_buffer_size）
+client_header_buffer_size = 32
+
+# 请求体缓冲区 512KB
+client_body_buffer_size = 512
+
+# 压测场景关闭 gzip（.bin 文件不可压缩，开启只增加 CPU 开销）
+gzip = false
+
+# 日志级别：压测时用 warn 减少日志 IO 开销
+log_level = "warn"
+
+# HTTP/2 单连接最大并发流数（对标 Nginx http2_max_concurrent_streams）
+# 128 条流：1000 并发需要 ~8 条连接，SO_REUSEPORT 可均匀分散到各 worker
+h2_max_concurrent_streams = 128
+
+# HTTP/2 RST 洪水防护（压测场景调高）
+h2_max_concurrent_reset_streams = 4096
+
+# HTTP/2 最大帧大小 65535 字节（减少 TLS 加密次数，提升中等文件吞吐）
+h2_max_frame_size = 65535
+
+# HTTP/2 单连接最大请求数（对标 Nginx keepalive_requests）
+# 达到后发 GOAWAY 优雅关闭，强制客户端重建连接重新分散到各 worker
+# 解决长连接负载集中于单核的问题
+h2_max_requests_per_conn = 1000
+
+# 不限制单连接在途 handler 数（依赖 h2_max_concurrent_streams 协议级流控）
+h2_max_pending_per_conn = 0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 站点配置
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "benchmark"
+server_name = ["172.24.174.28"]
+
+# HTTP 明文（用于 force_https 跳转）
+listen     = [80]
+
+# HTTPS + HTTP/2 + HTTP/3
+listen_tls = [443]
+
+# 静态文件根目录
+root  = "/www/wwwroot/local"
+index = ["index.html", "index.htm"]
+
+# 压测不记录访问日志（等价 Nginx access_log off）
+# access_log = "/var/log/sweety/benchmark_access.log"
+
+# HTTP → HTTPS 强制跳转（等价 Nginx return 301）
+force_https = true
+
+# 压测不压缩（.bin 文件不可压缩）
+gzip = false
+
+# ── TLS 配置 ──────────────────────────────────────────────────────────────────
+[sites.tls]
+cert = "/www/cert/cert.pem"
+key  = "/www/cert/key.pem"
+
+# TLS 版本（等价 Nginx ssl_protocols TLSv1.2 TLSv1.3）
+min_version = "tls1.2"
+max_version = "tls1.3"
+
+# 启用协议栈：HTTP/3(QUIC) > HTTP/2 > HTTP/1.1（等价 Nginx h2 on + quic reuseport）
+protocols = ["h3", "h2", "http/1.1"]
+
+# ── Location：静态文件服务 ────────────────────────────────────────────────────
+[[sites.locations]]
+path    = "/"
+handler = "static"

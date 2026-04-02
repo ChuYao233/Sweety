@@ -48,6 +48,10 @@ optional = true
 path = "../sweety-collection"
 features = ["bytes"]
 
+[target.'cfg(unix)'.dependencies.socket2]
+version = "0.5"
+features = ["all"]
+
 [features]
 default = []
 quic = [

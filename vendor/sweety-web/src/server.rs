@@ -142,6 +142,19 @@ where
         self
     }
 
+    /// HTTP/2 最大帧大小（字节，默认 65535）
+    pub fn h2_max_frame_size(mut self, n: u32) -> Self {
+        self.config = self.config.h2_max_frame_size(n);
+        self
+    }
+
+    /// HTTP/2 单连接最大请求数（0 = 不限制，默认 1000）
+    /// 达到后发 GOAWAY 优雅关闭，强制客户端重建连接重新分散到各 worker
+    pub fn h2_max_requests_per_conn(mut self, n: usize) -> Self {
+        self.config = self.config.h2_max_requests_per_conn(n);
+        self
+    }
+
     /// Change max size for request head.
     ///
     /// Request has a bigger head than it would be reject with error.
@@ -343,7 +356,7 @@ where
             .clone()
             .enclosed(HttpServiceBuilder::with_config(self.config));
 
-        self.builder = self.builder.bind_h3("sweety-web", addr, config, service)?;
+        self.builder = self.builder.bind_h3("sweety-web-h3", addr, config, service)?;
         Ok(self)
     }
 

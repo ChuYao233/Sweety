@@ -134,6 +134,8 @@ where
                         // update timer to first request timeout.
                         self.update_first_request_deadline(timer.as_mut());
 
+                        let raw_fd = sweety_io_compat::io::AsyncIo::raw_fd(&_tls_stream);
+
                         let mut conn = ::h2::server::Builder::new()
                             .enable_connect_protocol()
                             .handshake(sweety_io_compat::io::PollIoAdapter(_tls_stream))
@@ -148,8 +150,10 @@ where
                             timer.as_mut(),
                             self.config.keep_alive_timeout,
                             self.config.h2_max_pending_per_conn,
+                            self.config.h2_max_requests_per_conn,
                             Arc::clone(&self.service),
                             self.date.get_rc(),
+                            raw_fd,
                         )
                         .run()
                         .await

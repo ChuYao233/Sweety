@@ -200,6 +200,8 @@ impl SweetyServer {
             server = server.h2_max_pending_per_conn(cfg.global.h2_max_pending_per_conn);
         }
         server = server.h2_max_concurrent_reset_streams(cfg.global.h2_max_concurrent_reset_streams);
+        server = server.h2_max_frame_size(cfg.global.h2_max_frame_size);
+        server = server.h2_max_requests_per_conn(cfg.global.h2_max_requests_per_conn);
 
         // 绑定各站点监听端口（HTTP 明文）
         let http_ports = collect_http_ports(&cfg);

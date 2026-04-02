@@ -30,6 +30,12 @@ pub struct HttpServiceConfig<
     pub(crate) h2_max_pending_per_conn: usize,
     /// HTTP/2 RST 洪水防护：最大并发 reset 流数（对标 h2 crate max_concurrent_reset_streams）
     pub(crate) h2_max_concurrent_reset_streams: usize,
+    /// HTTP/2 最大帧大小（默认 65535）
+    pub(crate) h2_max_frame_size: u32,
+    /// HTTP/2 单连接最大请求数（0 = 不限制，默认 1000）
+    /// 达到后发 GOAWAY 优雅关闭，强制客户端重建连接重新分散到各 worker
+    /// 对标 Nginx keepalive_requests
+    pub(crate) h2_max_requests_per_conn: usize,
 }
 
 impl Default for HttpServiceConfig {
@@ -53,6 +59,8 @@ impl HttpServiceConfig {
             h2_max_concurrent_streams: 102400,
             h2_max_pending_per_conn: 0,
             h2_max_concurrent_reset_streams: 200,
+            h2_max_frame_size: 65535,
+            h2_max_requests_per_conn: 1000,
         }
     }
 }
@@ -144,6 +152,19 @@ impl<const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE_BUF_LIM
         self
     }
 
+    /// HTTP/2 最大帧大小（字节，默认 65535）
+    pub fn h2_max_frame_size(mut self, n: u32) -> Self {
+        self.h2_max_frame_size = n;
+        self
+    }
+
+    /// HTTP/2 单连接最大请求数（0 = 不限制，默认 1000）
+    /// 达到后发 GOAWAY 优雅关闭，强制客户端重建连接重新分散到各 worker
+    pub fn h2_max_requests_per_conn(mut self, n: usize) -> Self {
+        self.h2_max_requests_per_conn = n;
+        self
+    }
+
     /// Enable peek into connection to figure out it's protocol regardless the outcome
     /// of alpn negotiation.
     ///
@@ -172,6 +193,8 @@ impl<const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE_BUF_LIM
             h2_max_concurrent_streams: self.h2_max_concurrent_streams,
             h2_max_pending_per_conn: self.h2_max_pending_per_conn,
             h2_max_concurrent_reset_streams: self.h2_max_concurrent_reset_streams,
+            h2_max_frame_size: self.h2_max_frame_size,
+            h2_max_requests_per_conn: self.h2_max_requests_per_conn,
         }
     }
 }

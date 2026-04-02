@@ -191,7 +191,33 @@ fn cmd_reload(config: &PathBuf) {
     }
 }
 
+/// 把进程 nofile soft/hard limit 提到足够高，避免高并发下 fd 耗尽
+/// root 运行时可以突破系统 hard limit，普通用户只能提到当前 hard limit
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    use std::mem::MaybeUninit;
+    const TARGET: libc::rlim_t = 1_048_576;
+    unsafe {
+        let mut rl = MaybeUninit::<libc::rlimit>::uninit();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, rl.as_mut_ptr()) != 0 { return; }
+        let mut rl = rl.assume_init();
+        // root 可以把 hard limit 也提到 TARGET
+        if rl.rlim_max != libc::RLIM_INFINITY && rl.rlim_max < TARGET {
+            rl.rlim_max = TARGET;
+        }
+        let target_soft = if rl.rlim_max == libc::RLIM_INFINITY { TARGET } else { rl.rlim_max };
+        if rl.rlim_cur < target_soft {
+            rl.rlim_cur = target_soft;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+        }
+    }
+}
+
 fn cmd_run(config: &PathBuf) {
+    // 提升进程 fd 上限到 hard limit，防止高并发下 "No file descriptors available"
+    #[cfg(unix)]
+    raise_nofile_limit();
+
     let cfg = load_cfg_or_exit(config);
     let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.global.log_level));

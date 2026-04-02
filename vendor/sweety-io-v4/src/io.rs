@@ -44,6 +44,11 @@ pub trait AsyncIo: io::Read + io::Write + Unpin {
     /// # Why:
     /// tokio's network Stream types do not expose other api for shutdown besides [AsyncWrite::poll_shutdown].
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+
+    /// 返回底层 TCP socket 的 raw fd（仅 Linux 有效，其他平台返回 0）
+    /// 用于 TCP_CORK（等价 Nginx tcp_nopush）
+    #[inline(always)]
+    fn raw_fd(&self) -> i32 { 0 }
 }
 
 /// object safe version of [AsyncIo] trait.

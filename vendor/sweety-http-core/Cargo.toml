@@ -49,6 +49,7 @@ http3 = [
     "futures-util/alloc",
     "h3",
     "h3-quinn",
+    "itoa",
     "runtime",
 ]
 io-uring = [
@@ -182,6 +183,9 @@ path = "../sweety-server"
 [target.'cfg(not(target_family = "wasm"))'.dependencies.socket2]
 version = "0.5.1"
 features = ["all"]
+
+[target.'cfg(unix)'.dependencies.libc]
+version = "0.2"
 
 [lints.clippy]
 await_holding_lock = "allow"

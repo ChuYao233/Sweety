@@ -40,8 +40,13 @@ pub(crate) struct Dispatcher<'a, TlsSt, S, ReqB> {
     keep_alive: Pin<&'a mut KeepAlive>,
     ka_dur: Duration,
     max_pending: usize,
+    /// 单条连接最大请求数（0 = 不限制），达到后发 GOAWAY 优雅关闭
+    /// 对标 Nginx keepalive_requests，强制客户端重建连接重新分散负载到各 worker
+    max_requests: usize,
     service: Arc<S>,
     date: Rc<DateTimeHandle>,
+    /// 底层 TCP socket raw fd（Linux 上用于 TCP_CORK，0 表示不可用）
+    raw_fd: i32,
     _req_body: PhantomData<ReqB>,
 }
 
@@ -61,10 +66,12 @@ where
         keep_alive: Pin<&'a mut KeepAlive>,
         ka_dur: Duration,
         max_pending: usize,
+        max_requests: usize,
         service: Arc<S>,
         date: Rc<DateTimeHandle>,
+        raw_fd: i32,
     ) -> Self {
-        Self { io, addr, is_tls, keep_alive, ka_dur, max_pending, service, date, _req_body: PhantomData }
+        Self { io, addr, is_tls, keep_alive, ka_dur, max_pending, max_requests, service, date, raw_fd, _req_body: PhantomData }
     }
 
     async fn run_handler(
@@ -74,6 +81,7 @@ where
         date: Rc<DateTimeHandle>,
         addr: SocketAddr,
         is_tls: bool,
+        raw_fd: i32,
     ) -> Result<bool, ()> {
         let req = req.map(|body| {
             RequestExt::from_parts(RequestBody::from(body).into(), Extension::new(addr, is_tls))
@@ -82,11 +90,12 @@ where
             Ok(r) => r,
             Err(e) => { trace!("h2 service error: {:?}", e); return Ok(true); }
         };
-        h2_handler(resp, respond, &date).await
+        h2_handler(resp, respond, &date, raw_fd).await
     }
 
     pub(crate) async fn run(self) -> Result<(), Error<S::Error, BE>> {
-        let Self { io, addr, is_tls, mut keep_alive, ka_dur, max_pending, service, date, .. } = self;
+        let Self { io, addr, is_tls, mut keep_alive, ka_dur, max_pending, max_requests, service, date, raw_fd, .. } = self;
+        let mut req_count: usize = 0;
 
         let ping_pong = io.ping_pong().expect("first call to ping_pong should never fail");
         let deadline = date.now() + ka_dur;
@@ -141,8 +150,13 @@ where
                     if max_pending > 0 && queue.len() >= max_pending {
                         io.graceful_shutdown();
                     }
+                    req_count += 1;
+                    // 达到 max_requests 上限：发 GOAWAY 优雅关闭，客户端重建连接重新分散到各 worker
+                    if max_requests > 0 && req_count >= max_requests {
+                        io.graceful_shutdown();
+                    }
                     queue.push(Box::pin(Self::run_handler(
-                        req, respond, Arc::clone(&service), Rc::clone(&date), addr, is_tls,
+                        req, respond, Arc::clone(&service), Rc::clone(&date), addr, is_tls, raw_fd,
                     )));
                 }
             }
@@ -185,8 +199,10 @@ impl Future for H2PingPong<'_> {
     }
 }
 
-// 小文件内联阈值：≤ 32KB（H2 初始窗口 65535，32KB 以内无需等窗口）
-const SMALL_BODY_INLINE: usize = 32 * 1024;
+// 小/中等文件内联阈值：≤ 1MB（单次 collect 后整块发送，消除流控等待和多次调度开销）
+// 100KB~1MB 中等文件走流水线路径会被流控窗口多次截断，内联发送可消除这部分延迟
+// 超过 1MB 的大文件才走流水线 stream，避免一次性占用过多内存
+const SMALL_BODY_INLINE: usize = 1024 * 1024;
 // mmap stream 每块大小（与 sendfile.rs 的 STREAM_CHUNK 对齐）
 const CHUNK_SIZE: usize = 256 * 1024;
 // 大文件流水线窗口：允许提前读入并排队发送的最大字节数
@@ -194,10 +210,29 @@ const CHUNK_SIZE: usize = 256 * 1024;
 // 这样读文件和网络发送完全重叠，消除串行 RTT 等待
 const PIPELINE_WINDOW: usize = 1024 * 1024;
 
+/// Linux TCP_CORK：攒满再发，等价 Nginx tcp_nopush
+/// 在 send_response 前 CORK，最后一帧 send_data 后 UNCORK
+#[cfg(target_os = "linux")]
+#[inline(always)]
+#[allow(unsafe_code)]
+fn set_tcp_cork(fd: i32, on: bool) {
+    if fd <= 0 { return; }
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: fd 来自已建立的 TLS 连接，生命周期由调用方保证有效
+    // ManuallyDrop 确保函数返回时不会 close fd（不拥有所有权）
+    let owned = std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_fd(fd) });
+    let _ = socket2::SockRef::from(&*owned).set_cork(on);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline(always)]
+fn set_tcp_cork(_fd: i32, _on: bool) {}
+
 async fn h2_handler<B, BE>(
     resp: Response<B>,
     mut respond: SendResponse<Bytes>,
     date: &DateTimeHandle,
+    raw_fd: i32,
 ) -> Result<bool, ()>
 where
     B: Stream<Item = Result<Bytes, BE>>,
@@ -240,41 +275,62 @@ where
 
     // 无 body
     if is_eof {
+        set_tcp_cork(raw_fd, true);
         let _ = respond.send_response(res, true);
+        set_tcp_cork(raw_fd, false);
         return Ok(keep_alive);
     }
 
-    // 小文件快路：同步 collect body（ResponseBody::Bytes 的 poll_next 永远同步 Ready）
-    // 不使用 poll_fn(..).await 避免每次 chunk 都交还调度器
+    // 小/中等文件内联快路：collect 全部 body 后整块发送
+    // ≤ 1MB：单块 Bytes（pread_exact）同步 Ready，零 await；多 chunk stream（256KB×N）async collect
+    // 消除 H2 流控等待：整块 send_data 比分块流式减少多次 poll_capacity 调度往返
     if let BodySize::Sized(n) = body_size {
         if n as usize <= SMALL_BODY_INLINE {
             let data: Option<Bytes> = {
                 let mut body = pin!(body);
-                // noop waker：只做同步 poll，不注册真实唤醒
+                // 先尝试同步 poll（单块 Bytes body 永远同步 Ready，避免不必要的 await）
                 let waker = futures_util::task::noop_waker();
                 let mut cx = Context::from_waker(&waker);
                 match body.as_mut().poll_next(&mut cx) {
                     Poll::Pending => {
-                        // 极少数情况 body 异步，降级到 poll_fn await
+                        // 异步 body（少见），直接 async await 第一块
                         poll_fn(|cx| body.as_mut().poll_next(cx)).await
                             .and_then(|r| r.ok())
                     }
                     Poll::Ready(None) => None,
                     Poll::Ready(Some(Err(_))) => None,
                     Poll::Ready(Some(Ok(first))) => {
-                        // 检查是否还有更多 chunk（绝大多数情况 Bytes body 只有一个 chunk）
+                        // 检查是否还有更多 chunk
                         match body.as_mut().poll_next(&mut cx) {
-                            Poll::Ready(None) => Some(first), // 唯一 chunk，零拷贝
+                            Poll::Ready(None) => Some(first), // 唯一 chunk，零拷贝返回
                             Poll::Ready(Some(Ok(second))) => {
-                                // 多 chunk，合并（少见路径）
-                                let mut buf = crate::bytes::BytesMut::with_capacity(first.len() + second.len());
+                                // 多 chunk 同步合并
+                                let cap = n as usize;
+                                let mut buf = crate::bytes::BytesMut::with_capacity(cap);
                                 buf.extend_from_slice(&first);
                                 buf.extend_from_slice(&second);
                                 loop {
                                     match body.as_mut().poll_next(&mut cx) {
                                         Poll::Ready(Some(Ok(c))) => buf.extend_from_slice(&c),
-                                        _ => break,
+                                        Poll::Ready(_) => break,
+                                        Poll::Pending => {
+                                            // stream 还有数据但需要 async，切换到 async collect
+                                            while let Some(Ok(c)) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+                                                buf.extend_from_slice(&c);
+                                            }
+                                            break;
+                                        }
                                     }
+                                }
+                                Some(buf.freeze())
+                            }
+                            Poll::Pending => {
+                                // 第二块需要 async，先把第一块存着，async collect 剩余
+                                let cap = n as usize;
+                                let mut buf = crate::bytes::BytesMut::with_capacity(cap);
+                                buf.extend_from_slice(&first);
+                                while let Some(Ok(c)) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+                                    buf.extend_from_slice(&c);
                                 }
                                 Some(buf.freeze())
                             }
@@ -284,6 +340,7 @@ where
                 }
             };
             let has_trailers = trailers.is_some();
+            set_tcp_cork(raw_fd, true);
             match data {
                 None => { let _ = respond.send_response(res, true); }
                 Some(data) => {
@@ -293,6 +350,7 @@ where
                     }
                 }
             }
+            set_tcp_cork(raw_fd, false);
             return Ok(keep_alive);
         }
     }
@@ -302,10 +360,11 @@ where
     // 原理：reserve_capacity(PIPELINE_WINDOW) 预申请大窗口，h2 crate 持有发送队列
     //   capacity() > 0 时直接发，无需 await（零延迟）
     //   capacity() == 0 时 poll_capacity 等下一个 WINDOW_UPDATE，期间 tokio 调度其他任务
-    //   读文件（mmap 纯内存）与网络发送重叠，消除串行 RTT 等待
+    //   读文件（mmap 纯内存）与网络发送完全重叠，消除串行 RTT 等待
+    set_tcp_cork(raw_fd, true);
     let mut stream = match respond.send_response(res, false) {
         Ok(s) => s,
-        Err(_) => return Ok(keep_alive),
+        Err(_) => { set_tcp_cork(raw_fd, false); return Ok(keep_alive); }
     };
     let mut body = pin!(body);
 
@@ -333,9 +392,13 @@ where
                 stream.reserve_capacity(PIPELINE_WINDOW);
                 if remaining.is_empty() { break; }
             } else {
-                // 窗口耗尽：等 WINDOW_UPDATE（此时 tokio 可调度其他连接）
+                // 窗口耗尽：先 UNCORK flush 已攒的数据，再等 WINDOW_UPDATE
+                set_tcp_cork(raw_fd, false);
                 match poll_fn(|cx| stream.poll_capacity(cx)).await {
-                    Some(Ok(_)) => {} // 有新窗口，回到顶部重试
+                    Some(Ok(_)) => {
+                        // 有新窗口，重新 CORK 继续发送
+                        set_tcp_cork(raw_fd, true);
+                    }
                     _ => {
                         // 连接/流已关闭（RST 或 GOAWAY）
                         return Ok(keep_alive);
@@ -350,6 +413,7 @@ where
     } else {
         let _ = stream.send_data(Bytes::new(), true);
     }
+    set_tcp_cork(raw_fd, false);
 
     Ok(keep_alive)
 }

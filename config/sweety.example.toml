@@ -86,10 +86,21 @@ h2_max_concurrent_streams = 102400
 # 建议压测时设为 4096，生产环境根据实际并发量调整
 h2_max_concurrent_reset_streams = 4096
 
+# HTTP/2 最大帧大小（字节，RFC 7540 范围 16384~16777215，默认 65535）
+# 越大每条响应帧数越少，TLS record 加密次数越少，中等文件（100KB~5MB）吞吐更高
+# 16384 = 兼容性优先（RFC 默认值），65535 = 吞吐优先
+h2_max_frame_size = 65535
+
 # HTTP/2 单连接最大同时在途 handler 数（应用级背压）
 # 超出时发 GOAWAY 优雅拒绝新流，客户端会新开连接重试
 # 0 = 不限制（依赖 h2_max_concurrent_streams 协议级流控）
 h2_max_pending_per_conn = 0
+
+# HTTP/2 单连接最大请求数（对标 Nginx keepalive_requests，默认 1000）
+# 达到后发 GOAWAY 优雅关闭，强制客户端重建连接
+# 重建时 SO_REUSEPORT 将新连接分散到各 worker 线程，解决长连接负载集中于单核的问题
+# 0 = 不限制（不推荐，高并发下所有连接可能集中在少数 worker）
+h2_max_requests_per_conn = 1000
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 站点 1：静态网站（HTTPS + ACME 自动证书 + Brotli/gzip 压缩）

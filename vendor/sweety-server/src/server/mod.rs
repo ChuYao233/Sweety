@@ -144,8 +144,9 @@ impl Server {
                                                 v.push((name.clone(), l));
                                             }
                                             Err(e) => {
-                                                error!("worker-{idx}: listener [{name}] bind 失败: {e}");
-                                                return;
+                                                // SO_REUSEPORT 场景下部分 worker bind 失败是正常的
+                                                // 只要至少一个 worker bind 成功即可，不退出整个 worker
+                                                error!("worker-{idx}: listener [{name}] bind 失败: {e}，跳过");
                                             }
                                         }
                                     }

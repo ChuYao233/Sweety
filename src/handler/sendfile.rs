@@ -110,14 +110,12 @@ pub fn file_stream_backpressure<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    // 动态 chunk size：小文件用小块，大文件用 1MB
-    // 避免 1KB 文件分配 1MB buf
+    // 动态 chunk size：小文件用小块，中/大文件统一 256KB
+    // 中等文件（64KB~）用 256KB chunk 对齐 H2 pipeline CHUNK_SIZE，减少 poll_next 次数
     let chunk_size = if len <= 64 * 1024 {
         16 * 1024usize  // 小文件：16KB chunk
-    } else if len <= 1024 * 1024 {
-        128 * 1024      // 中文件：128KB chunk
     } else {
-        STREAM_CHUNK     // 大文件：1MB chunk
+        STREAM_CHUNK     // 中/大文件：256KB chunk，与 H2 PIPELINE_WINDOW 对齐
     };
 
     async_stream::stream! {
@@ -247,7 +245,30 @@ pub const fn has_sendfile() -> bool {
 // pread 系列：共享 fd + 无 seek 偏移读
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// 从共享 fd 的指定 offset 读取 len 字节（一次性）
+/// 异步版：从共享 fd 的 offset 读取 len 字节（一次性），无 spawn_blocking
+///
+/// try_clone 给出独立 fd，seek + read_exact 全部在 async 上下文完成。
+pub async fn async_read_range(
+    file: &std::sync::Arc<std::fs::File>,
+    offset: u64,
+    len: usize,
+) -> IoResult<Bytes> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    if len == 0 {
+        return Ok(Bytes::new());
+    }
+    let std_file = file.try_clone()?;
+    let mut async_file = tokio::fs::File::from_std(std_file);
+    if offset > 0 {
+        async_file.seek(std::io::SeekFrom::Start(offset)).await?;
+    }
+    let mut buf = bytes::BytesMut::with_capacity(len);
+    buf.resize(len, 0);
+    async_file.read_exact(&mut buf).await?;
+    Ok(buf.freeze())
+}
+
+/// 从共享 fd 的指定 offset 读取 len 字节（一次性，同步版）
 ///
 /// - Linux/macOS：使用 `pread(2)` 系统调用，无 seek，无竞争，线程安全
 /// - Windows：先 dup fd，再同步 seek + read_exact（单线程，无竞争）
@@ -268,15 +289,13 @@ pub fn pread_exact(
 
 /// 从共享 fd 的 offset 开始，生成一个分块 Stream
 ///
-/// 每个 chunk 在独立的 `spawn_blocking` 任务中通过 pread 读取，
-/// 通过 bounded channel（容量=2）实现背压：生产者超前最多 1 个 chunk。
-/// 内存占用恒定 ≤ 2 × STREAM_CHUNK，不随文件大小增长。
+/// 用 tokio::fs::File（异步 IO）直接在 async worker 里读，消除 spawn_blocking 开销。
+/// 每个请求只做一次 try_clone + seek，后续 read 全部异步，无额外 task 调度。
 pub fn pread_stream(
     file: std::sync::Arc<std::fs::File>,
     offset: u64,
     len: u64,
 ) -> impl Stream<Item = IoResult<Bytes>> + Send + 'static {
-    // 动态 chunk size：小 Range 用小块，大 Range 用 STREAM_CHUNK
     let chunk_size = if len <= 64 * 1024 {
         16 * 1024usize
     } else if len <= 1024 * 1024 {
@@ -286,31 +305,36 @@ pub fn pread_stream(
     };
 
     async_stream::stream! {
-        let mut pos = offset;
-        let end     = offset + len;
+        // try_clone 给出独立文件描述符，避免 seek 竞争
+        let std_file = match file.try_clone() {
+            Ok(f) => f,
+            Err(e) => { yield Err(e); return; }
+        };
+        let mut async_file = tokio::fs::File::from_std(std_file);
 
-        while pos < end {
-            let to_read = ((end - pos) as usize).min(chunk_size);
-            let file_c  = file.clone();
-            let cur_pos = pos;
+        // 定位到起始偏移
+        if offset > 0 {
+            use tokio::io::AsyncSeekExt;
+            if let Err(e) = async_file.seek(std::io::SeekFrom::Start(offset)).await {
+                yield Err(e);
+                return;
+            }
+        }
 
-            // 在 blocking 线程池里做 pread，不占用 async worker
-            let result = tokio::task::spawn_blocking(move || {
-                pread_exact(&file_c, cur_pos, to_read)
-            }).await;
+        let mut remaining = len;
+        let mut buf = bytes::BytesMut::with_capacity(chunk_size);
 
-            match result {
-                Ok(Ok(bytes)) => {
-                    pos += bytes.len() as u64;
-                    yield Ok(bytes);
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(chunk_size);
+            buf.resize(to_read, 0);
+
+            match async_file.read(&mut buf[..to_read]).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    remaining = remaining.saturating_sub(n as u64);
+                    yield Ok(buf.split_to(n).freeze());
                 }
-                Ok(Err(e)) => { yield Err(e); return; }
-                Err(_join) => {
-                    yield Err(std::io::Error::new(
-                        std::io::ErrorKind::Other, "spawn_blocking panicked"
-                    ));
-                    return;
-                }
+                Err(e) => { yield Err(e); return; }
             }
         }
     }

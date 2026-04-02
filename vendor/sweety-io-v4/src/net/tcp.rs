@@ -62,15 +62,31 @@ impl TryFrom<Stream> for (TcpStream, SocketAddr) {
 
 super::default_aio_impl!(TcpStream);
 
+#[cfg(target_os = "linux")]
+impl TcpStream {
+    /// 返回底层 socket raw fd，用于 TCP_CORK 等 Linux 特有优化
+    #[inline(always)]
+    pub fn raw_fd_linux(&self) -> i32 {
+        use std::os::unix::io::AsRawFd;
+        self.0.as_raw_fd()
+    }
+}
+
 #[cfg(unix)]
 mod unix_impl {
-    use std::os::unix::io::{AsFd, BorrowedFd};
+    use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
 
     use super::TcpStream;
 
     impl AsFd for TcpStream {
         fn as_fd(&self) -> BorrowedFd<'_> {
             self.0.as_fd()
+        }
+    }
+
+    impl AsRawFd for TcpStream {
+        fn as_raw_fd(&self) -> RawFd {
+            self.0.as_raw_fd()
         }
     }
 }

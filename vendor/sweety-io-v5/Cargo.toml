@@ -44,6 +44,10 @@ default-features = false
 features = ["aws-lc-rs", "runtime-tokio", "rustls"]
 optional = true
 
+[target.'cfg(unix)'.dependencies.socket2]
+version = "0.5"
+features = ["all"]
+
 [dependencies.tokio]
 version = "1.48"
 features = ["net"]

@@ -60,6 +60,11 @@ where
         &self.conn
     }
 
+    /// 获取底层 IO 引用（用于拿取原始 socket fd）
+    pub fn get_ref(&self) -> &Io {
+        &self.io
+    }
+
     /// finish handshake with given io and connection type.
     /// # Examples:
     /// ```rust
@@ -115,6 +120,31 @@ where
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         AsyncIo::poll_shutdown(Pin::new(&mut self.get_mut().io), cx)
+    }
+
+    #[inline(always)]
+    fn raw_fd(&self) -> i32 {
+        self.io.raw_fd()
+    }
+}
+
+#[cfg(unix)]
+impl<C, Io> std::os::unix::io::AsFd for TlsStream<C, Io>
+where
+    Io: std::os::unix::io::AsFd,
+{
+    fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
+        self.io.as_fd()
+    }
+}
+
+#[cfg(unix)]
+impl<C, Io> std::os::unix::io::AsRawFd for TlsStream<C, Io>
+where
+    Io: std::os::unix::io::AsRawFd,
+{
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.io.as_raw_fd()
     }
 }
 

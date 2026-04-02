@@ -64,6 +64,35 @@ impl QuicListenerBuilder {
 
     pub fn build(self) -> io::Result<QuicListener> {
         let Self { config, addr, .. } = self;
+
+        #[cfg(unix)]
+        {
+            // 手动创建 UDP socket 并设置 SO_REUSEPORT
+            // 使每个 worker 都能独立绑定同一端口，内核按四元组分发 UDP 包
+            // 效果等价于 Nginx worker_processes + reuseport on UDP
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(addr),
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            socket.set_reuse_address(true)?;
+            socket.set_reuse_port(true)?;
+            socket.set_nonblocking(true)?;
+            socket.bind(&addr.into())?;
+
+            let std_udp: std::net::UdpSocket = socket.into();
+            let runtime = quinn::default_runtime()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no tokio runtime"))?;
+            let endpoint = Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(config),
+                std_udp,
+                runtime,
+            )?;
+            return Ok(QuicListener { endpoint });
+        }
+
+        #[cfg(not(unix))]
         Endpoint::server(config, addr).map(|endpoint| QuicListener { endpoint })
     }
 }

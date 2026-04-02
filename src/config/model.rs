@@ -130,6 +130,18 @@ pub struct GlobalConfig {
     /// h2 crate 默认值为 20，压测场景需要调高
     #[serde(default = "default_h2_max_concurrent_reset_streams")]
     pub h2_max_concurrent_reset_streams: usize,
+
+    /// HTTP/2 最大帧大小（字节，RFC 7540 范围 16384~16777215，默认 65535）
+    /// 越大每条响应所需的帧数越少，TLS record 加密次数越少，中等文件吞吐更高
+    /// 建议：16384（兼容性优先）~ 65535（吞吐优先）
+    #[serde(default = "default_h2_max_frame_size")]
+    pub h2_max_frame_size: u32,
+
+    /// HTTP/2 单连接最大请求数（0 = 不限制，默认 1000）
+    /// 达到后发 GOAWAY 优雅关闭，强制客户端重建连接重新分散到各 worker
+    /// 对标 Nginx keepalive_requests，解决长连接负载集中于单 worker 的问题
+    #[serde(default = "default_h2_max_requests_per_conn")]
+    pub h2_max_requests_per_conn: usize,
 }
 
 impl Default for GlobalConfig {
@@ -156,6 +168,8 @@ impl Default for GlobalConfig {
             h2_max_concurrent_streams: default_h2_max_concurrent_streams(),
             h2_max_pending_per_conn: 0,
             h2_max_concurrent_reset_streams: default_h2_max_concurrent_reset_streams(),
+            h2_max_frame_size: default_h2_max_frame_size(),
+            h2_max_requests_per_conn: default_h2_max_requests_per_conn(),
         }
     }
 }
@@ -1044,6 +1058,8 @@ fn default_rewrite_flag() -> RewriteFlag { RewriteFlag::Last }
 fn default_worker_connections() -> usize { 51200 }
 fn default_h2_max_concurrent_streams() -> u32 { 128 }
 fn default_h2_max_concurrent_reset_streams() -> usize { 200 }
+fn default_h2_max_frame_size() -> u32 { 65535 }
+fn default_h2_max_requests_per_conn() -> usize { 1000 }
 fn default_keepalive_timeout() -> u64 { 60 }
 fn default_fastcgi_connect_timeout() -> u64 { 5 }
 fn default_fastcgi_read_timeout() -> u64 { 60 }

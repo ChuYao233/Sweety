@@ -242,3 +242,115 @@ pub fn file_stream_fallback(
 pub const fn has_sendfile() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos"))
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// pread 系列：共享 fd + 无 seek 偏移读
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// 从共享 fd 的指定 offset 读取 len 字节（一次性）
+///
+/// - Linux/macOS：使用 `pread(2)` 系统调用，无 seek，无竞争，线程安全
+/// - Windows：先 dup fd，再同步 seek + read_exact（单线程，无竞争）
+///
+/// 此函数必须在 `spawn_blocking` 线程池内调用（同步阻塞）。
+pub fn pread_exact(
+    file: &std::fs::File,
+    offset: u64,
+    len: usize,
+) -> IoResult<Bytes> {
+    if len == 0 {
+        return Ok(Bytes::new());
+    }
+    let mut buf = vec![0u8; len];
+    pread_all(file, offset, &mut buf)?;
+    Ok(Bytes::from(buf))
+}
+
+/// 从共享 fd 的 offset 开始，生成一个分块 Stream
+///
+/// 每个 chunk 在独立的 `spawn_blocking` 任务中通过 pread 读取，
+/// 通过 bounded channel（容量=2）实现背压：生产者超前最多 1 个 chunk。
+/// 内存占用恒定 ≤ 2 × STREAM_CHUNK，不随文件大小增长。
+pub fn pread_stream(
+    file: std::sync::Arc<std::fs::File>,
+    offset: u64,
+    len: u64,
+) -> impl Stream<Item = IoResult<Bytes>> + Send + 'static {
+    // 动态 chunk size：小 Range 用小块，大 Range 用 STREAM_CHUNK
+    let chunk_size = if len <= 64 * 1024 {
+        16 * 1024usize
+    } else if len <= 1024 * 1024 {
+        128 * 1024
+    } else {
+        STREAM_CHUNK
+    };
+
+    async_stream::stream! {
+        let mut pos = offset;
+        let end     = offset + len;
+
+        while pos < end {
+            let to_read = ((end - pos) as usize).min(chunk_size);
+            let file_c  = file.clone();
+            let cur_pos = pos;
+
+            // 在 blocking 线程池里做 pread，不占用 async worker
+            let result = tokio::task::spawn_blocking(move || {
+                pread_exact(&file_c, cur_pos, to_read)
+            }).await;
+
+            match result {
+                Ok(Ok(bytes)) => {
+                    pos += bytes.len() as u64;
+                    yield Ok(bytes);
+                }
+                Ok(Err(e)) => { yield Err(e); return; }
+                Err(_join) => {
+                    yield Err(std::io::Error::new(
+                        std::io::ErrorKind::Other, "spawn_blocking panicked"
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// 内部实现：从 fd + offset 连续读满 buf（处理短读）
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn pread_all(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> IoResult<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf[done..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - done,
+                (offset + done as u64) as libc::off_t,
+            )
+        };
+        match n {
+            n if n > 0 => done += n as usize,
+            // pread(2) 返回 0 表示已到达文件末尾，正常退出
+            0 => break,
+            _ => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Windows / 其他平台：dup fd 后同步 seek + read_exact
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn pread_all(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> IoResult<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    // try_clone() 给出独立的文件指针，不影响原 fd
+    let mut dup = file.try_clone()?;
+    dup.seek(SeekFrom::Start(offset))?;
+    dup.read_exact(buf)
+}

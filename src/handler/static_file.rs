@@ -5,15 +5,13 @@
 //! - **gzip**：客户端不支持 br 时的降级选项
 //! - **都仅对 ≤ 4MB 小文件做内存压缩，大文件直接流式传输**
 
-use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::SystemTime;
-
 use bytes::Bytes;
 use dashmap::DashMap;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncReadExt;
 use tracing::debug;
 use sweety_web::{
     body::ResponseBody,
@@ -66,6 +64,71 @@ static FILE_CACHE: OnceLock<DashMap<PathBuf, FileCacheEntry>> = OnceLock::new();
 
 fn file_cache() -> &'static DashMap<PathBuf, FileCacheEntry> {
     FILE_CACHE.get_or_init(|| DashMap::with_capacity(FILE_CACHE_MAX_ENTRIES))
+}
+
+/// 大文件 fd 缓存条目：缓存 fd + stat，避免 Range/普通请求重复 open syscall
+/// 对标 Nginx open_file_cache 机制
+#[derive(Clone)]
+struct FdCacheEntry {
+    file_size:     u64,
+    modified_secs: u64,
+    /// Arc<std::fs::File> 允许多请求共享同一 fd，每次 dup2/pread 时无需持锁
+    /// pread(2) 是无状态的，不需要 seek，天然支持多请求并发
+    fd:            std::sync::Arc<std::fs::File>,
+}
+
+/// fd 缓存最多条目数（每条目一个 OS fd，不宜过多）
+const FD_CACHE_MAX_ENTRIES: usize = 512;
+
+static FD_CACHE: OnceLock<DashMap<PathBuf, FdCacheEntry>> = OnceLock::new();
+
+fn fd_cache() -> &'static DashMap<PathBuf, FdCacheEntry> {
+    FD_CACHE.get_or_init(|| DashMap::with_capacity(FD_CACHE_MAX_ENTRIES))
+}
+
+/// 从 fd 缓存获取：直接信任缓存（文件变化由 notify watcher 驱逐），消除每次 stat
+/// 返回 Arc<std::fs::File> 共享 fd，调用方用 pread(无 seek 竞争)或 dup 后 seek
+#[inline]
+fn fd_cache_get(path: &PathBuf) -> Option<FdCacheEntry> {
+    fd_cache().get(path).map(|e| e.clone())
+}
+
+/// 从 fd 缓存获取或 open 文件（异步版，用于首次 open）
+/// 命中时直接返回 Arc<std::fs::File>，未命中时 open 并插入缓存
+#[inline]
+async fn fd_cache_get_or_open_arc(path: &PathBuf, file_size: u64, modified_secs: u64)
+    -> Option<std::sync::Arc<std::fs::File>>
+{
+    if let Some(entry) = fd_cache_get(path) {
+        return Some(entry.fd);
+    }
+    // 未命中：open 并插入缓存
+    match std::fs::File::open(path) {
+        Ok(f) => {
+            let arc = std::sync::Arc::new(f);
+            fd_cache_insert_arc(path.clone(), arc.clone(), file_size, modified_secs);
+            Some(arc)
+        }
+        Err(_) => None,
+    }
+}
+
+/// 插入 fd 缓存（Arc<std::fs::File> 版），LRU 满时淘汰前 1/4
+#[inline]
+fn fd_cache_insert_arc(path: PathBuf, fd: std::sync::Arc<std::fs::File>, file_size: u64, modified_secs: u64) {
+    let cache = fd_cache();
+    if cache.len() >= FD_CACHE_MAX_ENTRIES {
+        let to_remove: Vec<_> = cache.iter()
+            .take(FD_CACHE_MAX_ENTRIES / 4)
+            .map(|e| e.key().clone())
+            .collect();
+        for k in to_remove { cache.remove(&k); }
+    }
+    cache.insert(path, FdCacheEntry {
+        file_size,
+        modified_secs,
+        fd,
+    });
 }
 
 #[inline]
@@ -144,7 +207,8 @@ pub async fn handle_sweety(
     // 热路径：先用无 canonicalize 的快速路径构建 key 查缓存
     // 缓存 key 在写入时已经是 canonical path，查缓存只需 root.join + cache.get
     // 命中时完全跳过 canonicalize/stat/open 系统调用
-    if !is_head && !is_range_req {
+    // Range 请求也走此热路径：小文件数据在内存中，直接 slice，零 syscall
+    if !is_head {
         // 快速 `..` 检查（不做 syscall）
         let path_only = path.split('?').next().unwrap_or(path);
         let has_traversal = path_only.split('/').any(|s| s == "..");
@@ -168,6 +232,30 @@ pub async fn handle_sweety(
                 let mut resp = WebResponse::new(ResponseBody::none());
                 *resp.status_mut() = StatusCode::NOT_MODIFIED;
                 return resp;
+            }
+
+            // ── Range 请求：直接从内存缓存 slice，零 open/seek syscall ─────────
+            if is_range_req {
+                let file_size = entry.data.len() as u64;
+                let range_hdr = req_headers
+                    .get(sweety_web::http::header::RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| parse_range(s, file_size));
+                if let Some((range_start, range_end)) = range_hdr {
+                    let range_len = range_end - range_start + 1;
+                    let etag_val_str = etag_str.to_owned();
+                    let slice = entry.data.slice(range_start as usize..=range_end as usize);
+                    let mut resp = WebResponse::new(ResponseBody::from(slice));
+                    *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                    set_file_headers(resp.headers_mut(), &fast_key, range_len, &etag_val_str, modified_secs, location);
+                    let mut cr = String::with_capacity(32);
+                    cr.push_str("bytes "); cr.push_str(itoa::Buffer::new().format(range_start));
+                    cr.push('-'); cr.push_str(itoa::Buffer::new().format(range_end));
+                    cr.push('/'); cr.push_str(itoa::Buffer::new().format(file_size));
+                    if let Ok(v) = HeaderValue::from_str(&cr) { resp.headers_mut().insert(CONTENT_RANGE, v); }
+                    return resp;
+                }
+                // Range 解析失败（超出范围等），回落到下方常规路径
             }
 
             // 选择最优编码：br > gz > 原始
@@ -366,17 +454,54 @@ pub async fn handle_sweety(
             return resp;
         }
 
-        // 大文件（> FILE_CACHE_MAX_BYTES）：tokio::fs 分块流式读取
-        // 内存恒定在 PIPELINE_WINDOW(1MB) 量级，不随文件大小或并发数增长
-        debug!("提供静态文件(stream): {} size={}", file_path.display(), file_size);
-        let tk_file = match tokio::fs::File::open(&file_path).await {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!("打开文件失败 {}: {}", file_path.display(), e);
+        // 大文件（> FILE_CACHE_MAX_BYTES）：先查 fd 缓存，命中则共享 fd 直接用；否则 open 后写入缓存
+        debug!("提供静态文件(stream): {} size={} range={}", file_path.display(), file_size, is_range_req);
+        let arc_fd = match fd_cache_get_or_open_arc(&file_path, file_size, modified_secs).await {
+            Some(f) => f,
+            None => {
+                tracing::error!("打开文件失败: {}", file_path.display());
                 return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
             }
         };
-        return stream_file_response_async(tk_file, &file_path, file_size, &etag_val, modified_secs, location);
+
+        // Range 请求：只传 Range 片段
+        if is_range_req {
+            let range = req_headers
+                .get(sweety_web::http::header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| parse_range(s, file_size));
+            if let Some((range_start, range_end)) = range {
+                let range_len = range_end - range_start + 1;
+                // Range ≤ 4MB：单次 pread 读满到堆内存，零 stream 调度开销
+                // 典型场景：视频分块请求（浏览器默认 128KB-1MB/块）
+                const PREAD_INLINE_MAX: u64 = 4 * 1024 * 1024;
+                let body = if range_len <= PREAD_INLINE_MAX {
+                    let len = range_len as usize;
+                    match tokio::task::spawn_blocking(move || {
+                        crate::handler::sendfile::pread_exact(&arc_fd, range_start, len)
+                    }).await {
+                        Ok(Ok(buf)) => ResponseBody::from(buf),
+                        _ => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
+                    }
+                } else {
+                    // 超大 Range（> 4MB）：流式传输避免内存峓发
+                    let stream = crate::handler::sendfile::pread_stream(arc_fd, range_start, range_len);
+                    ResponseBody::box_stream(stream)
+                };
+                let mut resp = WebResponse::new(body);
+                *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                set_file_headers(resp.headers_mut(), &file_path, range_len, &etag_val, modified_secs, location);
+                let mut cr = String::with_capacity(32);
+                cr.push_str("bytes "); cr.push_str(itoa::Buffer::new().format(range_start));
+                cr.push('-'); cr.push_str(itoa::Buffer::new().format(range_end));
+                cr.push('/'); cr.push_str(itoa::Buffer::new().format(file_size));
+                if let Ok(v) = HeaderValue::from_str(&cr) { resp.headers_mut().insert(CONTENT_RANGE, v); }
+                return resp;
+            }
+            // Range 解析失败（超出范围），回落到全量传输
+        }
+
+        return stream_file_response_pread(arc_fd, &file_path, file_size, 0, file_size, &etag_val, modified_secs, location);
     }
 
     // ── HEAD / Range 路径：必须读 metadata ────────────────────────────────────
@@ -451,18 +576,33 @@ pub async fn handle_sweety(
     let _ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     if let Some((range_start, range_end)) = range {
-        // ── Range 请求：seek + 限长读取，内存恒定 ──────────────────────────
+        // ── Range 请求 ───────────────────────────────────────────────────────────────────
         let range_len = range_end - range_start + 1;
-        let mut tk_file = match tokio::fs::File::open(&file_path).await {
-            Ok(f) => f,
-            Err(e) => { tracing::error!("打开文件失败 {}: {}", file_path.display(), e); return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""); }
+        // 查 fd 缓存：命中则共享 fd，未命中则同步 open（随即写入缓存）
+        let arc_fd = match fd_cache_get_or_open_arc(&file_path, file_size, modified_secs).await {
+            Some(f) => f,
+            None => {
+                tracing::error!("打开文件失败: {}", file_path.display());
+                return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
+            }
         };
-        if tk_file.seek(SeekFrom::Start(range_start)).await.is_err() {
-            return make_error(StatusCode::RANGE_NOT_SATISFIABLE, "");
-        }
-        let limited = tk_file.take(range_len);
-        let stream = crate::handler::sendfile::file_stream_backpressure(limited, range_len);
-        let body = ResponseBody::box_stream(stream);
+
+        // Range ≤ 4MB：单次 pread 读满到堆内存，零 stream 调度开销
+        const PREAD_INLINE_MAX: u64 = 4 * 1024 * 1024;
+        let body = if range_len <= PREAD_INLINE_MAX {
+            let len = range_len as usize;
+            match tokio::task::spawn_blocking(move || {
+                crate::handler::sendfile::pread_exact(&arc_fd, range_start, len)
+            }).await {
+                Ok(Ok(buf)) => ResponseBody::from(buf),
+                _ => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
+            }
+        } else {
+            // 超大 Range（> 4MB）：流式传输避免内存峓发
+            let stream = crate::handler::sendfile::pread_stream(arc_fd, range_start, range_len);
+            ResponseBody::box_stream(stream)
+        };
+
         let mut resp = WebResponse::new(body);
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
         set_file_headers(resp.headers_mut(), &file_path, range_len, &etag_val, modified_secs, location);
@@ -473,36 +613,35 @@ pub async fn handle_sweety(
         if let Ok(v) = HeaderValue::from_str(&cr) { resp.headers_mut().insert(CONTENT_RANGE, v); }
         resp
     } else {
-        // ── 普通请求（大文件，> FILE_CACHE_MAX_BYTES）────────────────────────────────
-        // 大文件不做内存压缩：压缩需要把整个文件读进内存，内存开销过高
-        // 小文件（≤ FILE_CACHE_MAX_BYTES）在缓存写入时已预计算 gz/br，缓存命中时直接返回
-        // 大文件直接 tokio::fs 分块流式传输
-        let tk_file = match tokio::fs::File::open(&file_path).await {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!("打开文件失败 {}: {}", file_path.display(), e);
+        // ── 普通请求（大文件，> FILE_CACHE_MAX_BYTES）────────────────────────────────────────
+        let arc_fd = match fd_cache_get_or_open_arc(&file_path, file_size, modified_secs).await {
+            Some(f) => f,
+            None => {
+                tracing::error!("打开文件失败: {}", file_path.display());
                 return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
             }
         };
-        stream_file_response_async(tk_file, &file_path, file_size, &etag_val, modified_secs, location)
+        stream_file_response_pread(arc_fd, &file_path, file_size, 0, file_size, &etag_val, modified_secs, location)
     }
 }
 
 
-/// tokio::fs 分块流式读取：内存恒定在 chunk_size 量级，不随文件大小增长
-/// file_stream_backpressure 的 chunk_size 动态适配，H2 flow control 背压控制节奏
-fn stream_file_response_async(
-    file: tokio::fs::File,
+/// pread 分块流式传输：共享 fd + spawn_blocking pread，无 seek，无竞争
+/// 适用于大文件全量传输（offset=0, len=file_size）和大 Range 传输
+fn stream_file_response_pread(
+    fd: std::sync::Arc<std::fs::File>,
     file_path: &Path,
-    file_size: u64,
+    content_len: u64,
+    offset: u64,
+    len: u64,
     etag_val: &str,
     modified_secs: u64,
     location: &LocationConfig,
 ) -> WebResponse {
-    let stream = crate::handler::sendfile::file_stream_backpressure(file, file_size);
+    let stream = crate::handler::sendfile::pread_stream(fd, offset, len);
     let body = ResponseBody::box_stream(stream);
     let mut resp = WebResponse::new(body);
-    set_file_headers(resp.headers_mut(), file_path, file_size, etag_val, modified_secs, location);
+    set_file_headers(resp.headers_mut(), file_path, content_len, etag_val, modified_secs, location);
     resp
 }
 

@@ -445,7 +445,8 @@ async fn send_recv_pooled(
         if resp_is_chunked {
             // chunked 上游：解码后用 BytesMut.freeze() 零拷贝转 Bytes
             // 读完整个 chunked 流后把连接归还到池
-            tokio::spawn(async move {
+            // spawn_local：连接归还在同一 worker 线程执行，正确写回 thread_local ConnPool
+            tokio::task::spawn_local(async move {
                 let mut reader = buf;
                 let mut size_line = String::new();
                 let mut ok = true;
@@ -498,7 +499,8 @@ async fn send_recv_pooled(
             let stream_len = resp_content_length.unwrap_or(usize::MAX);
             let is_eof_mode = resp_content_length.is_none();
             let chunk_size = crate::handler::sendfile::STREAM_CHUNK;
-            tokio::spawn(async move {
+            // spawn_local：连接归还在同一 worker 线程执行，正确写回 thread_local ConnPool
+            tokio::task::spawn_local(async move {
                 let mut reader = buf;
                 let mut remaining = stream_len;
                 let mut heap = bytes::BytesMut::with_capacity(chunk_size);

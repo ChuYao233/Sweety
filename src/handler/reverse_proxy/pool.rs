@@ -4,59 +4,68 @@
 //! 支持 TCP 和 TLS 两种连接类型，通过枚举统一管理。
 //!
 //! 设计原则：
+//! - per-thread：每个 worker 线程有独立的 thread_local! 连接池，完全无锁
+//! - 等价 Nginx per-worker keepalive 池：消除 Arc<DashMap> 的 shard lock 竞争
 //! - 取连接：先从 idle 队列取，取不到则新建
 //! - 归还连接：响应头中无 `Connection: close` 则归还，否则丢弃
 //! - 空闲超时：idle 连接超过 idle_timeout 秒自动丢弃（惰性清理）
 //! - 最大 idle 数：超过上限时丢弃多余连接（防止资源泄漏）
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
-/// 连接池全局实例，按节点 key（addr:port）索引
-#[derive(Clone)]
+/// per-thread 连接池存储：key = "tcp:addr" 或 "tls:addr"
+/// 使用 thread_local! 完全消除跨 worker 的锁竞争，等价 Nginx per-worker keepalive
+thread_local! {
+    static PER_THREAD_POOL: RefCell<HashMap<String, NodePool>> = RefCell::default();
+}
+
+/// 连接池句柄：只保存配置，实际连接数据存在 thread_local 里
+/// Clone 成本极低（两个 usize），可以廉价地存入 AppState / 闭包
+#[derive(Clone, Copy)]
 pub struct ConnPool {
-    inner: Arc<DashMap<String, NodePool>>,
     /// 每节点最大 idle 连接数
     max_idle: usize,
-    /// idle 连接最大空闲时间（秒）
+    /// idle 连接最大空闲时间
     idle_timeout: Duration,
 }
 
 impl ConnPool {
     pub fn new(max_idle: usize, idle_timeout_secs: u64) -> Self {
         Self {
-            inner: Arc::new(DashMap::new()),
             max_idle,
             idle_timeout: Duration::from_secs(idle_timeout_secs),
         }
     }
 
-    /// 从连接池取一个 idle 连接
+    /// 从当前 worker 线程的 idle 池取一个连接
     /// 返回 (conn, created_at, request_count)，用于归还时传递 keepalive 判断
     pub fn acquire(&self, key: &str) -> Option<(PooledConn, Instant, u64)> {
-        let mut entry = self.inner.get_mut(key)?;
-        let pool = entry.value_mut();
-        // 惰性清理：只有当队列中有多个连接时才扫描，单连接时直接擦取跳过 O(n)
-        if pool.idle.len() > 1 {
-            let now = Instant::now();
-            pool.idle.retain(|c| now.duration_since(c.returned_at) < self.idle_timeout);
-        }
-        // 展示队头连接（过期连接直接丢弃）
-        while let Some(c) = pool.idle.pop_front() {
-            if c.returned_at.elapsed() < self.idle_timeout {
-                return Some((c.conn, c.created_at, c.request_count));
+        let idle_timeout = self.idle_timeout;
+        PER_THREAD_POOL.with(|cell| {
+            let mut pools = cell.borrow_mut();
+            let pool = pools.get_mut(key)?;
+            // 惰性清理：只有当队列中有多个连接时才扫描，单连接时直接取跳过 O(n)
+            if pool.idle.len() > 1 {
+                let now = Instant::now();
+                pool.idle.retain(|c| now.duration_since(c.returned_at) < idle_timeout);
             }
-        }
-        None
+            // 取队头连接（过期连接直接丢弃）
+            while let Some(c) = pool.idle.pop_front() {
+                if c.returned_at.elapsed() < idle_timeout {
+                    return Some((c.conn, c.created_at, c.request_count));
+                }
+            }
+            None
+        })
     }
 
-    /// 归还连接到池，附带应该验证的限制参数
+    /// 归还连接到当前 worker 线程的 idle 池
     pub fn release(
         &self,
         key: &str,
@@ -76,17 +85,19 @@ impl ConnPool {
             return;
         }
         let limit = if max_idle_override > 0 { max_idle_override } else { self.max_idle };
-        // 用 or_insert_with 只在 key 不存在时才分配，复用已有节点时零堆分配
-        let mut entry = self.inner.entry(key.to_owned()).or_insert_with(NodePool::default);
-        let pool = entry.value_mut();
-        if pool.idle.len() >= limit {
-            return; // 超过上限，丢弃
-        }
-        pool.idle.push_back(IdleConn {
-            conn,
-            returned_at: Instant::now(),
-            created_at,
-            request_count,
+        PER_THREAD_POOL.with(|cell| {
+            let mut pools = cell.borrow_mut();
+            // entry() 只在 key 不存在时才插入，避免不必要的 String::clone
+            let pool = pools.entry(key.to_owned()).or_default();
+            if pool.idle.len() >= limit {
+                return; // 超过上限，丢弃
+            }
+            pool.idle.push_back(IdleConn {
+                conn,
+                returned_at: Instant::now(),
+                created_at,
+                request_count,
+            });
         });
     }
 }

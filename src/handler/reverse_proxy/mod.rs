@@ -444,8 +444,9 @@ async fn forward_request_h2(
     }
 
     // 流式透传响应体（bounded channel，背压）
+    // spawn_local：在同一 worker 线程驱动，避免跨线程调度开销
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
-    tokio::spawn(async move {
+    tokio::task::spawn_local(async move {
         let mut stream = recv_stream;
         loop {
             match tokio::time::timeout(read_timeout, stream.data()).await {

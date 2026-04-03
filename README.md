@@ -95,13 +95,15 @@ Sweety 当前在小文件高并发和大文件传输场景下均优于 nginx 默
 
 ---
 
-## 文档 / Documentation
+## 文档
 
-| 语言 | 文档 |
-|------|------|
-| 🇨🇳 中文 | [快速开始](docs/zh/快速开始.md) · [配置参考](docs/zh/配置参考.md) · [Roadmap](docs/zh/roadmap.md) |
-| 🇺🇸 English | [Getting Started](docs/getting-started.md) · [Config Reference](docs/config-reference.md) |
-| 📄 完整配置示例 | [config/sweety.example.toml](config/sweety.example.toml) |
+| | |
+|---|---|
+| 📚 完整文档 | [docs/](docs/README.md) |
+| 🚀 快速开始 | [docs/getting-started/quickstart.md](docs/getting-started/quickstart.md) |
+| ⚙️ 配置参考 | [docs/configuration/overview.md](docs/configuration/overview.md) |
+| 🗺️ Roadmap | [docs/roadmap.md](docs/roadmap.md) |
+| 📄 配置示例 | [config/sweety.example.toml](config/sweety.example.toml) |
 
 ---
 
@@ -176,7 +178,7 @@ cargo build --release
 | `if` 条件块 / `map` 变量 | ❌ | ✅ |
 | TCP/UDP 四层代理 | ❌ | ✅ stream |
 
-与 Nginx 的差距跟踪：[docs/zh/roadmap.md](docs/zh/roadmap.md)
+与 Nginx 的差距跟踪：[docs/roadmap.md](docs/roadmap.md)
 
 ---
 

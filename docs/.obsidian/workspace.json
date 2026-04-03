@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "examples/reverse-proxy.md",
+                "file": "cli.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "reverse-proxy"
+              "title": "cli"
             }
           }
         ]
@@ -94,7 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "examples/reverse-proxy.md",
+                "file": "cli.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "reverse-proxy 的反向链接列表"
+              "title": "cli 的反向链接列表"
             }
           },
           {
@@ -113,12 +113,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "examples/reverse-proxy.md",
+                "file": "cli.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "reverse-proxy 的出链列表"
+              "title": "cli 的出链列表"
             }
           },
           {
@@ -156,13 +156,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "examples/reverse-proxy.md",
+                "file": "cli.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "reverse-proxy 的大纲"
+              "title": "cli 的大纲"
             }
           }
         ]
@@ -185,6 +185,18 @@
   },
   "active": "4483bcbefe3d081f",
   "lastOpenFiles": [
+    "roadmap.md",
+    "config-reference.md",
+    "cli.md",
+    "zh/配置参考.md",
+    "zh/roadmap.md",
+    "zh/快速开始.md",
+    "getting-started/quickstart.md",
+    "getting-started/introduction.md",
+    "getting-started/faq.md",
+    "examples/wordpress.md",
+    "examples/static-site.md",
+    "examples/reverse-proxy.md",
     "examples/laravel.md",
     "examples/grpc.md",
     "configuration/websocket.md",
@@ -198,8 +210,6 @@
     "configuration/http3.md",
     "configuration/grpc.md",
     "configuration/global.md",
-    "configuration/fastcgi.md",
-    "configuration/cache.md",
-    "advanced/hot-reload.md"
+    "configuration/fastcgi.md"
   ]
 }

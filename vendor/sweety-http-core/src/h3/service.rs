@@ -7,6 +7,7 @@ use sweety_service::{Service, ready::ReadyService};
 
 use crate::{
     bytes::Bytes,
+    date::DateTimeService,
     error::HttpServiceError,
     http::{Request, RequestExt, Response},
 };
@@ -15,13 +16,14 @@ use super::{body::RequestBody, proto::Dispatcher};
 
 pub struct H3Service<S> {
     service: Arc<S>,
+    date: DateTimeService,
 }
 
 impl<S> H3Service<S> {
     /// Construct new Http3Service.
     /// No upgrade/expect services allowed in Http/3.
     pub fn new(service: S) -> Self {
-        Self { service: Arc::new(service) }
+        Self { service: Arc::new(service), date: DateTimeService::new() }
     }
 }
 
@@ -35,7 +37,7 @@ where
     type Response = ();
     type Error = HttpServiceError<S::Error, BE>;
     async fn call(&self, (stream, addr): (QuicStream, SocketAddr)) -> Result<Self::Response, Self::Error> {
-        let dispatcher = Dispatcher::new(stream, addr, Arc::clone(&self.service));
+        let dispatcher = Dispatcher::new(stream, addr, Arc::clone(&self.service), self.date.get_rc());
 
         dispatcher.run().await?;
 

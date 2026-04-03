@@ -10,12 +10,14 @@
 use ::h3::server::{self, RequestStream};
 use futures_core::stream::Stream;
 use h3_quinn::{BidiStream as QuinnBidiStream, RecvStream as QuinnRecvStream};
+use std::rc::Rc;
 use std::sync::Arc;
 use sweety_io_compat::net::QuicStream;
 use sweety_service::Service;
 
 use crate::{
     bytes::{Bytes, BytesMut},
+    date::{DateTime, DateTimeHandle},
     error::HttpServiceError,
     h3::{body::RequestBody, error::Error},
     http::{Extension, Request, RequestExt, Response},
@@ -26,6 +28,7 @@ pub(crate) struct Dispatcher<S, ReqB> {
     io: QuicStream,
     addr: SocketAddr,
     service: Arc<S>,
+    date: Rc<DateTimeHandle>,
     _req_body: PhantomData<ReqB>,
 }
 
@@ -37,8 +40,8 @@ where
     BE: fmt::Debug,
     ReqB: From<RequestBody> + 'static,
 {
-    pub(crate) fn new(io: QuicStream, addr: SocketAddr, service: Arc<S>) -> Self {
-        Self { io, addr, service, _req_body: PhantomData }
+    pub(crate) fn new(io: QuicStream, addr: SocketAddr, service: Arc<S>, date: Rc<DateTimeHandle>) -> Self {
+        Self { io, addr, service, date, _req_body: PhantomData }
     }
 
     pub(crate) async fn run(self) -> Result<(), Error<S::Error, BE>> {
@@ -79,11 +82,11 @@ where
                         Ok(Some((req, stream))) => {
                             // 低并发快路：没有待处理 handler 时直接 inline，减少一次 future 入队/调度
                             if handlers.is_empty() {
-                                if let Err(e) = h3_handler(Arc::clone(&self.service), req, stream, self.addr).await {
+                                if let Err(e) = h3_handler(Arc::clone(&self.service), req, stream, self.addr, Rc::clone(&self.date)).await {
                                     HttpServiceError::from(e).log("h3_handler");
                                 }
                             } else {
-                                handlers.push(run_handler(Arc::clone(&self.service), req, stream, self.addr));
+                                handlers.push(run_handler(Arc::clone(&self.service), req, stream, self.addr, Rc::clone(&self.date)));
                             }
                         }
                         Ok(None) => break,
@@ -107,6 +110,7 @@ async fn run_handler<S, ReqB, ResB, BE>(
     req: Request<()>,
     stream: RequestStream<QuinnBidiStream<Bytes>, Bytes>,
     addr: SocketAddr,
+    date: Rc<DateTimeHandle>,
 )
 where
     S: Service<Request<RequestExt<ReqB>>, Response = Response<ResB>>,
@@ -115,7 +119,7 @@ where
     ResB: Stream<Item = Result<Bytes, BE>>,
     BE: fmt::Debug,
 {
-    if let Err(e) = h3_handler(service, req, stream, addr).await {
+    if let Err(e) = h3_handler(service, req, stream, addr, date).await {
         HttpServiceError::from(e).log("h3_handler");
     }
 }
@@ -126,6 +130,7 @@ async fn h3_handler<S, ReqB, ResB, BE>(
     req: Request<()>,
     stream: RequestStream<QuinnBidiStream<Bytes>, Bytes>,
     addr: SocketAddr,
+    date: Rc<DateTimeHandle>,
 ) -> Result<(), Error<S::Error, BE>>
 where
     S: Service<Request<RequestExt<ReqB>>, Response = Response<ResB>>,
@@ -153,6 +158,16 @@ where
             let mut ibuf = itoa::Buffer::new();
             if let Ok(v) = HeaderValue::from_str(ibuf.format(n)) {
                 parts.headers.insert(CONTENT_LENGTH, v);
+            }
+        }
+    }
+
+    // RFC 7231 §7.1.1.2 MUST：注入 Date 头（与 H2 dispatcher 行为一致）
+    {
+        use crate::http::header::{DATE, HeaderValue};
+        if !parts.headers.contains_key(DATE) {
+            if let Ok(v) = date.with_date(HeaderValue::from_bytes) {
+                parts.headers.insert(DATE, v);
             }
         }
     }

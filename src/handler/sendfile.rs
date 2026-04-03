@@ -142,8 +142,6 @@ where
     }
 }
 
-/// Linux/macOS HTTP/1.1：`sendfile(2)` 零拷贝
-///
 /// 直接在内核完成 file_fd → socket_fd 传输，无用户态内存拷贝。
 /// 返回实际传输字节数。
 #[cfg(target_os = "linux")]
@@ -289,52 +287,40 @@ pub fn pread_exact(
 
 /// 从共享 fd 的 offset 开始，生成一个分块 Stream
 ///
-/// 用 tokio::fs::File（异步 IO）直接在 async worker 里读，消除 spawn_blocking 开销。
-/// 每个请求只做一次 try_clone + seek，后续 read 全部异步，无额外 task 调度。
+/// 使用 pread(2) 系统调用：直接在指定 offset 读，无 seek，无 try_clone，共享 fd 线程安全。
+/// 按 chunk_size 分块，每块一次 spawn_blocking，高并发下 pread 耗时极短（微秒级），
+/// blocking 线程池不会长期被占用。
 pub fn pread_stream(
     file: std::sync::Arc<std::fs::File>,
     offset: u64,
     len: u64,
 ) -> impl Stream<Item = IoResult<Bytes>> + Send + 'static {
-    let chunk_size = if len <= 64 * 1024 {
-        16 * 1024usize
-    } else if len <= 1024 * 1024 {
-        128 * 1024
+    let chunk_size = if len <= 256 * 1024 {
+        len as usize  // 小/中文件一次读完，只用一次 spawn_blocking
     } else {
-        STREAM_CHUNK
+        STREAM_CHUNK  // 大文件分 256KB chunk
     };
 
     async_stream::stream! {
-        // try_clone 给出独立文件描述符，避免 seek 竞争
-        let std_file = match file.try_clone() {
-            Ok(f) => f,
-            Err(e) => { yield Err(e); return; }
-        };
-        let mut async_file = tokio::fs::File::from_std(std_file);
-
-        // 定位到起始偏移
-        if offset > 0 {
-            use tokio::io::AsyncSeekExt;
-            if let Err(e) = async_file.seek(std::io::SeekFrom::Start(offset)).await {
-                yield Err(e);
-                return;
-            }
-        }
-
+        let mut off = offset;
         let mut remaining = len;
-        let mut buf = bytes::BytesMut::with_capacity(chunk_size);
 
         while remaining > 0 {
             let to_read = (remaining as usize).min(chunk_size);
-            buf.resize(to_read, 0);
-
-            match async_file.read(&mut buf[..to_read]).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    remaining = remaining.saturating_sub(n as u64);
-                    yield Ok(buf.split_to(n).freeze());
+            let f = file.clone();
+            match tokio::task::spawn_blocking(move || pread_exact(&f, off, to_read)).await {
+                Ok(Ok(bytes)) => {
+                    let n = bytes.len() as u64;
+                    if n == 0 { break; }
+                    off += n;
+                    remaining = remaining.saturating_sub(n);
+                    yield Ok(bytes);
                 }
-                Err(e) => { yield Err(e); return; }
+                Ok(Err(e)) => { yield Err(e); return; }
+                Err(e) => {
+                    yield Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                    return;
+                }
             }
         }
     }

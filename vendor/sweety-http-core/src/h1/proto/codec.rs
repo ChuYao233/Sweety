@@ -311,7 +311,7 @@ impl TransferCoding {
         match *self {
             Self::Eof | Self::Upgrade | Self::Length(0) => {}
             Self::EncodeChunked => buf.write_buf_static(b"0\r\n\r\n"),
-            Self::Length(n) => unreachable!("UnexpectedEof for Length Body with {} remaining", n),
+            Self::Length(n) => warn!(target: "h1_encode", "encode_eof: connection closed with {} bytes remaining in Content-Length body", n),
             _ => unreachable!(),
         }
     }

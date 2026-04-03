@@ -13,11 +13,43 @@ export default defineConfig({
     logo: '/logo.svg',
     siteTitle: 'Sweety',
 
-    // ─── 顶部导航栏 ──────────────────────────────────────────────
-    nav: [
-      { text: '入门', link: '/getting-started/quickstart', activeMatch: '/getting-started/' },
-      { text: '配置', link: '/configuration/overview', activeMatch: '/configuration/' },
-      { text: '示例', link: '/examples/wordpress', activeMatch: '/examples/' },
+    // ─── 侧边栏（全局统一） ────────────────────────────────────────
+    sidebar: [
+      {
+        text: '入门',
+        items: [
+          { text: '简介与特性', link: '/getting-started/introduction' },
+          { text: '编译与安装', link: '/getting-started/installation' },
+          { text: '快速开始', link: '/getting-started/quickstart' },
+          { text: '常见问题', link: '/getting-started/faq' },
+        ],
+      },
+      {
+        text: '配置',
+        items: [
+          { text: '概述', link: '/configuration/overview' },
+          { text: '全局配置 [global]', link: '/configuration/global' },
+          { text: '站点配置 [[sites]]', link: '/configuration/sites' },
+          { text: 'TLS / ACME', link: '/configuration/tls' },
+          { text: 'HTTP/3 调优', link: '/configuration/http3' },
+          { text: '路由规则 locations', link: '/configuration/locations' },
+          { text: 'FastCGI / PHP', link: '/configuration/fastcgi' },
+          { text: '反向代理', link: '/configuration/reverse-proxy' },
+          { text: 'gRPC 代理', link: '/configuration/grpc' },
+          { text: 'WebSocket', link: '/configuration/websocket' },
+          { text: '缓存', link: '/configuration/cache' },
+          { text: '速率限制', link: '/configuration/rate-limit' },
+          { text: '内置预设', link: '/configuration/presets' },
+        ],
+      },
+      {
+        text: '示例',
+        items: [
+          { text: 'WordPress / Laravel', link: '/examples/wordpress' },
+          { text: '静态站点 / SPA', link: '/examples/static-site' },
+          { text: '反向代理 / gRPC', link: '/examples/reverse-proxy' },
+        ],
+      },
       {
         text: '更多',
         items: [
@@ -27,90 +59,7 @@ export default defineConfig({
           { text: '热重载', link: '/advanced/hot-reload' },
         ],
       },
-      {
-        text: 'GitHub',
-        link: 'https://github.com/ChuYao233/Sweety',
-        target: '_blank',
-      },
     ],
-
-    // ─── 侧边栏 ──────────────────────────────────────────────────
-    sidebar: {
-      '/getting-started/': [
-        {
-          text: '入门',
-          items: [
-            { text: '简介与特性', link: '/getting-started/introduction' },
-            { text: '编译与安装', link: '/getting-started/installation' },
-            { text: '快速开始', link: '/getting-started/quickstart' },
-            { text: '常见问题', link: '/getting-started/faq' },
-          ],
-        },
-      ],
-
-      '/configuration/': [
-        {
-          text: '配置基础',
-          items: [
-            { text: '概述', link: '/configuration/overview' },
-            { text: '全局配置 [global]', link: '/configuration/global' },
-            { text: '站点配置 [[sites]]', link: '/configuration/sites' },
-          ],
-        },
-        {
-          text: 'TLS / HTTPS',
-          items: [
-            { text: 'TLS / ACME', link: '/configuration/tls' },
-            { text: 'HTTP/3 调优', link: '/configuration/http3' },
-          ],
-        },
-        {
-          text: '请求处理',
-          items: [
-            { text: '路由规则 locations', link: '/configuration/locations' },
-            { text: 'FastCGI / PHP', link: '/configuration/fastcgi' },
-            { text: '反向代理', link: '/configuration/reverse-proxy' },
-            { text: 'gRPC 代理', link: '/configuration/grpc' },
-            { text: 'WebSocket', link: '/configuration/websocket' },
-          ],
-        },
-        {
-          text: '性能与安全',
-          items: [
-            { text: '缓存', link: '/configuration/cache' },
-            { text: '速率限制', link: '/configuration/rate-limit' },
-          ],
-        },
-        {
-          text: '开箱即用',
-          items: [
-            { text: '内置预设', link: '/configuration/presets' },
-          ],
-        },
-      ],
-
-      '/examples/': [
-        {
-          text: '示例',
-          items: [
-            { text: 'WordPress', link: '/examples/wordpress' },
-            { text: 'Laravel', link: '/examples/laravel' },
-            { text: '静态站点 / SPA', link: '/examples/static-site' },
-            { text: '反向代理', link: '/examples/reverse-proxy' },
-            { text: 'gRPC', link: '/examples/grpc' },
-          ],
-        },
-      ],
-
-      '/advanced/': [
-        {
-          text: '进阶',
-          items: [
-            { text: '热重载', link: '/advanced/hot-reload' },
-          ],
-        },
-      ],
-    },
 
     // ─── 页面底部 ─────────────────────────────────────────────────
     socialLinks: [
@@ -118,8 +67,7 @@ export default defineConfig({
     ],
 
     footer: {
-      message: '基于 MIT 协议发布',
-      copyright: '⚠️ 尚未经过生产环境验证，请勿在关键业务直接使用',
+      message: '基于 Apache License 2.0 发布',
     },
 
     // ─── 搜索 ─────────────────────────────────────────────────────

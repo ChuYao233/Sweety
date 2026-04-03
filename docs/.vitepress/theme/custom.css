@@ -1,0 +1,5 @@
+/* Hero name 亮色渐变 */
+:root {
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(135deg, #f97316 0%, #ec4899 50%, #a855f7 100%);
+}

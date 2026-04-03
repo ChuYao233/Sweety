@@ -18,7 +18,7 @@ use sweety_web::{
     http::{
         StatusCode, WebResponse,
         header::{
-            ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
+            ACCEPT_ENCODING, ACCEPT_RANGES, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
             CONTENT_TYPE, ETAG, LAST_MODIFIED, IF_MODIFIED_SINCE, IF_NONE_MATCH,
             HeaderMap, HeaderValue,
         },
@@ -312,6 +312,7 @@ pub async fn handle_sweety(
                     h.insert(ETAG, entry.hv_etag.clone());
                     h.insert(LAST_MODIFIED, entry.hv_last_modified.clone());
                     h.insert(CACHE_CONTROL, entry.hv_cache_control.clone());
+                    h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
                     if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(range_len)) {
                         h.insert(CONTENT_LENGTH, v);
                     }
@@ -347,6 +348,7 @@ pub async fn handle_sweety(
             let mut resp = WebResponse::new(ResponseBody::from(body_bytes.clone()));
             let h = resp.headers_mut();
             h.insert(CONTENT_TYPE,   entry.hv_content_type.clone());
+            h.insert(ACCEPT_RANGES,  HeaderValue::from_static("bytes"));
             // 压缩后 Content-Length 需重新计算
             if enc.is_some() {
                 if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_bytes.len())) {
@@ -498,6 +500,7 @@ pub async fn handle_sweety(
             let mut resp = WebResponse::new(ResponseBody::from(resp_bytes.clone()));
             let h = resp.headers_mut();
             h.insert(CONTENT_TYPE,   hv_ct);
+            h.insert(ACCEPT_RANGES,  HeaderValue::from_static("bytes"));
             if enc_hv.is_some() {
                 if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(resp_bytes.len())) {
                     h.insert(CONTENT_LENGTH, v);
@@ -785,6 +788,9 @@ fn set_file_headers(
     if let Ok(v) = HeaderValue::from_str(cc) {
         headers.insert(CACHE_CONTROL, v);
     }
+
+    // RFC 7233: 声明支持 Range 请求（与 Nginx 行为一致）
+    headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 }
 
 /// try_files 解析结果

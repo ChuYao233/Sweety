@@ -162,23 +162,29 @@ cargo build --release
 
 ---
 
-## 与 Nginx 对比
+## 横向对比
 
-| 功能 | Sweety | Nginx |
-|------|--------|-------|
-| HTTP/3 内置 | ✅ | ❌ 需重新编译 |
-| ACME 自动证书（Caddy 对标） | ✅ HTTP-01 + DNS-01，自签名占位启动 | ❌ 需 certbot |
-| Brotli 压缩内置 | ✅ | ❌ 第三方模块 |
-| WebSocket H2（RFC 8441） | ✅ | ✅ |
-| 断路器 | ✅ 三状态机 | ⚠️ max_fails 仅计数 |
-| H2 多核扩展（SO_REUSEPORT） | ✅ 每 worker 独立 bind | ✅ |
-| Admin REST API | ✅ | ❌ |
-| 单文件无依赖 | ✅ | ❌ |
-| 内存安全 | ✅ Rust | ❌ C |
-| `if` 条件块 / `map` 变量 | ❌ | ✅ |
-| TCP/UDP 四层代理 | ❌ | ✅ stream |
+> ⚠️ Sweety 尚未经过生产环境验证，欢迎在测试/开发环境试用并反馈问题。
 
-与 Nginx 的差距跟踪：[docs/roadmap.md](docs/roadmap.md)
+| 功能 | Sweety | Nginx | Caddy | Apache |
+|------|--------|-------|-------|--------|
+| HTTP/3 内置 | ✅ | ❌ 需重编译 | ✅ | ❌ 实验模块 |
+| ACME 自动证书 | ✅ HTTP-01 + DNS-01 | ❌ 需 certbot | ✅ | ❌ 需插件 |
+| Brotli 压缩 | ✅ 内置 | ❌ 第三方模块 | ✅ | ✅ mod_brotli |
+| 断路器 | ✅ 三状态机 | ⚠️ max_fails 仅计数 | ❌ | ❌ |
+| WebSocket H2（RFC 8441） | ✅ | ✅ | ✅ | ✅ |
+| gRPC 代理 | ✅ | ✅（商业版全功能） | ✅ | ⚠️ 有限 |
+| FastCGI 响应缓存 | ✅ | ✅ | ❌ | ✅ |
+| 静态文件内存缓存 | ✅ | ✅ OS page cache | ❌ | ✅ |
+| 配置易用性 | ✅ 预设 + 语法糖 | ❌ 纯手写 | ✅ Caddyfile | ⚠️ 冗长 |
+| Admin REST API | ✅ | ❌ | ✅ | ❌ |
+| 单文件无依赖 | ✅ | ❌ | ✅ | ❌ |
+| 内存安全 | ✅ Rust | ❌ C | ✅ Go | ❌ C |
+| `if` / `map` 条件 | ❌ | ✅ | ⚠️ 有限 | ✅ mod_rewrite |
+| TCP/UDP 四层代理 | ❌ | ✅ stream | ❌ | ❌ |
+| **生产检验** | ⚠️ **未验证** | ✅ 广泛 | ✅ 广泛 | ✅ 广泛 |
+
+完整差距跟踪与计划：[docs/roadmap.md](docs/roadmap.md)
 
 ---
 

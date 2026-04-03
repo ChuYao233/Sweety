@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "cli.md",
+                "file": "roadmap.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "cli"
+              "title": "roadmap"
             }
           }
         ]
@@ -94,7 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "cli.md",
+                "file": "roadmap.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "cli 的反向链接列表"
+              "title": "roadmap 的反向链接列表"
             }
           },
           {
@@ -113,12 +113,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "cli.md",
+                "file": "roadmap.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "cli 的出链列表"
+              "title": "roadmap 的出链列表"
             }
           },
           {
@@ -156,13 +156,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "cli.md",
+                "file": "roadmap.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "cli 的大纲"
+              "title": "roadmap 的大纲"
             }
           }
         ]
@@ -185,9 +185,10 @@
   },
   "active": "4483bcbefe3d081f",
   "lastOpenFiles": [
+    "performance.md",
+    "cli.md",
     "roadmap.md",
     "config-reference.md",
-    "cli.md",
     "zh/配置参考.md",
     "zh/roadmap.md",
     "zh/快速开始.md",
@@ -209,7 +210,6 @@
     "configuration/locations.md",
     "configuration/http3.md",
     "configuration/grpc.md",
-    "configuration/global.md",
-    "configuration/fastcgi.md"
+    "configuration/global.md"
   ]
 }

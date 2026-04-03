@@ -48,6 +48,7 @@ acme_cache/
 *.tmp
 *.bak
 *.orig
+1/
 
 # ─── VitePress / Node.js ─────────────────────
 node_modules/

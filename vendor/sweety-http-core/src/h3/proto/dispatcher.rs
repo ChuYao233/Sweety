@@ -4,109 +4,125 @@
     marker::PhantomData,
     net::SocketAddr,
     pin::pin,
+    task::{Context, Poll},
 };
 
 use ::h3::server::{self, RequestStream};
 use futures_core::stream::Stream;
 use h3_quinn::{BidiStream as QuinnBidiStream, RecvStream as QuinnRecvStream};
+use std::sync::Arc;
 use sweety_io_compat::net::QuicStream;
 use sweety_service::Service;
-use sweety_collection::futures::{Select, SelectOutput};
 
 use crate::{
-    bytes::Bytes,
+    bytes::{Bytes, BytesMut},
     error::HttpServiceError,
     h3::{body::RequestBody, error::Error},
     http::{Extension, Request, RequestExt, Response},
-    util::futures::Queue,
 };
 
 /// Http/3 dispatcher
-pub(crate) struct Dispatcher<'a, S, ReqB> {
+pub(crate) struct Dispatcher<S, ReqB> {
     io: QuicStream,
     addr: SocketAddr,
-    service: &'a S,
+    service: Arc<S>,
     _req_body: PhantomData<ReqB>,
 }
 
-impl<'a, S, ReqB, ResB, BE> Dispatcher<'a, S, ReqB>
+impl<S, ReqB, ResB, BE> Dispatcher<S, ReqB>
 where
-    S: Service<Request<RequestExt<ReqB>>, Response = Response<ResB>>,
+    S: Service<Request<RequestExt<ReqB>>, Response = Response<ResB>> + 'static,
     S::Error: fmt::Debug,
     ResB: Stream<Item = Result<Bytes, BE>>,
     BE: fmt::Debug,
-    ReqB: From<RequestBody>,
+    ReqB: From<RequestBody> + 'static,
 {
-    pub(crate) fn new(io: QuicStream, addr: SocketAddr, service: &'a S) -> Self {
-        Self {
-            io,
-            addr,
-            service,
-            _req_body: PhantomData,
-        }
+    pub(crate) fn new(io: QuicStream, addr: SocketAddr, service: Arc<S>) -> Self {
+        Self { io, addr, service, _req_body: PhantomData }
     }
 
     pub(crate) async fn run(self) -> Result<(), Error<S::Error, BE>> {
         let conn = self.io.connecting().await?;
         let conn = h3_quinn::Connection::new(conn);
         let mut builder = server::builder();
-        // 防 header 爆炸攻击，单请求头总大小限 64KB
         builder.max_field_section_size(65536);
         let mut conn = builder.build(conn).await?;
 
-        let mut queue = Queue::new();
-        // 单连接并发流上限（等价 H2 max_concurrent_streams）
-        const MAX_CONCURRENT: usize = 256;
+        use futures_util::{FutureExt as _, stream::FuturesUnordered};
+        use futures_util::StreamExt as _;
+
+        // 连接级事件循环：accept 和 handler 并发推进
+        let mut handlers = FuturesUnordered::new();
+        const MAX_CONCURRENT: usize = 1024;
+        const READY_DRAIN_BUDGET: usize = 32;
 
         loop {
-            if queue.len() >= MAX_CONCURRENT {
-                match queue.next2().await {
-                    Err(e) => HttpServiceError::from(e).log("h3_handler"),
-                    Ok(()) => {}
+            // 小批量清理已完成 handler，降低队列堆积导致的抖动
+            for _ in 0..READY_DRAIN_BUDGET {
+                match handlers.next().now_or_never() {
+                    Some(Some(())) => {}
+                    _ => break,
+                }
+            }
+
+            // 背压：满队列时先消费一个完成事件，避免 accept 后丢流
+            if handlers.len() >= MAX_CONCURRENT {
+                if handlers.next().await.is_none() {
+                    break;
                 }
                 continue;
             }
 
-            match conn.accept().select(queue.next()).await {
-                SelectOutput::A(Ok(Some((req, stream)))) => {
-                    let addr = self.addr;
-                    // 整个 BidiStream 传给 handler，在 handler 内 split
-                    // 这样 rx/tx 都在 h3_handler 栈帧上，finish() 后才一起 drop
-                    queue.push(async move {
-                        h3_handler(self.service, req, stream, addr).await
-                    });
-                }
-                SelectOutput::A(Ok(None)) => break,
-                SelectOutput::A(Err(e)) => {
-                    match e.get_error_level() {
-                        ::h3::error::ErrorLevel::StreamError => continue,
-                        ::h3::error::ErrorLevel::ConnectionError => break,
+            tokio::select! {
+                accept = conn.accept() => {
+                    match accept {
+                        Ok(Some((req, stream))) => {
+                            // 低并发快路：没有待处理 handler 时直接 inline，减少一次 future 入队/调度
+                            if handlers.is_empty() {
+                                if let Err(e) = h3_handler(Arc::clone(&self.service), req, stream, self.addr).await {
+                                    HttpServiceError::from(e).log("h3_handler");
+                                }
+                            } else {
+                                handlers.push(run_handler(Arc::clone(&self.service), req, stream, self.addr));
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => match e.get_error_level() {
+                            ::h3::error::ErrorLevel::StreamError => {}
+                            ::h3::error::ErrorLevel::ConnectionError => break,
+                        },
                     }
                 }
-                SelectOutput::B(Err(e)) => HttpServiceError::from(e).log("h3_handler"),
-                SelectOutput::B(Ok(())) => {}
+                Some(_) = handlers.next(), if !handlers.is_empty() => {}
             }
         }
 
-        queue.drain().await;
+        while handlers.next().await.is_some() {}
         Ok(())
     }
 }
 
-/// 大文件流水线阈值：超过此大小改用流水线发送，避免整块 collect 内存爆发
-/// 与 H2 SMALL_BODY_INLINE 对齐（1MB）
-const H3_INLINE_MAX: usize = 1024 * 1024;
+async fn run_handler<S, ReqB, ResB, BE>(
+    service: Arc<S>,
+    req: Request<()>,
+    stream: RequestStream<QuinnBidiStream<Bytes>, Bytes>,
+    addr: SocketAddr,
+)
+where
+    S: Service<Request<RequestExt<ReqB>>, Response = Response<ResB>>,
+    S::Error: fmt::Debug,
+    ReqB: From<RequestBody>,
+    ResB: Stream<Item = Result<Bytes, BE>>,
+    BE: fmt::Debug,
+{
+    if let Err(e) = h3_handler(service, req, stream, addr).await {
+        HttpServiceError::from(e).log("h3_handler");
+    }
+}
 
-/// H3 请求处理核心
-///
-/// 关键设计：
-/// - BidiStream 在 handler 内 split，tx 发响应，rx 用 ManuallyDrop 包装后传给 service
-/// - RequestBody drop 时不发 STOP_SENDING（ManuallyDrop 阻止 RecvStream::drop）
-/// - finish() 完成后函数返回，quinn 连接关闭时统一回收流资源
-/// - 小文件（≤1MB）：同步 poll 后整块 send_data，对标 H2 快路径
-/// - 大文件（>1MB）：流水线 send_data，不 collect 全部内存
+/// H3 请求处理核心：直接 chunk 发送，不做整块 collect
 async fn h3_handler<S, ReqB, ResB, BE>(
-    service: &S,
+    service: Arc<S>,
     req: Request<()>,
     stream: RequestStream<QuinnBidiStream<Bytes>, Bytes>,
     addr: SocketAddr,
@@ -120,24 +136,17 @@ where
 {
     use crate::body::BodySize;
 
-    // 在 handler 内 split：tx/rx 都在本函数栈帧
-    // rx 用 ManuallyDrop 包装，drop 时不发 STOP_SENDING
-    // quinn 连接关闭时统一回收流资源
     let (mut tx, rx): (_, RequestStream<QuinnRecvStream, Bytes>) = stream.split();
     let body = RequestBody::new(rx);
     let http_req = req.map(|_| {
-        RequestExt::from_parts(
-            ReqB::from(body),
-            Extension::new(addr, true),
-        )
+        RequestExt::from_parts(ReqB::from(body), Extension::new(addr, true))
     });
     let resp = service.call(http_req).await.map_err(Error::Service)?;
-    let (parts, res_body) = resp.into_parts();
+    let (mut parts, res_body) = resp.into_parts();
 
     let body_size = BodySize::from_stream(&res_body);
 
     // 注入 Content-Length
-    let mut parts = parts;
     if let BodySize::Sized(n) = body_size {
         use crate::http::header::{CONTENT_LENGTH, HeaderValue};
         if !parts.headers.contains_key(CONTENT_LENGTH) {
@@ -148,68 +157,37 @@ where
         }
     }
 
-    let res = crate::http::Response::from_parts(parts, ());
-    tx.send_response(res).await?;
+    tx.send_response(crate::http::Response::from_parts(parts, ())).await?;
 
-    let mut body = pin!(res_body);
+    // 小 body 内联快路：同步聚合后单次 send_data，减少多次 await 往返
+    const INLINE_SEND_MAX: usize = 32 * 1024;
+    if let BodySize::Sized(n) = body_size {
+        if (n as usize) <= INLINE_SEND_MAX {
+            let mut body = pin!(res_body);
+            let waker = futures_util::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut buf = BytesMut::with_capacity(n as usize);
 
-    match body_size {
-        BodySize::None => {
-            tx.finish().await?;
-        }
-        BodySize::Sized(n) if n <= H3_INLINE_MAX => {
-            // 同步 poll 尝试（mmap/cache 命中时单块立即 Ready，零 await）
-            let waker = futures_util::task::noop_waker_ref();
-            let mut cx = core::task::Context::from_waker(waker);
-            let data = match body.as_mut().poll_next(&mut cx) {
-                core::task::Poll::Ready(None) => None,
-                core::task::Poll::Ready(Some(Ok(first))) => {
-                    match body.as_mut().poll_next(&mut cx) {
-                        core::task::Poll::Ready(None) => Some(first),
-                        core::task::Poll::Ready(Some(Ok(second))) => {
-                            let mut buf = crate::bytes::BytesMut::with_capacity(n);
-                            buf.extend_from_slice(&first);
-                            buf.extend_from_slice(&second);
-                            loop {
-                                match body.as_mut().poll_next(&mut cx) {
-                                    core::task::Poll::Ready(Some(Ok(c))) => buf.extend_from_slice(&c),
-                                    core::task::Poll::Ready(_) => break,
-                                    core::task::Poll::Pending => {
-                                        while let Some(Ok(c)) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-                                            buf.extend_from_slice(&c);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            Some(buf.freeze())
+            loop {
+                match body.as_mut().poll_next(&mut cx) {
+                    Poll::Ready(Some(Ok(bytes))) => buf.extend_from_slice(&bytes),
+                    Poll::Ready(Some(Err(e))) => return Err(Error::Body(e)),
+                    Poll::Ready(None) => {
+                        if !buf.is_empty() {
+                            tx.send_data(buf.freeze()).await?;
                         }
-                        core::task::Poll::Pending => {
-                            let mut buf = crate::bytes::BytesMut::with_capacity(n);
-                            buf.extend_from_slice(&first);
-                            while let Some(Ok(c)) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-                                buf.extend_from_slice(&c);
-                            }
-                            Some(buf.freeze())
-                        }
-                        core::task::Poll::Ready(Some(Err(_))) => Some(first),
+                        tx.finish().await?;
+                        return Ok(());
                     }
+                    Poll::Pending => break,
                 }
-                core::task::Poll::Ready(Some(Err(_))) => None,
-                core::task::Poll::Pending => {
-                    let mut buf = crate::bytes::BytesMut::with_capacity(n);
-                    while let Some(Ok(c)) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-                        buf.extend_from_slice(&c);
-                    }
-                    Some(buf.freeze())
-                }
-            };
-            if let Some(data) = data {
-                tx.send_data(data).await?;
             }
-            tx.finish().await?;
-        }
-        _ => {
+
+            // 仍有后续异步数据：先发送已聚合部分，再回退到流式发送
+            if !buf.is_empty() {
+                tx.send_data(buf.freeze()).await?;
+            }
+
             while let Some(res) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
                 let bytes = res.map_err(Error::Body)?;
                 if !bytes.is_empty() {
@@ -217,8 +195,37 @@ where
                 }
             }
             tx.finish().await?;
+            return Ok(());
         }
     }
+
+    // H3 body 快路：先同步 poll，只有 Pending 时才 await，减少每 chunk 一次调度往返
+    let mut body = pin!(res_body);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match body.as_mut().poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                if !bytes.is_empty() {
+                    tx.send_data(bytes).await?;
+                }
+            }
+            Poll::Ready(Some(Err(e))) => return Err(Error::Body(e)),
+            Poll::Ready(None) => break,
+            Poll::Pending => {
+                match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+                    Some(Ok(bytes)) => {
+                        if !bytes.is_empty() {
+                            tx.send_data(bytes).await?;
+                        }
+                    }
+                    Some(Err(e)) => return Err(Error::Body(e)),
+                    None => break,
+                }
+            }
+        }
+    }
+    tx.finish().await?;
 
     Ok(())
 }

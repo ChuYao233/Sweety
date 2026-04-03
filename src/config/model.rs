@@ -399,6 +399,16 @@ pub struct Http3Config {
     /// MTU 探测（默认 true）：自动发现最优 PMTU，减少分片，提升吞吐
     #[serde(default = "default_true")]
     pub mtu_discovery: bool,
+
+    /// 初始 RTT 估算（毫秒，默认 1ms）
+    /// quinn 默认 333ms，内网/同机场景应设为 1ms，避免 PTO 超时过长
+    #[serde(default = "default_h3_initial_rtt_ms")]
+    pub initial_rtt_ms: u64,
+
+    /// 最大 ACK 延迟（毫秒，默认 1ms）
+    /// RFC 9000 默认 25ms，内网应设为 1ms，减少每个请求的端到端延迟
+    #[serde(default = "default_h3_max_ack_delay_ms")]
+    pub max_ack_delay_ms: u64,
 }
 
 impl Default for Http3Config {
@@ -413,6 +423,8 @@ impl Default for Http3Config {
             send_window:                 default_h3_send_window(),
             enable_0rtt:                 false,
             mtu_discovery:               true,
+            initial_rtt_ms:              default_h3_initial_rtt_ms(),
+            max_ack_delay_ms:            default_h3_max_ack_delay_ms(),
         }
     }
 }
@@ -1093,6 +1105,8 @@ fn default_h3_keep_alive_interval_ms() -> u64 { 10_000 }
 fn default_h3_receive_window() -> u64 { 8 * 1024 * 1024 }        // 8 MB
 fn default_h3_stream_receive_window() -> u64 { 2 * 1024 * 1024 } // 2 MB
 fn default_h3_send_window() -> u64 { 8 * 1024 * 1024 }           // 8 MB
+fn default_h3_initial_rtt_ms() -> u64 { 333 } // quinn 默认値
+fn default_h3_max_ack_delay_ms() -> u64 { 25 }  // RFC 9000 默认値
 
 // ─────────────────────────────────────────────
 // 单元测试

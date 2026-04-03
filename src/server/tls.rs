@@ -135,7 +135,7 @@ impl TlsManager {
             let cert_path = acme_cert_path(domain);
             let key_path  = acme_key_path(domain);
             if cert_path.exists() && key_path.exists() {
-                build_quinn_config_from_pem(&cert_path, &key_path)?
+                build_quinn_config_from_pem(&cert_path, &key_path, h3.enable_0rtt)?
             } else {
                 // 证书尚未就绪，生成自签名证书作临时替代
                 build_quinn_config_self_signed(domain)?
@@ -143,11 +143,11 @@ impl TlsManager {
         } else if !tls.certs.is_empty() {
             // 多证书模式：QUIC 只需一张，优先取列表第一张（通常是 ECDSA，兼容性最好）
             let first = &tls.certs[0];
-            build_quinn_config_from_pem(&first.cert, &first.key)?
+            build_quinn_config_from_pem(&first.cert, &first.key, h3.enable_0rtt)?
         } else {
             let cert = tls.cert.as_ref().context("QUIC TLS 需要 cert 路径")?;
             let key  = tls.key.as_ref().context("QUIC TLS 需要 key 路径")?;
-            build_quinn_config_from_pem(cert, key)?
+            build_quinn_config_from_pem(cert, key, h3.enable_0rtt)?
         };
 
         // 应用 TransportConfig 性能调优参数
@@ -448,7 +448,6 @@ fn apply_transport_config(
     tc.max_concurrent_uni_streams(VarInt::from_u32(h3.max_concurrent_uni_streams));
 
     // 空闲超时（0 表示禁用）
-    // IdleTimeout::try_from(Duration) 单位为毫秒级 VarInt，最大约 292 年
     if h3.idle_timeout_ms > 0 {
         let dur = Duration::from_millis(h3.idle_timeout_ms);
         if let Ok(timeout) = quinn::IdleTimeout::try_from(dur) {
@@ -479,6 +478,25 @@ fn apply_transport_config(
         tc.mtu_discovery_config(None);
     }
 
+    // initial_rtt 只在用户显式配置时才覆盖，默认让 quinn 使用 333ms 并自动收敛
+    if h3.initial_rtt_ms != 333 {
+        tc.initial_rtt(Duration::from_millis(h3.initial_rtt_ms.max(1)));
+    }
+
+    // ACK 延迟：只在用户显式配置非默认值（25ms）时才覆盖
+    if h3.max_ack_delay_ms != 25 {
+        let mut afc = quinn::AckFrequencyConfig::default();
+        afc.max_ack_delay(Some(Duration::from_millis(h3.max_ack_delay_ms.max(1))));
+        tc.ack_frequency_config(Some(afc));
+    }
+
+    // BBR 拥塞控制 + 大初始窗口
+    {
+        let mut bbr = quinn::congestion::BbrConfig::default();
+        bbr.initial_window(1024 * 1024);
+        tc.congestion_controller_factory(std::sync::Arc::new(bbr));
+    }
+
     server_config.transport_config(std::sync::Arc::new(tc));
 }
 
@@ -487,7 +505,7 @@ fn apply_transport_config(
 /// HTTP/3 QUIC 握手要求 TLS ALPN 必须包含 "h3"，
 /// quinn::ServerConfig::with_single_cert 不自动设置 ALPN，
 /// 必须先构建 rustls::ServerConfig 并注入 alpn_protocols，再转为 quinn::ServerConfig。
-fn build_quinn_config_from_pem(cert_path: &Path, key_path: &Path) -> Result<sweety_io::net::QuicConfig> {
+fn build_quinn_config_from_pem(cert_path: &Path, key_path: &Path, enable_0rtt: bool) -> Result<sweety_io::net::QuicConfig> {
     let cert_bytes = std::fs::read(cert_path)
         .with_context(|| format!("读取证书失败: {}", cert_path.display()))?;
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
@@ -508,6 +526,10 @@ fn build_quinn_config_from_pem(cert_path: &Path, key_path: &Path) -> Result<swee
         .context("构建 QUIC Rustls ServerConfig 失败")?;
     tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
     tls_cfg.session_storage = global_session_cache();
+    // 0-RTT：允许客户端复用 session ticket 在握手前发送请求，减少一个 RTT
+    if enable_0rtt {
+        tls_cfg.max_early_data_size = u32::MAX;
+    }
 
     quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg)
         .map(|qc| sweety_io::net::QuicConfig::with_crypto(std::sync::Arc::new(qc)))
@@ -1175,3 +1197,5 @@ fn load_certified_key_from_path(
     info!("TLS 证书加载成功: {}", cert_path.display());
     Ok(rustls::sign::CertifiedKey::new(certs, signing_key))
 }
+
+

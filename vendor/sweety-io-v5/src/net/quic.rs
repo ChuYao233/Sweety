@@ -82,6 +82,9 @@ impl QuicListenerBuilder {
             socket.set_reuse_address(true)?;
             socket.set_reuse_port(true)?;
             socket.set_nonblocking(true)?;
+            // 显式设置大缓冲区，避免沿用 rmem_default(256KB) 导致高并发握手时 kernel 丢包
+            let _ = socket.set_recv_buffer_size(16 * 1024 * 1024);
+            let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
             socket.bind(&addr.into())?;
 
             let std_udp: std::net::UdpSocket = socket.into();

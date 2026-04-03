@@ -32,6 +32,34 @@ impl QuicListener {
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "quinn endpoint is closed"))?;
         Ok(QuicStream { connecting })
     }
+
+    /// 非阻塞 accept：只 poll 一次，没有新连接时立即返回 WouldBlock
+    /// 用于批量 accept 循环，防止 QUIC accept 阻塞导致已接受连接的 task 得不到调度
+    pub fn try_accept(&self) -> io::Result<Option<QuicStream>> {
+        use core::{
+            future::Future,
+            pin::pin,
+            task::{Context, Poll},
+        };
+        use std::{sync::Arc, task::Wake};
+
+        // 安全的 noop waker：不需要唤醒，只 poll 一次看是否立即 Ready
+        struct NoopWake;
+        impl Wake for NoopWake {
+            fn wake(self: Arc<Self>) {}
+            fn wake_by_ref(self: &Arc<Self>) {}
+        }
+
+        let waker: std::task::Waker = Arc::new(NoopWake).into();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut accept_fut = pin!(self.endpoint.accept());
+        match accept_fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Some(incoming)) => Ok(Some(QuicStream { connecting: incoming })),
+            Poll::Ready(None) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "quinn endpoint is closed")),
+            Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        }
+    }
 }
 
 /// Builder type for [QuicListener]
@@ -78,6 +106,10 @@ impl QuicListenerBuilder {
             socket.set_reuse_address(true)?;
             socket.set_reuse_port(true)?;
             socket.set_nonblocking(true)?;
+            // 显式设置大缓冲区，避免沿用 rmem_default(256KB) 导致高并发握手时 kernel 丢包
+            // rmem_max 已由 sysctl_tune.sh 设为 128MB，这里取 16MB 做实际 socket 级设置
+            let _ = socket.set_recv_buffer_size(16 * 1024 * 1024);
+            let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
             socket.bind(&addr.into())?;
 
             let std_udp: std::net::UdpSocket = socket.into();

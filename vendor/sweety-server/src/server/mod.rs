@@ -97,8 +97,6 @@ impl Server {
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            // This worker threads is only used for accepting connections.
-            // sweety-server worker does not run task on them.
             .worker_threads(server_threads)
             .build()?;
 
@@ -163,7 +161,10 @@ impl Server {
                                         handles.extend(h);
                                         services.push(s);
                                     }
-                                    Err(_) => return,
+                                    Err(e) => {
+                                        error!("worker-{idx}: service factory [{name}] 初始化失败: {:?}，worker 退出", e);
+                                        return;
+                                    }
                                 }
                             }
 
@@ -175,7 +176,6 @@ impl Server {
                             let rt = tokio::runtime::Builder::new_current_thread()
                                 .enable_all()
                                 .max_blocking_threads(worker_max_blocking_threads)
-                                // blocking thread 空闲 60s 后回收，避免长期占用系统线程
                                 .thread_keep_alive(std::time::Duration::from_secs(60))
                                 .build()?;
 

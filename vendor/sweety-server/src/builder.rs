@@ -39,7 +39,6 @@ impl Builder {
     pub fn new() -> Self {
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         Self {
-            // accept 线程数：双核以上用 2，单核用 1（对标 Nginx worker_processes）
             server_threads: if cpus > 1 { 2 } else { 1 },
             worker_threads: cpus,
             worker_max_blocking_threads: 512,

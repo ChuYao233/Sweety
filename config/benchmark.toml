@@ -91,6 +91,24 @@ max_version = "tls1.3"
 # 启用协议栈：HTTP/3(QUIC) > HTTP/2 > HTTP/1.1（等价 Nginx h2 on + quic reuseport）
 protocols = ["h3", "h2", "http/1.1"]
 
+# ── HTTP/3 QUIC 性能参数 ──────────────────────────────────────────────────────
+[sites.tls.http3]
+# 0-RTT：允许客户端复用 session ticket 在握手前发送请求，减少一个 RTT
+enable_0rtt = true
+# initial_rtt_ms 不设置，用 quinn 默认値（333ms），让 quinn 自己从第一次握手 ACK 测量真实 RTT
+# 设 1ms/5ms 会导致 PTO 过小，频繁触发虚假重传，反而拉高 smoothed RTT
+# max_ack_delay_ms 也用默认値，避免干扰 AckFrequency extension 的协商
+# 单连接最大流 ID 额度（quinn 不自动补充 MAX_STREAMS 时，此值即每连接总请求上限）
+# 200 会导致每连接只能处理 200 个请求后被迫重建，大幅增加 connect 开销
+# 设为 2000 可让单连接处理足够多的请求，减少连接 churn
+max_concurrent_bidi_streams = 2000
+# 接收窗口 16MB（1000 并发 × 10KB = 10MB，窗口要大于峰值在途数据量）
+receive_window = 16777216
+# 流接收窗口 4MB
+stream_receive_window = 4194304
+# 发送窗口 16MB
+send_window = 16777216
+
 # ── Location：静态文件服务 ────────────────────────────────────────────────────
 [[sites.locations]]
 path    = "/"

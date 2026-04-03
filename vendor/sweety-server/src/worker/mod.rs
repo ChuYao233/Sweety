@@ -30,50 +30,43 @@ where
 
     tokio::task::spawn_local(async move {
         loop {
-            // 等待服务就绪（背压控制）
-            let ready = service.ready().await;
-
             match listener.accept_dyn().await {
                 Ok(stream) => {
-                    if let Ok(req) = TryFrom::try_from(stream) {
-                        let svc = service.clone();
-                        tokio::task::spawn_local(async move {
+                    // 接受后立即 spawn，service.ready() 在 task 内部等待
+                    // 这样 accept 循环永不阻塞，QUIC endpoint 能持续消费 UDP 接收缓冲区，
+                    // 避免 kernel 丢包导致 quinn 触发 333ms 重传定时器
+                    let svc = service.clone();
+                    tokio::task::spawn_local(async move {
+                        let ready = svc.ready().await;
+                        if let Ok(req) = Req::try_from(stream) {
                             let _ = svc.call(req).await;
-                            drop(ready);
-                        });
-                    } else {
+                        }
                         drop(ready);
-                    }
+                    });
 
-                    // 批量 accept：在同一 poll 周期内尽量多接受连接，减少 syscall 次数
-                    // 对标 Nginx multi_accept on：一次 epoll 事件后接受所有等待的连接
+                    // 批量 accept：用非阻塞 try_accept_dyn 尽量多接受等待中的连接
+                    // 对标 Nginx multi_accept on：一次事件后接受所有等待的连接
+                    // 注意：QUIC 的 endpoint.accept() 没有新连接时不返回 WouldBlock 而是 Pending，
+                    // 必须用 try_accept_dyn（只 poll 一次）避免阻塞已接受连接的 task 调度
                     for _ in 0..ACCEPT_BATCH {
-                        let ready = service.ready().await;
-                        match listener.accept_dyn().await {
-                            Ok(stream) => {
-                                if let Ok(req) = TryFrom::try_from(stream) {
-                                    let svc = service.clone();
-                                    tokio::task::spawn_local(async move {
+                        match listener.try_accept_dyn() {
+                            Ok(Some(stream)) => {
+                                let svc = service.clone();
+                                tokio::task::spawn_local(async move {
+                                    let ready = svc.ready().await;
+                                    if let Ok(req) = Req::try_from(stream) {
                                         let _ = svc.call(req).await;
-                                        drop(ready);
-                                    });
-                                } else {
+                                    }
                                     drop(ready);
-                                }
+                                });
                             }
+                            Ok(None) => break,
                             // 没有更多连接等待，退出批量 accept
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                drop(ready);
-                                break;
-                            }
-                            Err(ref e) if connection_error(e) => {
-                                drop(ready);
-                                continue;
-                            }
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(ref e) if connection_error(e) => continue,
                             Err(ref e) if fatal_error(e) => return,
                             Err(ref e) if os_error(e) => {
                                 error!("Error accepting connection: {e}");
-                                drop(ready);
                                 sleep(Duration::from_secs(1)).await;
                                 break;
                             }

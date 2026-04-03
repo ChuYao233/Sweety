@@ -95,7 +95,7 @@ where
 
         match io {
             #[cfg(feature = "http3")]
-            ServerStream::Udp(io, addr) => super::h3::Dispatcher::new(io, addr, &*self.service)
+            ServerStream::Udp(io, addr) => super::h3::Dispatcher::new(io, addr, Arc::clone(&self.service))
                 .run()
                 .await
                 .map_err(From::from),

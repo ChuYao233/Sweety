@@ -55,6 +55,12 @@ use sweety_io_compat::net::{QuicListener, QuicListenerBuilder};
 /// ```
 pub trait Listen: Send + Sync {
     fn accept(&self) -> impl Future<Output = io::Result<Stream>> + Send;
+
+    /// 非阻塞 accept：只 poll 一次，没有新连接时返回 WouldBlock
+    /// 默认实现直接返回 WouldBlock，QUIC listener 覆盖此方法
+    fn try_accept(&self) -> io::Result<Option<Stream>> {
+        Err(io::Error::from(io::ErrorKind::WouldBlock))
+    }
 }
 
 mod _seal {
@@ -68,6 +74,7 @@ mod _seal {
     /// dynamic compat trait for [Listen]
     pub trait ListenDyn: Send + Sync {
         fn accept_dyn(&self) -> BoxFuture<'_, io::Result<Stream>>;
+        fn try_accept_dyn(&self) -> io::Result<Option<Stream>>;
     }
 
     impl<S> ListenDyn for S
@@ -77,6 +84,11 @@ mod _seal {
         #[inline]
         fn accept_dyn(&self) -> BoxFuture<'_, io::Result<Stream>> {
             Box::pin(Listen::accept(self))
+        }
+
+        #[inline]
+        fn try_accept_dyn(&self) -> io::Result<Option<Stream>> {
+            Listen::try_accept(self)
         }
     }
 }
@@ -104,9 +116,20 @@ impl Listen for UnixListener {
 #[cfg(feature = "quic")]
 impl Listen for QuicListener {
     async fn accept(&self) -> io::Result<Stream> {
+        // self.accept() 调 QuicListener 固有方法（Rust 优先选固有方法），不递归
         let stream = self.accept().await?;
         let addr = stream.peer_addr();
         Ok(Stream::Udp(stream, addr))
+    }
+
+    fn try_accept(&self) -> io::Result<Option<Stream>> {
+        match QuicListener::try_accept(self)? {
+            Some(stream) => {
+                let addr = stream.peer_addr();
+                Ok(Some(Stream::Udp(stream, addr)))
+            }
+            None => Ok(None),
+        }
     }
 }
 

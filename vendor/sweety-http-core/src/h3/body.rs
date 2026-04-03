@@ -1,8 +1,10 @@
 use core::{
-    mem::ManuallyDrop,
+    mem,
     pin::Pin,
     task::{Context, Poll},
 };
+use std::sync::Arc;
+use std::task::Wake;
 
 use ::h3::server::RequestStream;
 use futures_core::stream::Stream;
@@ -15,21 +17,43 @@ use crate::{
 
 /// Request body type for Http/3 specifically.
 ///
-/// 用 ManuallyDrop 包装 RequestStream，drop 时什么都不做——
-/// RecvStream::drop 会发 STOP_SENDING，导致客户端回 RESET_STREAM，
-/// h2load 标记 errored（即使响应已完整收到）。
-/// quinn 连接关闭时统一回收所有流资源，每个流泄漏量极小（几十字节）。
-pub struct RequestBody(ManuallyDrop<RequestStream<RecvStream, Bytes>>);
+/// RequestBody 在 Drop 时会尽力把可立即读取的数据 drain 到 EOF。
+/// - 若能同步到 EOF：正常释放流（回收 stream 并发额度）
+/// - 若仍 Pending：保持旧行为，不主动 STOP_SENDING（避免客户端误判 errored）
+pub struct RequestBody(Option<RequestStream<RecvStream, Bytes>>);
 
 impl RequestBody {
     pub(in crate::h3) fn new(rx: RequestStream<RecvStream, Bytes>) -> Self {
-        Self(ManuallyDrop::new(rx))
+        Self(Some(rx))
     }
 }
 
 impl Drop for RequestBody {
     fn drop(&mut self) {
-        // 故意不 drop 内部 RequestStream，防止 RecvStream::drop 发 STOP_SENDING
+        struct NoopWake;
+        impl Wake for NoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        let Some(mut rx) = self.0.take() else { return; };
+        let waker: std::task::Waker = Arc::new(NoopWake).into();
+        let mut cx = Context::from_waker(&waker);
+
+        // 尽可能把已就绪数据 drain 掉：GET/HEAD 空 body 场景通常可立即到 EOF
+        loop {
+            match Pin::new(&mut rx).poll_recv_data(&mut cx) {
+                Poll::Ready(Ok(Some(_))) => continue,
+                Poll::Ready(Ok(None)) => {
+                    // 已到 EOF，正常 drop 回收 stream 额度
+                    return;
+                }
+                Poll::Ready(Err(_)) | Poll::Pending => {
+                    // 与旧行为一致：避免 drop 触发 STOP_SENDING 导致客户端误判 errored
+                    mem::forget(rx);
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -37,7 +61,9 @@ impl Stream for RequestBody {
     type Item = Result<Bytes, BodyError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let rx = &mut self.get_mut().0;
+        let Some(rx) = self.get_mut().0.as_mut() else {
+            return Poll::Ready(None);
+        };
         rx.poll_recv_data(cx)?
             .map(|res| res.map(|buf| Ok(Bytes::copy_from_slice(buf.chunk()))))
     }

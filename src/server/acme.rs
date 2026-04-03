@@ -1,0 +1,538 @@
+//! ACME（自动证书管理环境）模块
+//! 负责：HTTP-01 / DNS-01 证书申请、自动续期、热重载
+//!
+//! 支持提供商：Let's Encrypt、ZeroSSL、Buypass 及任意自定义 ACME 目录 URL
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use tracing::{error, info, warn};
+
+use crate::config::model::AppConfig;
+use super::tls::SniResolver;
+
+// ─────────────────────────────────────────────
+// ACME 提供商目录 URL
+// ─────────────────────────────────────────────
+
+const LETS_ENCRYPT_PROD:    &str = "https://acme-v02.api.letsencrypt.org/directory";
+const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
+const ZEROSSL:              &str = "https://acme.zerossl.com/v2/DV90";
+const BUYPASS:              &str = "https://api.buypass.com/acme/directory";
+const LITESSL:              &str = "https://acme.litessl.com/directory";
+
+/// 全局 HTTP-01 challenge token 存储（token → key_authorization）
+/// 由 ACME 申请流程写入，HTTP handler 读取并响应 Let's Encrypt 验证请求
+pub static ACME_HTTP01_TOKENS: std::sync::LazyLock<dashmap::DashMap<String, String>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+// ─────────────────────────────────────────────
+// 路径辅助函数
+// ─────────────────────────────────────────────
+
+pub(super) fn acme_cache_dir() -> PathBuf {
+    dirs_next::config_dir()
+        .unwrap_or_else(|| PathBuf::from("/etc"))
+        .join("sweety")
+        .join("acme")
+}
+
+pub(super) fn acme_cert_path(domain: &str) -> PathBuf {
+    acme_cache_dir().join(format!("{}.crt", domain))
+}
+
+pub(super) fn acme_key_path(domain: &str) -> PathBuf {
+    acme_cache_dir().join(format!("{}.key", domain))
+}
+
+// ─────────────────────────────────────────────
+// 公开接口：证书续期后台循环
+// ─────────────────────────────────────────────
+
+/// ACME 证书自动申请与续期后台循环
+///
+/// - HTTP-01 challenge，需要 80 端口可达；DNS-01 支持通配符证书
+/// - 每 12 小时检查一次
+/// - 到期前 `acme_renew_days_before` 天自动续期（解析真实证书到期日）
+/// - 续期成功后通知 `sni_resolvers` 热重载证书，不重启服务器
+pub async fn acme_renewal_loop(
+    cfg: Arc<AppConfig>,
+    sni_resolvers: HashMap<u16, Arc<SniResolver>>,
+) {
+    loop {
+        for site in &cfg.sites {
+            let Some(tls) = &site.tls else { continue };
+            if !tls.acme { continue }
+
+            let email = match &tls.acme_email {
+                Some(e) => e.clone(),
+                None => {
+                    warn!("站点 '{}' 启用了 ACME 但未配置 acme_email，跳过", site.name);
+                    continue;
+                }
+            };
+            let renew_days = tls.acme_renew_days_before;
+
+            let use_dns01 = tls.acme_challenge.as_str() == "dns01";
+
+            // DNS-01 模式：支持通配符证书（*.example.com）
+            // HTTP-01 模式：跳过通配符域名
+            for domain in &site.server_name {
+                // HTTP-01 不支持通配符证书
+                if !use_dns01 && domain.starts_with("*.") {
+                    warn!("ACME HTTP-01 不支持通配符证书 '{}'，请改用 acme_challenge = \"dns01\"", domain);
+                    continue;
+                }
+
+                let cert_path = acme_cert_path(domain);
+                let key_path  = acme_key_path(domain);
+
+                // 解析证书真实到期日，判断是否需续期
+                if cert_path.exists() && !cert_needs_renewal(&cert_path, renew_days) {
+                    continue;
+                }
+
+                info!("开始为域名 '{}' 申请/续期 ACME 证书（{}）",
+                    domain, if use_dns01 { "DNS-01" } else { "HTTP-01" });
+
+                let result = if use_dns01 {
+                    // DNS-01：需要 dns_provider 配置
+                    match &tls.dns_provider {
+                        Some(provider) => {
+                            request_acme_cert_dns01(
+                                domain, &email, &tls.acme_provider, provider
+                            ).await
+                        }
+                        None => {
+                            Err(anyhow::anyhow!(
+                                "域名 '{}' 配置了 acme_challenge=dns01 但没有配置 dns_provider", domain
+                            ))
+                        }
+                    }
+                } else {
+                    // HTTP-01
+                    request_acme_cert(domain, &email, &tls.acme_provider).await
+                };
+
+                match result {
+                    Ok((cert_pem, key_pem)) => {
+                        if let Err(e) = save_cert_files(&cert_path, &key_path, &cert_pem, &key_pem) {
+                            error!("ACME 证书保存失败 ({}): {}", domain, e);
+                        } else {
+                            info!("ACME 证书申请成功: {}", domain);
+                            reload_acme_cert_in_resolvers(
+                                &cert_path, &key_path,
+                                &site.server_name,
+                                &sni_resolvers,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!("ACME 证书申请失败 ({}): {}", domain, e);
+                        // 指数退避重试：1min → 5min → 30min → 2h → 12h
+                        // 防止被 CA 限速封退（Let's Encrypt 限制：5 次/小时/域名）
+                        let backoff_steps: &[u64] = &[60, 300, 1800, 7200];
+                        let mut last_err = e;
+                        let mut succeeded = false;
+                        for &wait_secs in backoff_steps {
+                            warn!("ACME 将在 {}s 后重试申请证书: {}", wait_secs, domain);
+                            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                            let retry_result = if use_dns01 {
+                                match &tls.dns_provider {
+                                    Some(provider) => request_acme_cert_dns01(domain, &email, &tls.acme_provider, provider).await,
+                                    None => break,
+                                }
+                            } else {
+                                request_acme_cert(domain, &email, &tls.acme_provider).await
+                            };
+                            match retry_result {
+                                Ok((cert_pem, key_pem)) => {
+                                    if let Err(e) = save_cert_files(&cert_path, &key_path, &cert_pem, &key_pem) {
+                                        error!("ACME 证书保存失败 ({}): {}", domain, e);
+                                    } else {
+                                        info!("ACME 证书重试申请成功: {}", domain);
+                                        reload_acme_cert_in_resolvers(&cert_path, &key_path, &site.server_name, &sni_resolvers);
+                                    }
+                                    succeeded = true;
+                                    break;
+                                }
+                                Err(e) => { last_err = e; }
+                            }
+                        }
+                        if !succeeded {
+                            error!("ACME 证书申请多次重试均失败 ({})，等待12h后再次尝试: {}", domain, last_err);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 每 12 小时检查一次
+        tokio::time::sleep(Duration::from_secs(12 * 3600)).await;
+    }
+}
+
+// ─────────────────────────────────────────────
+// 内部实现：证书申请
+// ─────────────────────────────────────────────
+
+/// 通过 instant-acme（HTTP-01）申请证书
+///
+/// HTTP-01：Let's Encrypt 访问 http://domain/.well-known/acme-challenge/<token>
+/// Sweety 在 80 端口响应，完全不依赖 443 是否已有证书。
+///
+/// `acme_provider` 支持: letsencrypt / letsencrypt_staging / zerossl / buypass / 自定义 URL
+async fn request_acme_cert(domain: &str, email: &str, acme_provider: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    use instant_acme::{Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus};
+    use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+
+    // 根据 provider 选择 ACME 目录 URL
+    let directory_url = match acme_provider {
+        "letsencrypt"         => LETS_ENCRYPT_PROD,
+        "letsencrypt_staging" => LETS_ENCRYPT_STAGING,
+        "zerossl"             => ZEROSSL,
+        "buypass"             => BUYPASS,
+        "litessl"             => LITESSL,
+        custom                => custom,
+    };
+    info!("ACME 使用提供商: {} ({})", acme_provider, directory_url);
+
+    let cache_dir = acme_cache_dir();
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("创建 ACME 缓存目录失败: {}", cache_dir.display()))?;
+
+    // 尝试加载缓存的账号凭据，否则新建账号
+    let creds_path = cache_dir.join(format!("{}.json", email.replace('@', "_").replace('.', "_")));
+    let account = if creds_path.exists() {
+        let json = std::fs::read_to_string(&creds_path)
+            .with_context(|| format!("读取 ACME 账号缓存失败: {}", creds_path.display()))?;
+        let creds: AccountCredentials = serde_json::from_str(&json)
+            .context("ACME 账号缓存格式无效")?;
+        Account::from_credentials(creds).await
+            .context("从缓存恢复 ACME 账号失败")?
+    } else {
+        let (account, creds) = Account::create(
+            &NewAccount {
+                contact: &[&format!("mailto:{}", email)],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            directory_url,
+            None,
+        ).await.context("创建 ACME 账号失败")?;
+        // 保存账号凭据到本地
+        let json = serde_json::to_string(&creds).context("序列化 ACME 账号凭据失败")?;
+        std::fs::write(&creds_path, json)
+            .with_context(|| format!("保存 ACME 账号凭据失败: {}", creds_path.display()))?;
+        account
+    };
+
+    // 创建新订单
+    let mut order = account.new_order(&NewOrder {
+        identifiers: &[Identifier::Dns(domain.to_string())],
+    }).await.context("创建 ACME 订单失败")?;
+
+    // 获取 HTTP-01 challenge
+    let authorizations = order.authorizations().await.context("获取 ACME 授权失败")?;
+    let mut challenges_to_cleanup: Vec<String> = Vec::new();
+
+    for auth in &authorizations {
+        let challenge = auth.challenges.iter()
+            .find(|c| c.r#type == ChallengeType::Http01)
+            .with_context(|| format!("域名 {} 没有 HTTP-01 challenge", domain))?;
+
+        let key_auth = order.key_authorization(challenge);
+        let token = challenge.token.clone();
+
+        // 写入全局 token map，HTTP handler 会响应 /.well-known/acme-challenge/<token>
+        ACME_HTTP01_TOKENS.insert(token.clone(), key_auth.as_str().to_string());
+        challenges_to_cleanup.push(token);
+
+        // 通知 ACME 服务器可以开始验证
+        order.set_challenge_ready(&challenge.url).await
+            .context("通知 ACME challenge ready 失败")?;
+    }
+
+    // 等待订单完成（最多 5 分钟轮询）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let status = order.refresh().await.context("刷新 ACME 订单状态失败")?;
+        match status.status {
+            OrderStatus::Ready => break,
+            OrderStatus::Valid => break,
+            OrderStatus::Invalid => {
+                for t in &challenges_to_cleanup { ACME_HTTP01_TOKENS.remove(t); }
+                bail!("ACME 订单验证失败（Invalid），请检查域名 DNS 解析和 80 端口是否可达");
+            }
+            OrderStatus::Pending => {
+                if std::time::Instant::now() > deadline {
+                    for t in &challenges_to_cleanup { ACME_HTTP01_TOKENS.remove(t); }
+                    bail!("ACME 订单验证超时（5分钟）");
+                }
+                info!("ACME 等待验证中... ({})", domain);
+            }
+            OrderStatus::Processing => {
+                if std::time::Instant::now() > deadline {
+                    for t in &challenges_to_cleanup { ACME_HTTP01_TOKENS.remove(t); }
+                    bail!("ACME 订单处理超时（5分钟）");
+                }
+            }
+        }
+    }
+
+    // 清理 token
+    for t in &challenges_to_cleanup { ACME_HTTP01_TOKENS.remove(t); }
+
+    // 生成 CSR 并提交
+    let key_pair = KeyPair::generate().context("生成 ACME 密钥对失败")?;
+    let mut params = CertificateParams::new(vec![domain.to_string()])
+        .context("构建证书参数失败")?;
+    params.distinguished_name = DistinguishedName::new();
+    let csr = params.serialize_request(&key_pair).context("生成 CSR 失败")?;
+    let csr_der = csr.der();
+
+    order.finalize(csr_der).await.context("提交 CSR 失败")?;
+
+    // 等待证书签发
+    let cert_chain_pem = loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        match order.certificate().await.context("获取签发证书失败")? {
+            Some(pem) => break pem,
+            None => {
+                if std::time::Instant::now() > deadline {
+                    bail!("ACME 证书签发超时");
+                }
+            }
+        }
+    };
+
+    // serialize_der() 返回 DER 字节，按 64 字符一行折行后包装成 PEM
+    let key_der = key_pair.serialize_der();
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&key_der);
+    let key_pem = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or_default()).collect::<Vec<_>>().join("\n")
+    );
+    Ok((cert_chain_pem.into_bytes(), key_pem.into_bytes()))
+}
+
+/// 通过 instant-acme（DNS-01）申请证书，支持通配符证书（*.example.com）
+///
+/// DNS-01：在 DNS 上设置 `_acme-challenge.<domain>` TXT 记录完成验证
+/// 不需要 80 端口可达，适合内网/防火墙场景和通配符证书
+async fn request_acme_cert_dns01(
+    domain: &str,
+    email: &str,
+    acme_provider: &str,
+    dns_provider: &crate::config::model::DnsProviderConfig,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    use instant_acme::{Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus};
+    use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+
+    let directory_url = match acme_provider {
+        "letsencrypt"         => LETS_ENCRYPT_PROD,
+        "letsencrypt_staging" => LETS_ENCRYPT_STAGING,
+        "zerossl"             => ZEROSSL,
+        "buypass"             => BUYPASS,
+        "litessl"             => LITESSL,
+        custom                => custom,
+    };
+    info!("ACME DNS-01 使用提供商: {} ({})", acme_provider, directory_url);
+
+    let cache_dir = acme_cache_dir();
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("创建 ACME 缓存目录失败: {}", cache_dir.display()))?;
+
+    // 加载或创建 ACME 账号
+    let creds_path = cache_dir.join(format!("{}.json", email.replace('@', "_").replace('.', "_")));
+    let account = if creds_path.exists() {
+        let json = std::fs::read_to_string(&creds_path)?;
+        let creds: AccountCredentials = serde_json::from_str(&json)?;
+        Account::from_credentials(creds).await.context("从缓存恢复 ACME 账号失败")?
+    } else {
+        let (account, creds) = Account::create(
+            &NewAccount {
+                contact: &[&format!("mailto:{}", email)],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            directory_url,
+            None,
+        ).await.context("创建 ACME 账号失败")?;
+        std::fs::write(&creds_path, serde_json::to_string(&creds)?)?;
+        account
+    };
+
+    let identifier = Identifier::Dns(domain.to_string());
+
+    let mut order = account.new_order(&NewOrder {
+        identifiers: &[identifier],
+    }).await.context("创建 ACME 订单失败")?;
+
+    let authorizations = order.authorizations().await.context("获取 ACME 授权失败")?;
+    let mut cleanup_records: Vec<(String, String)> = Vec::new(); // (domain, txt_value)
+
+    for auth in &authorizations {
+        // DNS-01 必须用于通配符，普通域名也可用
+        let challenge = auth.challenges.iter()
+            .find(|c| c.r#type == ChallengeType::Dns01)
+            .with_context(|| format!("域名 {} 没有 DNS-01 challenge", domain))?;
+
+        let key_auth = order.key_authorization(challenge);
+        let txt_value = key_auth.dns_value(); // DNS-01 专用：对 key_authorization 做 SHA-256 base64
+
+        info!("DNS-01: 设置 TXT 记录 domain={} value={}", domain, txt_value);
+
+        // 调用 DNS provider API 设置 TXT 记录
+        super::dns01::set_dns01_record(dns_provider, domain, &txt_value).await
+            .with_context(|| format!("DNS-01 设置 TXT 记录失败 ({})", domain))?;
+
+        cleanup_records.push((domain.to_string(), txt_value.to_string()));
+
+        // 等待 DNS 传播（推荐至少 30 秒）
+        info!("DNS-01: 等待 DNS 传播（60 秒）...");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        // 通知 ACME 服务器可以开始验证
+        order.set_challenge_ready(&challenge.url).await
+            .context("通知 ACME DNS-01 challenge ready 失败")?;
+    }
+
+    // 等待订单完成（最多 5 分钟）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let status = order.refresh().await.context("刷新 ACME 订单状态失败")?;
+        match status.status {
+            OrderStatus::Ready | OrderStatus::Valid => break,
+            OrderStatus::Invalid => {
+                for (d, v) in &cleanup_records {
+                    super::dns01::delete_dns01_record(dns_provider, d, v).await.ok();
+                }
+                bail!("ACME DNS-01 订单验证失败（Invalid）");
+            }
+            OrderStatus::Pending | OrderStatus::Processing => {
+                if std::time::Instant::now() > deadline {
+                    for (d, v) in &cleanup_records {
+                        super::dns01::delete_dns01_record(dns_provider, d, v).await.ok();
+                    }
+                    bail!("ACME DNS-01 订单超时（5 分钟）");
+                }
+                info!("DNS-01: 等待验证中... ({})", domain);
+            }
+        }
+    }
+
+    // 清理 DNS TXT 记录
+    for (d, v) in &cleanup_records {
+        super::dns01::delete_dns01_record(dns_provider, d, v).await
+            .unwrap_or_else(|e| warn!("DNS-01 清理 TXT 记录失败 ({}): {}", d, e));
+    }
+
+    // 生成 CSR 并提交
+    let key_pair = KeyPair::generate().context("生成 ACME 密钥对失败")?;
+    let mut params = CertificateParams::new(vec![domain.to_string()])
+        .context("构建证书参数失败")?;
+    params.distinguished_name = DistinguishedName::new();
+    let csr = params.serialize_request(&key_pair).context("生成 CSR 失败")?;
+
+    order.finalize(csr.der()).await.context("提交 CSR 失败")?;
+
+    // 等待证书签发
+    let cert_chain_pem = loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        match order.certificate().await.context("获取签发证书失败")? {
+            Some(pem) => break pem,
+            None => {
+                if std::time::Instant::now() > deadline {
+                    bail!("ACME DNS-01 证书签发超时");
+                }
+            }
+        }
+    };
+
+    use base64::Engine as _;
+    let key_der = key_pair.serialize_der();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&key_der);
+    let key_pem = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or_default()).collect::<Vec<_>>().join("\n")
+    );
+
+    info!("ACME DNS-01 证书申请成功: {}", domain);
+    Ok((cert_chain_pem.into_bytes(), key_pem.into_bytes()))
+}
+
+// ─────────────────────────────────────────────
+// 内部实现：证书管理辅助
+// ─────────────────────────────────────────────
+
+/// 检查证书是否需要续期
+///
+/// 解析 X.509 证书的真实到期日，距到期 < `renew_days_before` 天则返回 true
+pub(super) fn cert_needs_renewal(cert_path: &Path, renew_days_before: u64) -> bool {
+    let Ok(bytes) = std::fs::read(cert_path) else { return true };
+
+    // 提取第一个 PEM 证书的 DER 字节
+    let Ok(Some(der)) = rustls_pemfile::certs(&mut bytes.as_slice()).next().transpose() else {
+        return true;
+    };
+
+    // 用 x509-parser 解析 DER，获取 not_after 到期时间
+    use x509_parser::prelude::*;
+    let Ok((_, cert)) = X509Certificate::from_der(der.as_ref()) else {
+        return true;
+    };
+
+    // not_after 是 ASN.1 GeneralizedTime，转成 Unix 时间戳
+    let not_after_ts = cert.validity().not_after.timestamp();
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days_left = (not_after_ts - now_ts) / 86400;
+
+    info!("证书 {} 还有 {} 天到期（续期阈值: {} 天）",
+        cert_path.display(), days_left, renew_days_before);
+
+    days_left < renew_days_before as i64
+}
+
+/// ACME 续期成功后将新证书热重载到所有 SniResolver，不重启服务器
+pub(super) fn reload_acme_cert_in_resolvers(
+    cert_path: &Path,
+    key_path: &Path,
+    server_names: &[String],
+    resolvers: &HashMap<u16, Arc<SniResolver>>,
+) {
+    match crate::server::tls::load_certified_key_from_path(cert_path, key_path) {
+        Ok(ck) => {
+            let keys = vec![ck];
+            for resolver in resolvers.values() {
+                resolver.upsert_site(server_names, keys.clone());
+            }
+            info!("ACME 证书已热重载到 {} 个 TLS 端口", resolvers.len());
+        }
+        Err(e) => error!("ACME 证书热重载失败: {}", e),
+    }
+}
+
+/// 保存证书文件到磁盘
+pub(super) fn save_cert_files(
+    cert_path: &Path,
+    key_path: &Path,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<()> {
+    if let Some(parent) = cert_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(cert_path, cert_pem)?;
+    std::fs::write(key_path, key_pem)?;
+    Ok(())
+}

@@ -276,7 +276,7 @@ impl SweetyServer {
                         return;
                     }
                 };
-                rt.block_on(crate::server::tls::TlsManager::acme_renewal_loop(
+                rt.block_on(crate::server::acme::acme_renewal_loop(
                     cfg_clone,
                     resolvers_for_acme,
                 ));
@@ -744,6 +744,17 @@ async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
             }
         }
     }
+
+    // 统一注入 Server 和 X-Content-Type-Options 头（对所有站点所有响应生效）
+    // 使用 from_static 零堆分配，与 Nginx 行为保持一致
+    resp.headers_mut().insert(
+        sweety_web::http::header::HeaderName::from_static("server"),
+        HeaderValue::from_static("Sweety"),
+    );
+    resp.headers_mut().insert(
+        sweety_web::http::header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
 
     // 访问日志：非阻塞投递到 channel，后台 task 批量写文件
     // site.access_logger 直接持有，零 HashMap 查找开销

@@ -1,0 +1,318 @@
+//! Location 路由规则及关联类型
+//!
+//! LocationConfig / HandlerType / HeaderOverride / CacheRule / SubFilter
+//! ProxyCacheConfig / RewriteRule / RewriteFlag / RateLimitConfig
+
+use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+
+fn default_true() -> bool { true }
+fn default_auth_failure_status() -> u16 { 401 }
+fn default_rewrite_flag() -> RewriteFlag { RewriteFlag::Last }
+fn default_cache_max_entries() -> usize { 1000 }
+fn default_cache_ttl() -> u64 { 60 }
+fn default_cache_statuses() -> Vec<u16> { vec![200, 301, 302] }
+fn default_cache_methods() -> Vec<String> { vec!["GET".into(), "HEAD".into()] }
+fn default_no_cache_headers() -> Vec<String> { vec!["Authorization".into(), "Cookie".into()] }
+
+/// Location 路由规则
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LocationConfig {
+    /// 路径匹配表达式（支持 = /path、^~ /prefix、~ regex、/prefix）
+    pub path: String,
+
+    /// 处理器类型
+    pub handler: HandlerType,
+
+    /// 覆盖该 Location 的根目录
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+
+    /// 使用的上游组名称（handler = reverse_proxy 时必填）
+    #[serde(default)]
+    pub upstream: Option<String>,
+
+    /// Cache-Control 响应头覆盖
+    #[serde(default)]
+    pub cache_control: Option<String>,
+
+    /// 直接返回状态码（健康检查等）
+    #[serde(default)]
+    pub return_code: Option<u16>,
+
+    /// WebSocket 最大并发连接数
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+
+    /// 去掉上游 Set-Cookie 里的 Secure 标志
+    #[serde(default)]
+    pub strip_cookie_secure: bool,
+
+    /// 替换 Set-Cookie 里的 Domain 属性
+    #[serde(default)]
+    pub proxy_cookie_domain: Option<String>,
+
+    /// Location 响应头中上游 URL 替换为客户端 URL
+    #[serde(default)]
+    pub proxy_redirect_from: Option<String>,
+
+    /// proxy_redirect 的目标地址（客户端访问的 URL 前缀）
+    #[serde(default)]
+    pub proxy_redirect_to: Option<String>,
+
+    /// 自定义转发请求头（等价 Nginx proxy_set_header）
+    #[serde(default)]
+    pub proxy_set_headers: Vec<HeaderOverride>,
+
+    /// 向客户端响应中注入自定义头（等价 Nginx add_header）
+    #[serde(default)]
+    pub add_headers: Vec<HeaderOverride>,
+
+    /// 按扩展名正则设置缓存规则
+    #[serde(default)]
+    pub cache_rules: Vec<CacheRule>,
+
+    /// 直接返回（带 URL 的 return 指令）
+    #[serde(default)]
+    pub return_url: Option<String>,
+
+    /// 直接返回文本内容体（等价 Caddy respond）
+    #[serde(default)]
+    pub return_body: Option<String>,
+
+    /// return_body 的 Content-Type（默认 "text/plain; charset=utf-8"）
+    #[serde(default)]
+    pub return_content_type: Option<String>,
+
+    /// per-location 并发连接数限制（等价 Nginx limit_conn）
+    #[serde(default)]
+    pub limit_conn: usize,
+
+    /// 反代缓冲控制（等价 Nginx proxy_buffering）
+    #[serde(default)]
+    pub proxy_buffering: bool,
+
+    /// 尝试文件列表（等价 Nginx try_files）
+    #[serde(default)]
+    pub try_files: Vec<String>,
+
+    /// 响应体内容替换（等价 Nginx sub_filter）
+    #[serde(default)]
+    pub sub_filter: Vec<SubFilter>,
+
+    /// 子请求鉴权 URL（等价 Nginx auth_request）
+    #[serde(default)]
+    pub auth_request: Option<String>,
+
+    /// auth_request 失败时返回的状态码（默认 401）
+    #[serde(default = "default_auth_failure_status")]
+    pub auth_failure_status: u16,
+
+    /// auth_request 时向子请求注入的额外头
+    #[serde(default)]
+    pub auth_request_headers: Vec<HeaderOverride>,
+}
+
+impl Default for LocationConfig {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            handler: HandlerType::Static,
+            root: None,
+            upstream: None,
+            cache_control: None,
+            return_code: None,
+            max_connections: None,
+            strip_cookie_secure: false,
+            proxy_cookie_domain: None,
+            proxy_redirect_from: None,
+            proxy_redirect_to: None,
+            proxy_set_headers: vec![],
+            add_headers: vec![],
+            cache_rules: vec![],
+            return_url: None,
+            return_body: None,
+            return_content_type: None,
+            limit_conn: 0,
+            proxy_buffering: false,
+            try_files: vec![],
+            sub_filter: vec![],
+            auth_request: None,
+            auth_failure_status: 401,
+            auth_request_headers: vec![],
+        }
+    }
+}
+
+/// 请求头/响应头覆盖配置
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HeaderOverride {
+    /// 头名称
+    pub name: String,
+    /// 头值（支持变量: $remote_addr, $host, $scheme, $request_uri）
+    pub value: String,
+}
+
+/// 按扩展名缓存规则
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheRule {
+    /// 匹配扩展名的正则表达式（如 "\\.(css|js|png)$"）
+    pub pattern: String,
+    /// Cache-Control 头值（如 "public, max-age=2592000"）
+    pub cache_control: String,
+}
+
+/// 响应体内容替换规则（等价 Nginx sub_filter）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubFilter {
+    /// 被替换的字符串或正则（以 `~` 开头表示正则）
+    pub pattern: String,
+    /// 替换内容（支持 $1 $2 捕获组）
+    pub replacement: String,
+}
+
+/// 反代响应缓存配置（等价 Nginx proxy_cache）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProxyCacheConfig {
+    /// 磁盘缓存目录（不设则只用内存缓存）
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+
+    /// 内存缓存最大条数（默认 1000）
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+
+    /// 缓存有效期（秒，默认 60）
+    #[serde(default = "default_cache_ttl")]
+    pub ttl: u64,
+
+    /// 可缓存的 HTTP 状态码（默认 [200, 301, 302]）
+    #[serde(default = "default_cache_statuses")]
+    pub cacheable_statuses: Vec<u16>,
+
+    /// 可缓存的 HTTP 方法（默认 ["GET", "HEAD"]）
+    #[serde(default = "default_cache_methods")]
+    pub cacheable_methods: Vec<String>,
+
+    /// 跳过缓存的请求头（如 Authorization 头存在时不缓存）
+    #[serde(default = "default_no_cache_headers")]
+    pub bypass_headers: Vec<String>,
+}
+
+/// 请求处理器类型
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub enum HandlerType {
+    /// 静态文件服务
+    #[default]
+    #[serde(rename = "static")]
+    Static,
+    /// PHP / FastCGI
+    #[serde(rename = "fastcgi")]
+    Fastcgi,
+    /// WebSocket
+    #[serde(rename = "websocket")]
+    Websocket,
+    /// 反向代理
+    #[serde(rename = "reverse_proxy")]
+    ReverseProxy,
+    /// gRPC 反向代理
+    #[serde(rename = "grpc")]
+    Grpc,
+    /// 插件处理器（handler = "plugin:name" 格式）
+    #[serde(untagged, deserialize_with = "deserialize_plugin_handler")]
+    Plugin(String),
+}
+
+/// 反序列化 plugin:<name> 格式的 handler 字段
+fn deserialize_plugin_handler<'de, D>(de: D) -> Result<String, D::Error>
+where D: serde::Deserializer<'de>
+{
+    let s = String::deserialize(de)?;
+    if let Some(name) = s.strip_prefix("plugin:") {
+        Ok(name.to_string())
+    } else {
+        Err(serde::de::Error::custom(format!("期望 plugin:<name> 格式，得到: {}", s)))
+    }
+}
+
+/// 单条 Rewrite / 伪静态规则
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RewriteRule {
+    /// 匹配的正则模式
+    pub pattern: String,
+
+    /// 替换目标（支持 $1 $2 捕获组）
+    pub target: String,
+
+    /// 行为标志：last / break / redirect(302) / permanent(301)
+    #[serde(default = "default_rewrite_flag")]
+    pub flag: RewriteFlag,
+
+    /// 触发条件（可选）：!-f 文件不存在，!-d 目录不存在
+    #[serde(default)]
+    pub condition: Option<String>,
+}
+
+/// Rewrite 行为标志
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RewriteFlag {
+    /// 重写后重新匹配 location
+    Last,
+    /// 重写后停止处理后续 rewrite
+    Break,
+    /// 302 临时重定向
+    Redirect,
+    /// 301 永久重定向
+    Permanent,
+}
+
+/// 站点限流总配置
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct RateLimitConfig {
+    /// 限流规则列表
+    #[serde(default)]
+    pub rules: Vec<RateLimitRule>,
+}
+
+/// 单条限流规则
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RateLimitRule {
+    /// 限流维度
+    pub dimension: RateLimitDimension,
+
+    /// 稳定速率（每秒请求数）
+    pub rate: u64,
+
+    /// 突发容量（令牌桶上限，默认 = rate）
+    #[serde(default)]
+    pub burst: u64,
+
+    /// nodelay 模式（等价 Nginx limit_req nodelay）
+    #[serde(default = "default_true")]
+    pub nodelay: bool,
+
+    /// 路径匹配模式（dimension = path 时使用）
+    #[serde(default)]
+    pub path_pattern: Option<String>,
+
+    /// Header 名称（dimension = header 时使用）
+    #[serde(default)]
+    pub header_name: Option<String>,
+}
+
+/// 限流维度
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitDimension {
+    /// 按客户端 IP
+    Ip,
+    /// 按请求路径
+    Path,
+    /// 按指定 Header 值
+    Header,
+    /// 按 User-Agent
+    UserAgent,
+    /// IP + 路径组合
+    IpPath,
+}

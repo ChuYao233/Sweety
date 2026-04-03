@@ -416,10 +416,12 @@ where
     stream.reserve_capacity(PIPELINE_WINDOW);
 
     loop {
-        // 读一块文件（mmap：纯内存，几乎立即 Ready）
+        // 读一块数据（文件：mmap 纯内存几乎立即 Ready；WebSocket：BiDirStream 异步轮诮）
         let chunk = match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
             None | Some(Err(_)) => break,
-            Some(Ok(c)) if c.is_empty() => break,
+            // 空 chunk 跳过，不当做 EOF：WebSocket 空帧、流控屏障等场景下可能吸入 0 字节，
+            // 若 break 则 h2 会发送 EOS 帧强制关闭流，导致 WebSocket 连接异常断开
+            Some(Ok(c)) if c.is_empty() => continue,
             Some(Ok(c)) => c,
         };
 

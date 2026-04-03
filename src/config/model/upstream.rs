@@ -219,4 +219,9 @@ pub struct FastCgiCacheConfig {
     /// 跳过缓存的请求头（如 Cookie 存在时不缓存）
     #[serde(default)]
     pub bypass_headers: Vec<String>,
+
+    /// 忽略响应头对缓存决策的影响（等价 Nginx fastcgi_ignore_headers）
+    /// WordPress 必须设为 ["Cache-Control", "Set-Cookie"] 才能命中缓存
+    #[serde(default)]
+    pub ignore_headers: Vec<String>,
 }

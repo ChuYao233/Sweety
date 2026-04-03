@@ -82,6 +82,10 @@ pub struct ProxyCache {
     cacheable_methods: Vec<String>,
     bypass_headers: Vec<String>,
     disk_path: Option<PathBuf>,
+    /// 忽略 Cache-Control 响应头对缓存决策的影响（fastcgi_ignore_headers Cache-Control）
+    ignore_cache_control: bool,
+    /// 忽略 Set-Cookie 响应头对缓存决策的影响（fastcgi_ignore_headers Set-Cookie）
+    ignore_set_cookie: bool,
 }
 
 impl ProxyCache {
@@ -92,6 +96,10 @@ impl ProxyCache {
                 warn!("proxy_cache 磁盘目录创建失败 {}: {}", path.display(), e);
             }
         }
+        let ignore_cache_control = cfg.ignore_headers.iter()
+            .any(|h| h.eq_ignore_ascii_case("Cache-Control"));
+        let ignore_set_cookie = cfg.ignore_headers.iter()
+            .any(|h| h.eq_ignore_ascii_case("Set-Cookie"));
         Arc::new(Self {
             mem: Arc::new(DashMap::with_capacity(cfg.max_entries)),
             max_entries: cfg.max_entries,
@@ -100,6 +108,8 @@ impl ProxyCache {
             cacheable_methods: cfg.cacheable_methods.iter().map(|s| s.to_uppercase()).collect(),
             bypass_headers: cfg.bypass_headers.iter().map(|s| s.to_lowercase()).collect(),
             disk_path: cfg.path.clone(),
+            ignore_cache_control,
+            ignore_set_cookie,
         })
     }
 
@@ -130,16 +140,16 @@ impl ProxyCache {
         if !self.cacheable_statuses.contains(&status) {
             return false;
         }
-        // Cache-Control: no-store / private 时不缓存
         for (k, v) in resp_headers {
-            if k.eq_ignore_ascii_case("cache-control") {
+            // Cache-Control: no-store / private 时不缓存（可被 ignore_cache_control 覆盖）
+            if !self.ignore_cache_control && k.eq_ignore_ascii_case("cache-control") {
                 let vl = v.to_ascii_lowercase();
                 if vl.contains("no-store") || vl.contains("private") {
                     return false;
                 }
             }
-            // Set-Cookie 响应默认不缓存（防止 session 泄露）
-            if k.eq_ignore_ascii_case("set-cookie") {
+            // Set-Cookie 响应默认不缓存（可被 ignore_set_cookie 覆盖）
+            if !self.ignore_set_cookie && k.eq_ignore_ascii_case("set-cookie") {
                 return false;
             }
         }

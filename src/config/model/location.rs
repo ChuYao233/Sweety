@@ -197,6 +197,13 @@ pub struct ProxyCacheConfig {
     /// 跳过缓存的请求头（如 Authorization 头存在时不缓存）
     #[serde(default = "default_no_cache_headers")]
     pub bypass_headers: Vec<String>,
+
+    /// 忽略响应头对缓存决策的影响（等价 Nginx fastcgi_ignore_headers）
+    /// 常用值：["Cache-Control", "Set-Cookie"]
+    /// WordPress 每个响应都带 Cache-Control: no-store 和 Set-Cookie，
+    /// 配置此项后 Sweety 强制缓存，不管这些响应头怎么说
+    #[serde(default)]
+    pub ignore_headers: Vec<String>,
 }
 
 /// 请求处理器类型

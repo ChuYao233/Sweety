@@ -120,6 +120,7 @@ impl SweetyServer {
                         cacheable_statuses: cache_cfg.cacheable_statuses.clone(),
                         cacheable_methods: cache_cfg.cacheable_methods.clone(),
                         bypass_headers: cache_cfg.bypass_headers.clone(),
+                        ignore_headers: cache_cfg.ignore_headers.clone(),
                     };
                     info!("站点 '{}' FastCGI 缓存已开启（max_entries={}, ttl={}s)",
                         site.name, cache_cfg.max_entries, cache_cfg.ttl);

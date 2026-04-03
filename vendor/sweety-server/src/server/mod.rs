@@ -212,6 +212,11 @@ impl Server {
         if let Some(rt) = self.rt.take() {
             self.is_graceful_shutdown.store(graceful, Ordering::SeqCst);
             rt.shutdown_background();
+            if !graceful {
+                // ForceStop（Ctrl+C/SIGINT）：accept 循环无停止机制，join 会永久阻塞
+                // 直接退出进程，OS 回收所有资源
+                std::process::exit(0);
+            }
             mem::take(&mut self.worker_join_handles).into_iter().for_each(|handle| {
                 // 安全处理 join 错误，不 panic
                 if let Err(e) = handle.join() {

@@ -176,7 +176,8 @@ where
                         if !buf.is_empty() {
                             tx.send_data(buf.freeze()).await?;
                         }
-                        tx.finish().await?;
+                        // fire-and-forget：不等客户端 ACK FIN（~26ms delayed ACK），立即返回
+                        tokio::task::spawn_local(async move { let _ = tx.finish().await; });
                         return Ok(());
                     }
                     Poll::Pending => break,
@@ -194,7 +195,8 @@ where
                     tx.send_data(bytes).await?;
                 }
             }
-            tx.finish().await?;
+            // fire-and-forget：不等客户端 ACK FIN
+            tokio::task::spawn_local(async move { let _ = tx.finish().await; });
             return Ok(());
         }
     }
@@ -225,8 +227,7 @@ where
             }
         }
     }
-    tx.finish().await?;
-
+    // fire-and-forget：不等客户端 ACK FIN
+    tokio::task::spawn_local(async move { let _ = tx.finish().await; });
     Ok(())
 }
-

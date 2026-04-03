@@ -10,6 +10,7 @@
 
 use ::h2::{
     Ping, PingPong,
+    ext::Protocol,
     server::{Connection, SendResponse},
 };
 use futures_core::stream::Stream;
@@ -83,8 +84,19 @@ where
         is_tls: bool,
         raw_fd: i32,
     ) -> Result<bool, ()> {
+        // 检测 H2 extended CONNECT（RFC 8441）：:method=CONNECT + :protocol=websocket
+        // h2 crate 把 :protocol 伪头存入 req.extensions()，检测后用 new_h2_ws 标记
+        // 否则 is_h2_ws() 永远 false，CONNECT 请求被当作隧道返回 400，WS 握手失败
+        let is_h2_ws = req.extensions().get::<Protocol>()
+            .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
         let req = req.map(|body| {
-            RequestExt::from_parts(RequestBody::from(body).into(), Extension::new(addr, is_tls))
+            let ext = if is_h2_ws {
+                Extension::new_h2_ws(addr, is_tls)
+            } else {
+                Extension::new(addr, is_tls)
+            };
+            RequestExt::from_parts(RequestBody::from(body).into(), ext)
         });
         let resp = match service.call(req).await {
             Ok(r) => r,
@@ -109,10 +121,11 @@ where
             ka_dur,
         };
 
+        // FuturesUnordered：在同一 task 里推进该连接所有并发 handler
+        // 等价于 Nginx 事件循环在同一 epoll 线程里处理所有流——零 task switch 开销
+        // 相比 spawn_local，避免了每请求的 tokio task 切换（对 1KB 短请求差异显著）
         let mut queue: FuturesUnordered<Pin<Box<dyn Future<Output = Result<bool, ()>>>>> = FuturesUnordered::new();
 
-        // select! 只负责等事件，不做 .await 副作用
-        // 用枚举区分三路事件，accept 结果移到 select! 外处理（做首次 poll）
         enum Ev {
             Accept(Option<Result<(Request<::h2::RecvStream>, ::h2::server::SendResponse<Bytes>), ::h2::Error>>),
             QueueDone(Option<Result<bool, ()>>),
@@ -151,7 +164,6 @@ where
                         io.graceful_shutdown();
                     }
                     req_count += 1;
-                    // 达到 max_requests 上限：发 GOAWAY 优雅关闭，客户端重建连接重新分散到各 worker
                     if max_requests > 0 && req_count >= max_requests {
                         io.graceful_shutdown();
                     }
@@ -345,7 +357,39 @@ where
                 None => { let _ = respond.send_response(res, true); }
                 Some(data) => {
                     if let Ok(mut stream) = respond.send_response(res, false) {
-                        let _ = stream.send_data(data, !has_trailers);
+                        // 先申请容量：初始流控窗口仅 65535，直接 send_data 超过窗口会被丢弃导致 EOF
+                        let total = data.len();
+                        stream.reserve_capacity(total);
+                        let cap = stream.capacity();
+                        if cap >= total {
+                            // 窗口足够（小文件或对端窗口够大），直接发
+                            let _ = stream.send_data(data, !has_trailers);
+                        } else {
+                            // 窗口不够（典型：100KB > 65535），需要分块等 WINDOW_UPDATE
+                            // 先 UNCORK 让 HEADERS 刷到对端，对端才会发 WINDOW_UPDATE
+                            set_tcp_cork(raw_fd, false);
+                            let mut remaining = data;
+                            loop {
+                                let cap = stream.capacity();
+                                if cap > 0 {
+                                    let n = cmp::min(cap, remaining.len());
+                                    let chunk = remaining.split_to(n);
+                                    let eos = remaining.is_empty() && !has_trailers;
+                                    let _ = stream.send_data(chunk, eos);
+                                    stream.reserve_capacity(remaining.len());
+                                    if remaining.is_empty() { break; }
+                                } else {
+                                    match poll_fn(|cx| stream.poll_capacity(cx)).await {
+                                        None | Some(Err(_)) => {
+                                            set_tcp_cork(raw_fd, false);
+                                            return Ok(keep_alive);
+                                        }
+                                        Some(Ok(_)) => {}
+                                    }
+                                }
+                            }
+                            // 分块完成后不再需要重新 CORK（后续直接 UNCORK）
+                        }
                         if let Some(t) = trailers { let _ = stream.send_trailers(t); }
                     }
                 }

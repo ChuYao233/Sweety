@@ -1,4 +1,4 @@
-﻿//! 静态文件处理器
+//! 静态文件处理器
 //!
 //! # 压缩策略
 //! - **Brotli**：当客户端支持 `br` 时优先使用，压缩率比 gzip 高 20-30%
@@ -6,13 +6,9 @@
 //! - **都仅对 ≤ 4MB 小文件做内存压缩，大文件直接流式传输**
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::SystemTime;
-use bytes::Bytes;
-use dashmap::DashMap;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::debug;
+use bytes::Bytes;
 use sweety_web::{
     body::ResponseBody,
     http::{
@@ -31,216 +27,21 @@ use crate::dispatcher::vhost::SiteInfo;
 use crate::middleware::cache::{generate_etag, to_unix_secs, mime_type_for, default_cache_control};
 use crate::server::http::AppState;
 
-/// 构建缓存 key 字符串：root/relative，用于 DashMap<Arc<str>, _> 的零分配查询
-/// Arc<str>: Borrow<str>，所以 DashMap::get 可以直接接受 &str，命中时无需构造 Arc
-#[inline]
-fn make_cache_key(root: &Path, relative: &str) -> Arc<str> {
-    let root_str = root.to_str().unwrap_or("");
-    let mut s = String::with_capacity(root_str.len() + 1 + relative.len());
-    s.push_str(root_str);
-    if !relative.is_empty() {
-        s.push('/');
-        s.push_str(relative);
-    }
-    Arc::from(s.as_str())
-}
+mod cache;
+mod compress;
+mod path;
+mod range;
 
-/// 从完整路径构建缓存 key（canonical path 用）
-#[inline]
-fn make_cache_key_from_path(path: &Path) -> Arc<str> {
-    Arc::from(path.to_str().unwrap_or(""))
-}
+pub use cache::start_file_cache_watcher;
+pub use path::{TryFilesResult, try_files_resolve, resolve_safe_path, resolve_safe_path_fast};
 
-/// 零分配缓存查询：用栈上拼接的临时 &str 直接查询 DashMap<Arc<str>, _>，命中时无堆分配
-#[inline]
-fn cache_get_fast(root: &Path, relative: &str) -> Option<FileCacheEntry> {
-    let root_str = root.to_str().unwrap_or("");
-    // 用栈缓冲区拼接 key，避免堆分配（路径长度通常 < 256 字节）
-    let mut buf = [0u8; 512];
-    let root_b = root_str.as_bytes();
-    let rel_b  = relative.as_bytes();
-    let total  = root_b.len() + if rel_b.is_empty() { 0 } else { 1 + rel_b.len() };
-    if total <= buf.len() {
-        buf[..root_b.len()].copy_from_slice(root_b);
-        if !rel_b.is_empty() {
-            buf[root_b.len()] = b'/';
-            buf[root_b.len() + 1..total].copy_from_slice(rel_b);
-        }
-        // buf 内容来自 UTF-8 str 拼接，from_utf8 不会失败
-        if let Ok(key) = std::str::from_utf8(&buf[..total]) {
-            file_cache().get(key).map(|e| e.clone())
-        } else {
-            None
-        }
-    } else {
-        // 超长路径（极少见）回退到堆分配
-        let key = make_cache_key(root, relative);
-        file_cache().get(key.as_ref()).map(|e| e.clone())
-    }
-}
-
-/// gzip/brotli 内存压缩文件大小上限（1MB）
-const GZIP_MAX_INLINE: u64 = 1024 * 1024;
-/// 内存文件缓存大小上限：缓存 ≤ 64KB 的小文件
-/// 超过此阈值的文件改用 fd 缓存 + pread 流式传输
-const FILE_CACHE_MAX_BYTES: u64 = 64 * 1024;
-/// 文件缓存总字节数上限：64MB（含压缩副本约 2x，实际原始数据 ~32MB）
-const FILE_CACHE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
-/// 最多缓存条数（上限）
-const FILE_CACHE_MAX_ENTRIES: usize = 2048;
-
-/// 文件内存缓存条目（预缓存所有响应头 HeaderValue，缓存命中时零分配）
-#[derive(Clone)]
-struct FileCacheEntry {
-    /// 原始文件内存（未压缩）
-    data:          Bytes,
-    /// gzip 预压缩结果（None 表示未压缩或超过阈値）
-    gz:            Option<Bytes>,
-    /// brotli 预压缩结果
-    br:            Option<Bytes>,
-    modified_secs: u64,
-    // 预构建的响应头（缓存命中时直接插入，零 from_str 分配）
-    hv_content_type:  HeaderValue,
-    hv_content_length: HeaderValue,  // 原始大小
-    hv_etag:          HeaderValue,
-    hv_last_modified: HeaderValue,
-    hv_cache_control: HeaderValue,
-}
-
-/// 全局 L2 文件缓存（DashMap：无锁分片读写，多线程共享）
-/// key 为 Arc<str>（root/relative 拼接），Arc<str>: Borrow<str> 支持 &str 零分配查询
-static FILE_CACHE: OnceLock<DashMap<Arc<str>, FileCacheEntry>> = OnceLock::new();
-
-fn file_cache() -> &'static DashMap<Arc<str>, FileCacheEntry> {
-    FILE_CACHE.get_or_init(|| DashMap::with_capacity(FILE_CACHE_MAX_ENTRIES))
-}
-
-/// 大文件 fd 缓存条目：缓存 fd + stat，避免 Range/普通请求重复 open syscall
-/// 对标 Nginx open_file_cache 机制
-#[derive(Clone)]
-struct FdCacheEntry {
-    #[allow(dead_code)]
-    file_size:     u64,
-    #[allow(dead_code)]
-    modified_secs: u64,
-    /// Arc<std::fs::File> 允许多请求共享同一 fd，每次 dup2/pread 时无需持锁
-    /// pread(2) 是无状态的，不需要 seek，天然支持多请求并发
-    fd:            std::sync::Arc<std::fs::File>,
-}
-
-/// fd 缓存最多条目数（每条目一个 OS fd，不宜过多）
-const FD_CACHE_MAX_ENTRIES: usize = 512;
-
-static FD_CACHE: OnceLock<DashMap<Arc<str>, FdCacheEntry>> = OnceLock::new();
-
-fn fd_cache() -> &'static DashMap<Arc<str>, FdCacheEntry> {
-    FD_CACHE.get_or_init(|| DashMap::with_capacity(FD_CACHE_MAX_ENTRIES))
-}
-
-/// 从 fd 缓存获取：直接信任缓存（文件变化由 notify watcher 驱逐），消除每次 stat
-/// 返回 Arc<std::fs::File> 共享 fd，调用方用 pread(无 seek 竞争)或 dup 后 seek
-#[inline]
-fn fd_cache_get(key: &str) -> Option<FdCacheEntry> {
-    fd_cache().get(key).map(|e| e.clone())
-}
-
-/// 从 fd 缓存获取或 open 文件（异步版，用于首次 open）
-/// 命中时直接返回 Arc<std::fs::File>，未命中时 open 并插入缓存
-#[inline]
-async fn fd_cache_get_or_open_arc(path: &PathBuf, file_size: u64, modified_secs: u64)
-    -> Option<std::sync::Arc<std::fs::File>>
-{
-    let key: Arc<str> = Arc::from(path.to_str().unwrap_or(""));
-    if let Some(entry) = fd_cache_get(&key) {
-        return Some(entry.fd);
-    }
-    // 未命中：open 并插入缓存
-    match std::fs::File::open(path) {
-        Ok(f) => {
-            let arc = std::sync::Arc::new(f);
-            fd_cache_insert_arc(key, arc.clone(), file_size, modified_secs);
-            Some(arc)
-        }
-        Err(_) => None,
-    }
-}
-
-/// 插入 fd 缓存（Arc<std::fs::File> 版），LRU 满时淘汰前 1/4
-#[inline]
-fn fd_cache_insert_arc(key: Arc<str>, fd: std::sync::Arc<std::fs::File>, file_size: u64, modified_secs: u64) {
-    let cache = fd_cache();
-    if cache.len() >= FD_CACHE_MAX_ENTRIES {
-        let to_remove: Vec<_> = cache.iter()
-            .take(FD_CACHE_MAX_ENTRIES / 4)
-            .map(|e| e.key().clone())
-            .collect();
-        for k in to_remove { cache.remove(&k); }
-    }
-    cache.insert(key, FdCacheEntry {
-        file_size,
-        modified_secs,
-        fd,
-    });
-}
-
-fn cache_insert(key: Arc<str>, entry: FileCacheEntry) {
-    let cache = file_cache();
-    // 按总字节数淘汰：超过 FILE_CACHE_TOTAL_BYTES 时淘汰最旧 1/4
-    let total: usize = cache.iter().map(|e| {
-        e.data.len()
-            + e.gz.as_ref().map(|b| b.len()).unwrap_or(0)
-            + e.br.as_ref().map(|b| b.len()).unwrap_or(0)
-    }).sum();
-    if total + entry.data.len() > FILE_CACHE_TOTAL_BYTES || cache.len() >= FILE_CACHE_MAX_ENTRIES {
-        let to_remove: Vec<_> = cache.iter()
-            .take(FILE_CACHE_MAX_ENTRIES / 4)
-            .map(|e| e.key().clone())
-            .collect();
-        for k in to_remove { cache.remove(&k); }
-    }
-    cache.insert(key, entry);
-}
-
-/// 启动文件变更监听：文件修改/删除时直接淡化 FILE_CACHE 对应条目
-/// 返回 watcher 句柄，调用方需保持其生命周期与服务器相同
-pub fn start_file_cache_watcher(roots: Vec<PathBuf>) -> Option<RecommendedWatcher> {
-    if roots.is_empty() { return None; }
-
-    let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-        let Ok(event) = res else { return };
-        // 只处理文件内容变化事件（写入、创建、删除、重命名）
-        if !matches!(event.kind,
-            EventKind::Modify(_) | EventKind::Create(_)
-            | EventKind::Remove(_)
-        ) { return; }
-
-        let cache = file_cache();
-        for path in &event.paths {
-            // 直接移除命中的缓存条目，下次请求将重新从磁盘加载
-            if let Some(key) = path.to_str() {
-                if cache.remove(key).is_some() {
-                    debug!("文件缓存已淡化: {}", path.display());
-                }
-            }
-        }
-    });
-
-    match watcher {
-        Ok(mut w) => {
-            for root in &roots {
-                if let Err(e) = w.watch(root, RecursiveMode::Recursive) {
-                    tracing::warn!("文件缓存监听启动失败 ({}): {}", root.display(), e);
-                }
-            }
-            tracing::info!("文件缓存 notify 监听已启动，共 {} 个目录", roots.len());
-            Some(w)
-        }
-        Err(e) => {
-            tracing::warn!("文件缓存 notify 初始化失败: {}，回退到定期检查模式", e);
-            None
-        }
-    }
-}
+use cache::{
+    FileCacheEntry, cache_get_fast, cache_insert, make_cache_key,
+    fd_cache_get_or_open_arc, make_cache_key_from_path,
+    GZIP_MAX_INLINE, FILE_CACHE_MAX_BYTES,
+};
+use compress::{stream_file_response_pread, gzip_compress, brotli_compress};
+use range::parse_range;
 
 
 /// 处理静态文件请求（sweety-web WebContext 版本）
@@ -679,75 +480,6 @@ pub async fn handle_sweety(
 }
 
 
-/// pread 分块流式传输：共享 fd + spawn_blocking pread，无 seek，无竞争
-/// 适用于大文件全量传输（offset=0, len=file_size）和大 Range 传输
-fn stream_file_response_pread(
-    fd: std::sync::Arc<std::fs::File>,
-    file_path: &Path,
-    content_len: u64,
-    offset: u64,
-    len: u64,
-    etag_val: &str,
-    modified_secs: u64,
-    location: &LocationConfig,
-) -> WebResponse {
-    let stream = crate::handler::sendfile::pread_stream(fd, offset, len);
-    let body = ResponseBody::box_stream(stream);
-    let mut resp = WebResponse::new(body);
-    set_file_headers(resp.headers_mut(), file_path, content_len, etag_val, modified_secs, location);
-    resp
-}
-
-/// gzip 压缩（flate2，仅用于小文件；调用方需通过 spawn_blocking 调用）
-fn gzip_compress(data: &[u8], level: u32) -> std::io::Result<bytes::Bytes> {
-    use flate2::{Compression, write::GzEncoder};
-    use std::io::Write;
-    let mut encoder = GzEncoder::new(
-        Vec::with_capacity(data.len() / 2),
-        Compression::new(level.min(9)),
-    );
-    encoder.write_all(data)?;
-    Ok(bytes::Bytes::from(encoder.finish()?))
-}
-
-/// Brotli 压缩（async-compression，spawn_blocking 避免阻塞 tokio 线程）
-async fn brotli_compress(data: &[u8]) -> std::io::Result<bytes::Bytes> {
-    use async_compression::tokio::bufread::BrotliEncoder;
-    use tokio::io::AsyncReadExt;
-
-    let cursor = std::io::Cursor::new(data.to_vec());
-    let reader = tokio::io::BufReader::new(cursor);
-    let mut encoder = BrotliEncoder::new(reader);
-    let mut out = Vec::with_capacity(data.len() / 3);
-    encoder.read_to_end(&mut out).await?;
-    Ok(bytes::Bytes::from(out))
-}
-
-/// 解析 Range 头，返回 (start, end) 字节偏移（闭区间），失败或超出范围返回 None
-fn parse_range(range_header: &str, file_size: u64) -> Option<(u64, u64)> {
-    let s = range_header.strip_prefix("bytes=")?;
-    let mut parts = s.splitn(2, '-');
-    let start_str = parts.next()?.trim();
-    let end_str = parts.next()?.trim();
-
-    let start: u64 = if start_str.is_empty() {
-        // suffix-length: bytes=-500
-        let suffix: u64 = end_str.parse().ok()?;
-        file_size.saturating_sub(suffix)
-    } else {
-        start_str.parse().ok()?
-    };
-
-    let end: u64 = if end_str.is_empty() {
-        file_size.saturating_sub(1)
-    } else {
-        end_str.parse().ok()?
-    };
-
-    if start > end || end >= file_size { return None; }
-    Some((start, end))
-}
-
 /// 设置静态文件响应头（Content-Type / ETag / Last-Modified / Cache-Control）
 fn set_file_headers(
     headers: &mut HeaderMap,
@@ -793,152 +525,6 @@ fn set_file_headers(
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 }
 
-/// try_files 解析结果
-pub enum TryFilesResult {
-    /// 找到可用文件（静态文件或 PHP 脚本，调用方根据扩展名分流）
-    File(PathBuf),
-    /// 返回指定错误码（如 =404）
-    Code(u16),
-    /// 所有路径均不存在
-    NotFound,
-}
-
-/// 按 try_files 列表依次尝试路径（等价 Nginx try_files $uri $uri/ /fallback.html =404）
-///
-/// 支持的条目格式：
-/// - `$uri`      → 请求路径对应的文件
-/// - `$uri/`     → 请求路径对应的目录（查找 index 文件）
-/// - `/path`     → 固定路径的文件
-/// - `=<code>`   → 返回指定 HTTP 状态码（必须是最后一项）
-/// 供 http.rs 调用（root 为 Option）
-pub async fn try_files_resolve(
-    try_files_list: &[String],
-    request_path: &str,
-    root: Option<&std::path::PathBuf>,
-) -> TryFilesResult {
-    let index_files = vec!["index.php".to_string(), "index.html".to_string()];
-    let root_path = match root {
-        Some(r) => r.as_path(),
-        None => return TryFilesResult::NotFound,
-    };
-    try_files_resolve_inner(root_path, request_path, try_files_list, &index_files).await
-}
-
-/// 内部实现（保持原始变体不变）
-async fn try_files_resolve_inner(
-    root: &Path,
-    request_path: &str,
-    try_files: &[String],
-    index_files: &[String],
-) -> TryFilesResult {
-    let uri = request_path.split('?').next().unwrap_or(request_path);
-
-    for entry in try_files {
-        let entry = entry.trim();
-
-        // =<code>：返回状态码
-        if let Some(code_str) = entry.strip_prefix('=') {
-            if let Ok(code) = code_str.parse::<u16>() {
-                return TryFilesResult::Code(code);
-            }
-            continue;
-        }
-
-        // 展开变量
-        let expanded = entry
-            .replace("$uri", uri)
-            .replace("$request_uri", request_path);
-
-        if expanded.ends_with('/') {
-            // 目录模式：查找 index 文件
-            let dir_path = match resolve_safe_path(root, expanded.trim_end_matches('/')) {
-                Some(p) => p,
-                None => continue,
-            };
-            if let Some(idx) = find_index(&dir_path, index_files).await {
-                return TryFilesResult::File(idx);
-            }
-        } else {
-            // 文件模式
-            let file_path = match resolve_safe_path(root, &expanded) {
-                Some(p) => p,
-                None => continue,
-            };
-            if file_path.is_file() {
-                return TryFilesResult::File(file_path);
-            }
-        }
-    }
-
-    TryFilesResult::NotFound
-}
-
-/// 在目录中查找第一个存在的默认文档
-async fn find_index(dir: &Path, index_files: &[String]) -> Option<PathBuf> {
-    for name in index_files {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// 将请求路径安全地解析为文件系统绝对路径（防目录穿越）
-///
-/// `canonical_root`：启动时预计算的 `root.canonicalize()` 结果，
-/// 传入后跳过每请求 `root.canonicalize()` 系统调用（约省 1 次 stat syscall）。
-pub fn resolve_safe_path(root: &Path, request_path: &str) -> Option<PathBuf> {
-    resolve_safe_path_with_canon(root, request_path, None)
-}
-
-/// 带预计算 canonical root 的版本（供 handle_sweety 调用以消除重复系统调用）
-pub fn resolve_safe_path_fast(
-    root: &Path,
-    request_path: &str,
-    canonical_root: Option<&Path>,
-) -> Option<PathBuf> {
-    resolve_safe_path_with_canon(root, request_path, canonical_root)
-}
-
-fn resolve_safe_path_with_canon(
-    root: &Path,
-    request_path: &str,
-    canonical_root: Option<&Path>,
-) -> Option<PathBuf> {
-    // 去掉查询字符串
-    let path_only = request_path.split('?').next().unwrap_or(request_path);
-
-    // 拒绝包含 `..` 的路径片段
-    for segment in path_only.split('/') {
-        if segment == ".." {
-            return None;
-        }
-    }
-
-    let relative = path_only.trim_start_matches('/');
-    let full = root.join(relative);
-
-    // canonicalize 验证路径在 root 下（防符号链接穿越）
-    // 文件不存在时 canonicalize 失败，直接返回拼接路径（后续 is_file 会返回 false）
-    let cr_opt: Option<PathBuf>;
-    let cr = match canonical_root {
-        Some(p) => Some(p),     // 使用预计算结果，跳过 syscall
-        None => {
-            cr_opt = root.canonicalize().ok();
-            cr_opt.as_deref()
-        }
-    };
-    match (full.canonicalize().ok(), cr) {
-        (Some(cf), Some(cr)) => {
-            if cf.starts_with(cr) { Some(cf) } else { None }
-        }
-        _ => Some(full),
-    }
-}
-
-/// 构造简单错误响应（使用预构建 Bytes 缓存，零堆分配）
-#[inline(always)]
 fn make_error(status: StatusCode, _msg: &str) -> WebResponse {
     let body = crate::handler::error_page::get_error_bytes(status.as_u16());
     let mut resp = WebResponse::new(ResponseBody::from(body));

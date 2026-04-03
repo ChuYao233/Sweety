@@ -143,7 +143,7 @@ impl SweetyServer {
         // 收集 HTTP/3 端口集合（用于 Alt-Svc 注入）
         let h3_port_set: HashSet<u16> = collect_h3_ports(&cfg)
             .into_iter()
-            .map(|(port, _)| port)
+            .map(|(port, _, _)| port)
             .collect();
 
         // 第二步：构建 state
@@ -219,8 +219,8 @@ impl SweetyServer {
         // 先构建好所有 H3 配置，再统一通过链式 bind_h3 绑定（避免所有权问题）
         let h3_bindings: Vec<(String, sweety_io::net::QuicConfig)> = collect_h3_ports(&cfg)
             .into_iter()
-            .filter_map(|(port, tls_cfg)| {
-                match TlsManager::build_quic_config(tls_cfg) {
+            .filter_map(|(port, tls_cfg, server_names)| {
+                match TlsManager::build_quic_config(tls_cfg, &server_names) {
                     Ok(cfg) => Some((format!("0.0.0.0:{}", port), cfg)),
                     Err(e) => {
                         tracing::warn!("HTTP/3 配置失败（端口 {}）: {}，跳过", port, e);
@@ -349,9 +349,9 @@ fn collect_tls_ports_grouped(
     map.into_iter().collect()
 }
 
-/// 收集 HTTP/3 QUIC 端口及对应 TLS 配置（取每端口第一个站点的证书）
+/// 收集 HTTP/3 QUIC 端口及对应 TLS 配置（取每端口第一个站点的证书和域名）
 /// 仅收集 protocols 列表中包含 "h3" 的站点对应的端口
-fn collect_h3_ports(cfg: &AppConfig) -> Vec<(u16, &crate::config::model::TlsConfig)> {
+fn collect_h3_ports(cfg: &AppConfig) -> Vec<(u16, &crate::config::model::TlsConfig, Vec<String>)> {
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for site in &cfg.sites {
@@ -362,7 +362,7 @@ fn collect_h3_ports(cfg: &AppConfig) -> Vec<(u16, &crate::config::model::TlsConf
             }
             for &p in &site.listen_tls {
                 if seen.insert(p) {
-                    result.push((p, tls));
+                    result.push((p, tls, site.server_name.clone()));
                 }
             }
         }

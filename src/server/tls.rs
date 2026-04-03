@@ -67,8 +67,10 @@ impl TlsManager {
             .with_no_client_auth()
             .with_cert_resolver(resolver.clone());
         // 根据 protocols 列表构建 TCP TLS ALPN（不包含 h3，h3 走 QUIC UDP 不经过 TCP TLS）
-        // 序列即协商优先级：客户端支持多个时取第一个匹配项
-        // 合并所有站点的 protocols 控制该端口的协议开关
+        //
+        // 并集语义（与 Nginx listener 级别行为一致）：
+        // 端口上任何一个站点声明了某协议，该端口就广播该协议。
+        // 若要禁用端口 h2，需要该端口上所有站点都不声明 h2（等同 Nginx 去掉 http2 参数）。
         let mut alpn: Vec<Vec<u8>> = Vec::new();
         for site in sites {
             let protos = site.tls.as_ref()
@@ -78,17 +80,15 @@ impl TlsManager {
                 let bytes: Vec<u8> = match p.as_str() {
                     "h2"       => b"h2".to_vec(),
                     "http/1.1" => b"http/1.1".to_vec(),
-                    _          => continue, // h3 跳过，h3 的 ALPN 在 QUIC 配置里单独设置
+                    _          => continue, // h3 走 QUIC，不进 TCP ALPN
                 };
                 if !alpn.contains(&bytes) { alpn.push(bytes); }
             }
         }
-        // ALPN 为空说明 protocols 仅含 h3（h3 走 QUIC 不经过 TCP TLS）
-        // 此时 TCP 侧只保留 http/1.1 做最小引导：
-        // 浏览器首次 TCP 连接协商 HTTP/1.1，拿到 Alt-Svc: h3 响应头后立即切换 QUIC
-        // 若回退到 h2，浏览器会长期复用 h2 多路复用连接，不积极尝试 H3
+        // protocols 全部只有 h3 时 ALPN 为空，保留 http/1.1 作为最小 TCP 引导：
+        // 浏览器先用 HTTP/1.1 拿到 Alt-Svc: h3 头，再切换 QUIC
         if alpn.is_empty() {
-            alpn = vec![b"http/1.1".to_vec()];
+            alpn.push(b"http/1.1".to_vec());
         }
         cfg.alpn_protocols = alpn;
         cfg.session_storage = global_session_cache();
@@ -100,12 +100,15 @@ impl TlsManager {
     /// - `acme = false`：从 cert/key 文件加载（支持 RSA / ECDSA / Ed25519）
     /// - `acme = true`：从 ACME 缓存目录加载已申请的证书；
     ///   首次运行时自动申请（通过 `acme_renewal_loop`）
-    pub fn build_server_config(tls: &TlsConfig) -> Result<ServerConfig> {
+    /// `server_names` 供 ACME 模式定位证书文件（证书按域名存储）
+    pub fn build_server_config(tls: &TlsConfig, server_names: &[String]) -> Result<ServerConfig> {
         if tls.acme {
-            // ACME 模式：读取本地缓存的证书（由 acme::acme_renewal_loop 写入）
-            let domain = tls.acme_email.as_deref()
-                .map(|_| "")
-                .unwrap_or("default");
+            // ACME 模式：用第一个非通配符域名定位证书（由 acme::acme_renewal_loop 按域名存储）
+            let domain = server_names.iter()
+                .find(|d| !d.starts_with("*."))
+                .or_else(|| server_names.first())
+                .map(|s| s.as_str())
+                .unwrap_or("localhost");
             let cert_path = super::acme::acme_cert_path(domain);
             let key_path  = super::acme::acme_key_path(domain);
             if cert_path.exists() && key_path.exists() {
@@ -127,11 +130,16 @@ impl TlsManager {
     ///
     /// `QuicConfig` 实际是 `quinn::ServerConfig`
     /// 使用 `with_single_cert` 直接构建，无需先构建 rustls::ServerConfig
-    pub fn build_quic_config(tls: &TlsConfig) -> Result<sweety_io::net::QuicConfig> {
+    /// `server_names` 供 ACME 模式定位证书文件（证书按域名存储）
+    pub fn build_quic_config(tls: &TlsConfig, server_names: &[String]) -> Result<sweety_io::net::QuicConfig> {
         let h3 = &tls.http3;
         let mut server_config = if tls.acme {
-            // ACME 模式：读取本地缓存证书
-            let domain = tls.acme_email.as_deref().unwrap_or("default");
+            // ACME 模式：用第一个非通配符域名定位证书（证书按域名存储）
+            let domain = server_names.iter()
+                .find(|d| !d.starts_with("*."))
+                .or_else(|| server_names.first())
+                .map(|s| s.as_str())
+                .unwrap_or("localhost");
             let cert_path = super::acme::acme_cert_path(domain);
             let key_path  = super::acme::acme_key_path(domain);
             if cert_path.exists() && key_path.exists() {

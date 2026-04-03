@@ -16,7 +16,7 @@ pub fn cmd_validate(config: &PathBuf) {
         if let Some(tls) = &site.tls {
             if !tls.acme {
                 if let (Some(cert), Some(key)) = (tls.cert.as_ref(), tls.key.as_ref()) {
-                    if let Err(e) = sweety_lib::server::tls::TlsManager::build_server_config(tls) {
+                    if let Err(e) = sweety_lib::server::tls::TlsManager::build_server_config(tls, &site.server_name) {
                         eprintln!("[ERROR] 站点 '{}' TLS 证书验证失败: {:#}", site.name, e);
                         eprintln!("  cert: {}", cert.display());
                         eprintln!("  key:  {}", key.display());
@@ -33,7 +33,7 @@ pub fn cmd_validate(config: &PathBuf) {
                         acme: false,
                         ..tls.clone()
                     };
-                    if let Err(e) = sweety_lib::server::tls::TlsManager::build_server_config(&single_tls) {
+                    if let Err(e) = sweety_lib::server::tls::TlsManager::build_server_config(&single_tls, &site.server_name) {
                         eprintln!("[ERROR] 站点 '{}' 第 {} 张证书验证失败: {:#}", site.name, i + 1, e);
                         eprintln!("  cert: {}", c.cert.display());
                         eprintln!("  key:  {}", c.key.display());

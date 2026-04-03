@@ -303,11 +303,16 @@ where
     {
         let service_config = self.config;
 
-        #[cfg(feature = "http2")]
-        config.alpn_protocols.push("h2".into());
+        // 若调用方已通过 ServerConfig.alpn_protocols 明确声明支持协议（如 Sweety 根据
+        // sites.tls.protocols 精确控制），则尊重调用方配置，不追加额外协议。
+        // 只有当 alpn_protocols 为空时才注入框架默认值，避免覆盖用户的协议限制意图。
+        if config.alpn_protocols.is_empty() {
+            #[cfg(feature = "http2")]
+            config.alpn_protocols.push("h2".into());
 
-        #[cfg(feature = "http1")]
-        config.alpn_protocols.push("http/1.1".into());
+            #[cfg(feature = "http1")]
+            config.alpn_protocols.push("http/1.1".into());
+        }
 
         let config = std::sync::Arc::new(config);
 

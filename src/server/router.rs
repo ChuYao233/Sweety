@@ -1,0 +1,456 @@
+//! 多站点请求路由分发
+//!
+//! `multi_site_handler` 是所有 HTTP/1.1 + HTTP/2 + HTTP/3 请求的统一入口：
+//! 1. max_connections 限流 → ACME challenge → Host 解析 → 站点匹配
+//! 2. force_https / Rewrite / Location 匹配
+//! 3. auth_request → 插件前置 → handler 分发
+//! 4. HSTS / Alt-Svc / Server 响应头注入 → 访问日志
+
+use std::sync::Arc;
+
+use sweety_web::{
+    body::ResponseBody,
+    http::{StatusCode, WebResponse, header::{CONTENT_TYPE, LOCATION, HeaderValue}},
+    WebContext,
+};
+
+use crate::config::model::HandlerType;
+use crate::middleware::access_log::AccessLogEntry;
+use super::state::{AppState, ConnGuard};
+
+/// 多站点请求分发处理器
+///
+/// 参数必须是 `&WebContext` 引用（sweety-web handler_service FromRequest 约束）
+pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebResponse {
+    use std::sync::atomic::Ordering;
+    let state = ctx.state();
+    // req_start 延迟初始化：只有当该站点配置了访问日志时才计时
+    let req_start: Option<std::time::Instant> = if state.any_access_log {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
+    // max_connections 限流：超出并发上限时返回 503
+    let _conn_guard: Option<ConnGuard> = if state.max_connections > 0 {
+        let cur = state.active_connections.fetch_add(1, Ordering::Relaxed);
+        if cur >= state.max_connections {
+            state.active_connections.fetch_sub(1, Ordering::Relaxed);
+            state.metrics.record_status(503);
+            return make_error_resp(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Some(ConnGuard(state.active_connections.clone()))
+    } else {
+        None
+    };
+
+    state.metrics.inc_requests();
+
+    // ACME HTTP-01 challenge 响应（优先于所有站点匹配）
+    {
+        let path = ctx.req().uri().path();
+        if path.len() > 25 && path.as_bytes().get(1) == Some(&b'.')
+            && path.starts_with("/.well-known/acme-challenge/")
+        {
+            if let Some(token) = path.get(28..) {
+                if let Some(entry) = crate::server::tls::ACME_HTTP01_TOKENS.get(token) {
+                    let body = entry.value().clone();
+                    let mut resp = WebResponse::new(ResponseBody::from(body));
+                    *resp.status_mut() = StatusCode::OK;
+                    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+                    return resp;
+                }
+            }
+        }
+    }
+
+    // 解析 Host 头（H2/H3 用 :authority，H1 用 Host 头）
+    let host_raw = ctx.req().uri().authority()
+        .map(|a| a.as_str())
+        .or_else(|| ctx.req().headers().get("host").and_then(|v| v.to_str().ok()))
+        .unwrap_or("");
+    let (host, host_port): (&str, Option<u16>) = if host_raw.starts_with('[') {
+        if let Some(end) = host_raw.find(']') {
+            let h = &host_raw[..=end];
+            let p = host_raw[end + 1..].strip_prefix(':').and_then(|s| s.parse().ok());
+            (h, p)
+        } else {
+            (host_raw, None)
+        }
+    } else if let Some((h, p)) = host_raw.rsplit_once(':') {
+        (h, p.parse().ok())
+    } else {
+        (host_raw, None)
+    };
+
+    let path = ctx.req().uri().path();
+    let request_uri = ctx.req().uri().path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(path);
+    let is_https = ctx.req().body().is_tls();
+
+    // HTTPS 严格匹配：无精确/通配符匹配时返回 421
+    let site = if is_https {
+        match state.registry.lookup_by_host_strict(host) {
+            Some(s) => s,
+            None => {
+                state.metrics.record_status(421);
+                return make_error_resp(StatusCode::MISDIRECTED_REQUEST);
+            }
+        }
+    } else {
+        match state.registry.lookup_by_host(host) {
+            Some(s) => s,
+            None => {
+                state.metrics.record_status(404);
+                return make_error_resp(StatusCode::NOT_FOUND);
+            }
+        }
+    };
+
+    // force_https 重定向
+    if site.force_https && !is_https {
+        let tls_port = if site.listen_tls.contains(&443) { 443 }
+                       else { site.listen_tls.first().copied().unwrap_or(443) };
+        let host_for_redirect = if tls_port == 443 { host.to_string() }
+                                else { format!("{}:{}", host, tls_port) };
+        let redirect_url = format!("https://{}{}",
+            host_for_redirect,
+            ctx.req().uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+        state.metrics.record_status(301);
+        return make_redirect_resp(&redirect_url, StatusCode::MOVED_PERMANENTLY);
+    }
+
+    // 安全检查：拦截敏感路径
+    if crate::middleware::security::is_sensitive_path(&path) {
+        state.metrics.record_status(403);
+        return make_error_resp(StatusCode::FORBIDDEN);
+    }
+
+    // Location 匹配 + Rewrite
+    let rewritten = crate::dispatcher::rewrite::apply_rewrites(&site.rewrites, &path);
+
+    if let Some(ref rp) = rewritten {
+        if let Some(rest) = rp.strip_prefix("REDIRECT:301:") {
+            return make_redirect_resp(rest, StatusCode::MOVED_PERMANENTLY);
+        }
+        if let Some(rest) = rp.strip_prefix("REDIRECT:302:") {
+            return make_redirect_resp(rest, StatusCode::FOUND);
+        }
+    }
+
+    let effective_path = rewritten.as_deref().unwrap_or(&path);
+
+    let compiled_loc = match crate::dispatcher::location::match_location(&site.locations, effective_path) {
+        Some(loc) => loc,
+        None => {
+            state.metrics.record_status(404);
+            return make_error_resp(StatusCode::NOT_FOUND);
+        }
+    };
+    let location = &compiled_loc.config;
+
+    // 请求体大小限制
+    let max_body_bytes = state.max_body_bytes;
+    if max_body_bytes > 0 {
+        if let Some(content_length) = ctx.req().headers()
+            .get(sweety_web::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            if content_length > max_body_bytes {
+                state.metrics.record_status(413);
+                return make_error_resp(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+        }
+    }
+
+    // return_url：带 URL 的 return 指令
+    if let Some(ref ret) = location.return_url {
+        let (code, url) = parse_return_directive(ret, &request_uri);
+        state.metrics.record_status(code);
+        return make_redirect_resp(&url, StatusCode::from_u16(code).unwrap_or(StatusCode::MOVED_PERMANENTLY));
+    }
+
+    // return_body：直接返回文本内容
+    if let Some(ref body_text) = location.return_body {
+        let code = location.return_code.unwrap_or(200);
+        let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+        let ct = location.return_content_type.as_deref()
+            .unwrap_or("text/plain; charset=utf-8");
+        state.metrics.record_status(code);
+        let mut resp = WebResponse::new(ResponseBody::from(body_text.clone()));
+        *resp.status_mut() = status;
+        resp.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_str(ct).unwrap_or_else(|_| HeaderValue::from_static("text/plain; charset=utf-8")),
+        );
+        return resp;
+    }
+
+    // return_code：直接返回状态码
+    if let Some(code) = location.return_code {
+        let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+        state.metrics.record_status(code);
+        let mut resp = WebResponse::new(ResponseBody::empty());
+        *resp.status_mut() = status;
+        return resp;
+    }
+
+    // per-location limit_conn
+    let _loc_conn_guard: Option<ConnGuard> = if compiled_loc.limit_conn > 0 {
+        let cur = compiled_loc.conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cur >= compiled_loc.limit_conn {
+            compiled_loc.conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            state.metrics.record_status(503);
+            return make_error_resp(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Some(ConnGuard(Arc::clone(&compiled_loc.conn_count)))
+    } else {
+        None
+    };
+
+    // auth_request 前置鉴权
+    if let Some(ref auth_url) = location.auth_request {
+        let client_ip_for_auth = ctx.req().body().socket_addr().ip().to_string();
+        match crate::handler::auth_request::check(
+            auth_url,
+            ctx.req().headers(),
+            &client_ip_for_auth,
+            &location.auth_request_headers,
+            location.auth_failure_status,
+        ).await {
+            crate::handler::auth_request::AuthResult::Allow(_auth_headers) => {}
+            crate::handler::auth_request::AuthResult::Deny(code) => {
+                state.metrics.record_status(code);
+                return make_error_resp(
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED)
+                );
+            }
+        }
+    }
+
+    // 插件 on_request 前置拦截
+    if let HandlerType::Plugin(ref plugin_name) = location.handler {
+        let method_str = ctx.req().method().as_str();
+        let body_len = ctx.req().headers()
+            .get(sweety_web::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let client_ip_str2 = ctx.req().body().socket_addr().ip().to_string();
+        let preq = crate::handler::plugin::PluginRequest {
+            method:    method_str,
+            path:      effective_path,
+            headers:   ctx.req().headers(),
+            client_ip: &client_ip_str2,
+            body_len,
+        };
+        if let Some(short_resp) = crate::handler::plugin::run_plugin_request(plugin_name, &preq) {
+            state.metrics.record_status(short_resp.status().as_u16());
+            return short_resp;
+        }
+    }
+
+    // handler 分发
+    let mut resp = match location.handler {
+        HandlerType::Static => {
+            crate::handler::static_file::handle_sweety(ctx, &site, &location).await
+        }
+        HandlerType::Fastcgi => {
+            if !location.try_files.is_empty() {
+                let root = location.root.as_ref().or(site.root.as_ref());
+                use crate::handler::static_file::TryFilesResult;
+                match crate::handler::static_file::try_files_resolve(
+                    &location.try_files, &path, root
+                ).await {
+                    TryFilesResult::File(p) => {
+                        if p.extension().and_then(|e| e.to_str()) == Some("php") {
+                            crate::handler::fastcgi::handle_sweety(ctx, &site, &location, Some(&p)).await
+                        } else {
+                            let mut static_loc = location.clone();
+                            static_loc.handler = HandlerType::Static;
+                            crate::handler::static_file::handle_sweety(ctx, &site, &static_loc).await
+                        }
+                    }
+                    TryFilesResult::Code(code) => {
+                        state.metrics.record_status(code);
+                        make_error_resp(StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND))
+                    }
+                    TryFilesResult::NotFound => {
+                        crate::handler::fastcgi::handle_sweety(ctx, &site, &location, None).await
+                    }
+                }
+            } else {
+                crate::handler::fastcgi::handle_sweety(ctx, &site, &location, None).await
+            }
+        }
+        HandlerType::Websocket => {
+            crate::handler::websocket::handle_sweety(ctx, &location).await
+        }
+        HandlerType::ReverseProxy => {
+            crate::handler::reverse_proxy::handle_sweety(ctx, &site, &location).await
+        }
+        HandlerType::Grpc => {
+            crate::handler::grpc::handle_sweety(ctx, &site, &location).await
+        }
+        HandlerType::Plugin(ref plugin_name) => {
+            let handler_ip = ctx.req().body().socket_addr().ip().to_string();
+            let hctx = crate::handler::plugin::HandlerContext {
+                method:        ctx.req().method().as_str(),
+                path:          effective_path,
+                headers:       ctx.req().headers(),
+                client_ip:     &handler_ip,
+                site_name:     &site.name,
+                location_path: &location.path,
+            };
+            if let Some(resp) = crate::handler::plugin::run_custom_handler(plugin_name, hctx).await {
+                resp
+            } else {
+                use sweety_web::body::ResponseBody;
+                let mut r = WebResponse::new(ResponseBody::none());
+                *r.status_mut() = StatusCode::OK;
+                crate::handler::plugin::run_plugin_response(plugin_name, r)
+            }
+        }
+    };
+
+    // 插件 on_response 后置处理
+    if let HandlerType::Plugin(ref plugin_name) = location.handler {
+        resp = crate::handler::plugin::run_plugin_response(plugin_name, resp);
+    }
+
+    state.metrics.record_status(resp.status().as_u16());
+
+    // error_page：自定义错误页
+    let status_u16 = resp.status().as_u16();
+    if !site.error_pages.is_empty() && (400..600).contains(&status_u16) {
+        if let Some(ep_path) = site.error_pages.get(&status_u16) {
+            if let Some(root) = location.root.as_ref().or(site.root.as_ref()) {
+                let ep_file = root.join(ep_path.trim_start_matches('/'));
+                if let Ok(content) = tokio::fs::read(&ep_file).await {
+                    let mut ep_resp = WebResponse::new(ResponseBody::from(content));
+                    *ep_resp.status_mut() = resp.status();
+                    let ext = ep_file.extension().and_then(|e| e.to_str()).unwrap_or("html");
+                    let mime = crate::middleware::cache::mime_type_for(ext);
+                    if let Ok(v) = HeaderValue::from_str(mime) {
+                        ep_resp.headers_mut().insert(CONTENT_TYPE, v);
+                    }
+                    return ep_resp;
+                }
+            }
+        }
+    }
+
+    // 注入 HSTS 响应头
+    if site.hsts_header_value.is_some() && is_https {
+        if let Some(hsts_val) = &site.hsts_header_value {
+            resp.headers_mut().insert(
+                sweety_web::http::header::HeaderName::from_static("strict-transport-security"),
+                hsts_val.clone(),
+            );
+        }
+    }
+
+    // 注入 Alt-Svc 响应头（HTTP/3 升级广播）
+    {
+        if is_https && !state.h3_ports.is_empty() {
+            let effective_port = host_port
+                .filter(|p| state.h3_ports.contains(p))
+                .or_else(|| state.h3_ports.iter().next().copied());
+            if let Some(port) = effective_port {
+                let alt_svc_val = format!("h3=\":{}\"; ma=86400", port);
+                if let Ok(v) = HeaderValue::try_from(alt_svc_val) {
+                    resp.headers_mut().insert(
+                        sweety_web::http::header::HeaderName::from_static("alt-svc"),
+                        v,
+                    );
+                }
+            }
+        }
+    }
+
+    // 统一注入 Server 和 X-Content-Type-Options 头
+    resp.headers_mut().insert(
+        sweety_web::http::header::HeaderName::from_static("server"),
+        HeaderValue::from_static("Sweety"),
+    );
+    resp.headers_mut().insert(
+        sweety_web::http::header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+
+    // 访问日志
+    if let Some(logger) = &site.access_logger {
+        let duration_ms = req_start.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
+        logger.send(AccessLogEntry {
+            client_ip: ctx.req().body().socket_addr().ip().to_string(),
+            method:    ctx.req().method().as_str().to_string(),
+            uri:       request_uri.to_string(),
+            http_version: match ctx.req().version() {
+                sweety_web::http::Version::HTTP_11 => "HTTP/1.1",
+                sweety_web::http::Version::HTTP_2  => "HTTP/2.0",
+                sweety_web::http::Version::HTTP_3  => "HTTP/3.0",
+                sweety_web::http::Version::HTTP_10 => "HTTP/1.0",
+                _                                  => "HTTP/?",
+            }.to_string(),
+            status:    resp.status().as_u16(),
+            bytes_sent: resp.headers()
+                .get(sweety_web::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0u64),
+            referer: ctx.req().headers()
+                .get(sweety_web::http::header::REFERER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string(),
+            user_agent: ctx.req().headers()
+                .get(sweety_web::http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string(),
+            duration_ms,
+            site: site.name.clone(),
+        });
+    }
+
+    resp
+}
+
+// ─────────────────────────────────────────────
+// 响应辅助函数
+// ─────────────────────────────────────────────
+
+/// 构造 HTML 错误响应（不依赖 ctx）
+#[inline(always)]
+pub(crate) fn make_error_resp(status: StatusCode) -> WebResponse {
+    let body = crate::handler::error_page::get_error_bytes(status.as_u16());
+    let mut resp = WebResponse::new(ResponseBody::from(body));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    resp
+}
+
+/// 解析 return 指令："301 https://..." 或 "https://..."（默认 301）
+fn parse_return_directive(ret: &str, request_uri: &str) -> (u16, String) {
+    let ret = ret.trim();
+    if let Some(space) = ret.find(' ') {
+        if let Ok(code) = ret[..space].parse::<u16>() {
+            let url = ret[space + 1..].trim().replace("$request_uri", request_uri);
+            return (code, url);
+        }
+    }
+    let url = ret.replace("$request_uri", request_uri);
+    (301, url)
+}
+
+/// 构造重定向响应
+fn make_redirect_resp(location: &str, status: StatusCode) -> WebResponse {
+    let mut resp = WebResponse::new(ResponseBody::empty());
+    *resp.status_mut() = status;
+    if let Ok(v) = HeaderValue::try_from(location) {
+        resp.headers_mut().insert(LOCATION, v);
+    }
+    resp
+}

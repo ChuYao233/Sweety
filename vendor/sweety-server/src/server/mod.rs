@@ -17,7 +17,7 @@ use std::{
 
 use tokio::{
     runtime::Runtime,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    sync::{Notify, mpsc::{UnboundedReceiver, UnboundedSender}},
 };
 
 use tracing::{error, info};
@@ -25,6 +25,7 @@ use crate::{builder::Builder, worker};
 
 pub struct Server {
     is_graceful_shutdown: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
     tx_cmd: UnboundedSender<Command>,
     rx_cmd: UnboundedReceiver<Command>,
     rt: Option<Runtime>,
@@ -106,6 +107,8 @@ impl Server {
 
         let is_graceful_shutdown = Arc::new(AtomicBool::new(false));
         let is_graceful_shutdown2 = is_graceful_shutdown.clone();
+        let stop_notify  = Arc::new(Notify::new());
+        let stop_notify2 = stop_notify.clone();
 
         // on_worker_start / factories / shutdown 需要跨多个 worker 线程共享，用 Arc 包装
         let on_worker_start = Arc::new(on_worker_start);
@@ -126,6 +129,7 @@ impl Server {
                         let factories          = Arc::clone(&factories);
                         let on_worker_start    = Arc::clone(&on_worker_start);
                         let is_graceful_shutdown = Arc::clone(&is_graceful_shutdown);
+                        let stop_notify = Arc::clone(&stop_notify2);
 
                         let task = move || async move {
                             on_worker_start().await;
@@ -168,7 +172,7 @@ impl Server {
                                 }
                             }
 
-                            worker::wait_for_stop(handles, services, shutdown_timeout, &is_graceful_shutdown).await;
+                            worker::wait_for_stop(handles, services, shutdown_timeout, &is_graceful_shutdown, stop_notify).await;
                         };
 
                         #[cfg(not(feature = "io-uring"))]
@@ -201,6 +205,7 @@ impl Server {
 
         Ok(Self {
             is_graceful_shutdown,
+            stop_notify,
             tx_cmd,
             rx_cmd,
             rt: Some(rt),
@@ -211,6 +216,8 @@ impl Server {
     pub(crate) fn stop(&mut self, graceful: bool) {
         if let Some(rt) = self.rt.take() {
             self.is_graceful_shutdown.store(graceful, Ordering::SeqCst);
+            // 通知所有 worker GracefulStop 信号（事件驱动，零 CPU 开销）
+            self.stop_notify.notify_waiters();
             rt.shutdown_background();
             if !graceful {
                 // ForceStop（Ctrl+C/SIGINT）：accept 循环无停止机制，join 会永久阻塞

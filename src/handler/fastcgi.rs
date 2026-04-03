@@ -22,7 +22,7 @@ use crate::server::http::AppState;
 mod proto;
 mod response;
 
-use response::{FcgiParsedHeaders, fcgi_send_and_read_headers, build_streaming_response, make_complete_response};
+use response::{fcgi_send_and_read_headers, build_streaming_response};
 
 // ─────────────────────────────────────────────
 // 主处理函数

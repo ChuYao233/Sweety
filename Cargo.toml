@@ -1,7 +1,6 @@
 ﻿[workspace]
 members = [
     ".",
-    "crates/sweety-http",
 ]
 exclude = [
     "vendor/sweety-collection",

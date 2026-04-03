@@ -2,9 +2,9 @@
 
 use core::{any::Any, sync::atomic::AtomicBool, time::Duration};
 
-use std::{io, rc::Rc, thread};
+use std::{io, rc::Rc, sync::Arc, thread};
 
-use tokio::{task::JoinHandle, time::sleep};
+use tokio::{sync::Notify, task::JoinHandle, time::sleep};
 use tracing::{error, info};
 use sweety_io_compat::net::Stream;
 use sweety_service::{Service, ready::ReadyService};
@@ -91,15 +91,22 @@ pub(crate) async fn wait_for_stop(
     services: Vec<ServiceAny>,
     shutdown_timeout: Duration,
     is_graceful_shutdown: &AtomicBool,
+    stop_notify: Arc<Notify>,
 ) {
     with_worker_name_str(|name| info!("Started {name}"));
 
     let shutdown_handle = ShutdownHandle::new(shutdown_timeout, services, is_graceful_shutdown);
 
+    // 事件驱动等待停止信号（Server::stop 调用 notify_waiters 唤醒）
+    // ForceStop 路径直接 process::exit(0)，不会到达这里
+    stop_notify.notified().await;
+
+    // 收到 GracefulStop：abort accept loop（不再接受新连接），然后排空活跃连接
+    for handle in &handles {
+        handle.abort();
+    }
     for handle in handles {
-        handle
-            .await
-            .unwrap_or_else(|e| with_worker_name_str(|name| error!("{name} exit on error: {e}")));
+        let _ = handle.await; // 忽略 JoinError::Cancelled
     }
 
     shutdown_handle.shutdown().await;

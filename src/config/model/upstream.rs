@@ -193,6 +193,39 @@ pub struct FastCgiConfig {
     pub cache: Option<FastCgiCacheConfig>,
 }
 
+impl Default for FastCgiConfig {
+    fn default() -> Self {
+        Self {
+            socket: None,
+            host: None,
+            port: None,
+            pool_size: default_pool_size(),
+            connect_timeout: default_connect_timeout(),
+            read_timeout: default_read_timeout(),
+            cache: None,
+        }
+    }
+}
+
+impl FastCgiConfig {
+    /// 从地址字符串快速构建（以 '/' 开头视为 Unix socket，否则视为 host:port）
+    ///
+    /// 供 `php_fastcgi = "/tmp/php.sock"` 语法糖展开使用
+    pub fn from_addr(addr: &str) -> Self {
+        if addr.starts_with('/') {
+            Self { socket: Some(std::path::PathBuf::from(addr)), ..Self::default() }
+        } else {
+            // 取最后一个 ':' 分割 host 和 port
+            let (host, port) = if let Some(pos) = addr.rfind(':') {
+                (&addr[..pos], addr[pos+1..].parse::<u16>().unwrap_or(9000))
+            } else {
+                (addr, 9000u16)
+            };
+            Self { host: Some(host.to_string()), port: Some(port), ..Self::default() }
+        }
+    }
+}
+
 /// FastCGI 响应缓存配置（对标 Nginx fastcgi_cache）
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FastCgiCacheConfig {

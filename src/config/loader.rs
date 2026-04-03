@@ -4,6 +4,7 @@
 use std::path::Path;
 use anyhow::{Context, Result, bail};
 
+use super::expand::expand_config;
 use super::model::AppConfig;
 
 /// 返回默认配置文件路径（环境变量 SWEETY_CONFIG > 默认 config/sweety.toml）
@@ -59,6 +60,8 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
         other => bail!("不支持的配置文件格式: .{}（支持 .toml / .json / .yaml / .yml）", other),
     };
 
+    let mut cfg = cfg;
+    expand_config(&mut cfg);
     validate_config(&cfg)?;
     Ok(cfg)
 }

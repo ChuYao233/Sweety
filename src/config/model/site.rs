@@ -120,6 +120,44 @@ pub struct SiteConfig {
     /// 反代响应缓存配置（等价 Nginx proxy_cache）
     #[serde(default)]
     pub proxy_cache: Option<ProxyCacheConfig>,
+
+    // ─── 开箱即用语法糖（Caddy 风格，加载时自动展开） ───────────────────────
+
+    /// 内置应用预设，自动生成对应 location 规则
+    ///
+    /// 可用值：`wordpress` / `laravel` / `static`
+    /// 若已手动配置 `[[sites.locations]]`，preset 不覆盖（手动优先）
+    ///
+    /// ```toml
+    /// preset = "wordpress"
+    /// ```
+    #[serde(default)]
+    pub preset: Option<crate::config::preset::SitePreset>,
+
+    /// PHP FastCGI 快捷字段（Unix socket 路径或 host:port）
+    ///
+    /// 等同完整 `[sites.fastcgi]` 块，pool_size/timeout 使用默认値。
+    /// 若已配置 `[sites.fastcgi]`，此字段被忽略。
+    ///
+    /// ```toml
+    /// php_fastcgi = "/tmp/php-cgi-82.sock"
+    /// php_fastcgi = "127.0.0.1:9000"
+    /// ```
+    #[serde(default)]
+    pub php_fastcgi: Option<String>,
+
+    /// ACME 自动 HTTPS 快捷字段
+    ///
+    /// 配置此字段后，无需再写完整的 `[sites.tls]` 块，
+    /// expand 阶段会自动启用 ACME 并使用 Let's Encrypt 申请证书。
+    /// 若已配置 `[sites.tls]`，此字段被忽略。
+    ///
+    /// ```toml
+    /// listen_tls  = [443]
+    /// acme_email  = "your@example.com"
+    /// ```
+    #[serde(default)]
+    pub acme_email: Option<String>,
 }
 
 fn default_hsts_max_age() -> u64 { 31_536_000 }

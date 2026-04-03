@@ -19,8 +19,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
-/// per-thread 连接池存储：key = "tcp:addr" 或 "tls:addr"
-/// 使用 thread_local! 完全消除跨 worker 的锁竞争，等价 Nginx per-worker keepalive
+// per-thread 连接池存储：key = "tcp:addr" 或 "tls:addr"
+// 使用 thread_local! 完全消除跨 worker 的锁竞争，等价 Nginx per-worker keepalive
 thread_local! {
     static PER_THREAD_POOL: RefCell<HashMap<String, NodePool>> = RefCell::default();
 }

@@ -1,7 +1,7 @@
-#[cfg(any(feature = "http2", feature = "http3"))]
+#[cfg(all(feature = "http2", feature = "io-uring"))]
 pub(crate) use queue::*;
 
-#[cfg(any(feature = "http2", feature = "http3"))]
+#[cfg(all(feature = "http2", feature = "io-uring"))]
 mod queue {
     use futures_util::stream::{FuturesUnordered, StreamExt};
 

@@ -14,7 +14,7 @@ use rustls::ServerConfig;
 use rustls_pemfile::Item;
 use tracing::{error, info, warn};
 
-use crate::config::model::{AppConfig, SiteConfig, TlsConfig};
+use crate::config::model::{SiteConfig, TlsConfig};
 
 pub use sni_resolver::SniResolver;
 

@@ -1,0 +1,130 @@
+//! `sweety start` / `sweety stop` —— daemon 进程管理
+//!
+//! Unix：fork 子进程 + setsid 脱离终端，写 PID 文件
+//! Windows：spawn detached 进程，写 PID 文件
+
+use std::path::PathBuf;
+
+use crate::util::{init_stderr_log, load_cfg_or_exit};
+
+/// 后台启动 Sweety（daemon 模式）
+pub fn cmd_start(config: &PathBuf, pid_file: &PathBuf) {
+    init_stderr_log();
+    let _cfg = load_cfg_or_exit(config);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().unwrap_or_else(|_| "sweety".into());
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("run")
+           .arg("--config").arg(config)
+           .arg("--pid-file").arg(pid_file)
+           .stdin(std::process::Stdio::null())
+           .stdout(std::process::Stdio::null())
+           .stderr(std::process::Stdio::null());
+        unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                if let Some(parent) = pid_file.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(pid_file, pid.to_string()) {
+                    eprintln!("[WARN] 写 PID 文件失败 {}: {}", pid_file.display(), e);
+                }
+                println!("Sweety started (PID {})", pid);
+                println!("PID file: {}", pid_file.display());
+            }
+            Err(e) => {
+                eprintln!("[ERROR] 启动失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        let exe = std::env::current_exe().unwrap_or_else(|_| "sweety.exe".into());
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("run")
+           .arg("--config").arg(config)
+           .arg("--pid-file").arg(pid_file)
+           .stdin(std::process::Stdio::null())
+           .stdout(std::process::Stdio::null())
+           .stderr(std::process::Stdio::null())
+           .creation_flags(DETACHED_PROCESS);
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                if let Err(e) = std::fs::write(pid_file, pid.to_string()) {
+                    eprintln!("[WARN] 写 PID 文件失败: {}", e);
+                }
+                println!("Sweety started (PID {})", pid);
+            }
+            Err(e) => {
+                eprintln!("[ERROR] 启动失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// 停止后台运行的 Sweety（读取 PID 文件，发送 SIGTERM / taskkill）
+pub fn cmd_stop(pid_file: &PathBuf) {
+    let pid_str = match std::fs::read_to_string(pid_file) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => {
+            eprintln!("[ERROR] 找不到 PID 文件: {}，Sweety 可能未在运行", pid_file.display());
+            std::process::exit(1);
+        }
+    };
+    let pid: u32 = match pid_str.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("[ERROR] PID 文件内容无效: {}", pid_str);
+            std::process::exit(1);
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if ret == 0 {
+            let _ = std::fs::remove_file(pid_file);
+            println!("Sweety stopped (PID {})", pid);
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                eprintln!("[WARN] 进程 {} 不存在，可能已停止", pid);
+                let _ = std::fs::remove_file(pid_file);
+            } else {
+                eprintln!("[ERROR] 发送 SIGTERM 失败: {}", err);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                let _ = std::fs::remove_file(pid_file);
+                println!("Sweety stopped (PID {})", pid);
+            }
+            Ok(_) => {
+                eprintln!("[WARN] 进程 {} 可能已停止", pid);
+                let _ = std::fs::remove_file(pid_file);
+            }
+            Err(e) => {
+                eprintln!("[ERROR] taskkill 失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}

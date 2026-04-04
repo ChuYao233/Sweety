@@ -15,6 +15,8 @@
 - TLS：rustls 纯 Rust，多证书 SNI 自动路由，TLS session cache（65536 entries）
 - ACME HTTP-01 自动证书（Let's Encrypt / ZeroSSL / Buypass / LiteSSL）
 - ACME DNS-01 通配符证书（Cloudflare / 阿里云 / Shell 自定义）(`69224f0`)
+- ACME SAN 多域名证书：单站点多 `server_name` 自动签发一张 SAN 证书
+- ACME 即时续期 API：`POST /api/certs/acme/renew`，后台异步执行，失败不影响当前证书
 - ACME 自签名占位启动：证书未就绪时自动生成占位证书，申请成功后热重载 (`ce644ad`)
 - QUIC 0-RTT（TLS Early Data）：`enable_0rtt` 配置项，首请求免握手 (`4667260`)
 
@@ -63,8 +65,10 @@
 ### 运维
 - 配置热重载：不断开现有连接（等价 nginx -s reload）
 - 访问日志：combined / json / 自定义模板，异步写 (`d830ba7`)
-- Admin REST API 基础框架：health / version / stats / plugins / doc (`71d885c`)（站点管理、节点控制、API 热重载、WebSocket 推送计划 v0.5）
-- Prometheus `/metrics` 端点（计划 v0.5）
+- Admin REST API（Caddy Admin API 超集）：配置树 CRUD、@id 节点直达、TOML→JSON 适配器、站点管理、上游节点控制（enable/disable/weight）、证书管理、缓存管理、日志级别热切换、插件列表、API 文档端点、CORS 支持
+- Prometheus `/metrics` 端点：text/plain 格式，支持 requests / errors / bytes_sent / active_requests / ws_connections
+- PROXY protocol v1/v2：接收端解析 LB/CDN 真实 IP + 发送端透传（`proxy_protocol` / `send_proxy_protocol`）
+- Unix socket 上游：`addr = "unix:/path"` TCP 和 gRPC 均支持，同机通信延迟低 10-30%
 - Daemon 模式：start / stop / restart / PID 文件 (`5c1e836`)
 - 配置验证：sweety validate（等价 nginx -t）(`71d885c`)
 - 多格式配置：TOML / JSON / YAML 自动识别
@@ -94,11 +98,9 @@
 
 | 功能 | 对应 Nginx | 说明 |
 |------|-----------|------|
-| Admin API v0.5 完善 | — | 站点管理、上游节点控制、API 热重载、WebSocket 实时推送、Prometheus `/metrics` 拉取端点 |
-| PROXY protocol v1/v2 | `proxy_protocol` | 接收端：解析 LB/CDN 发来的真实客户端 IP；发送端：向上游传递客户端 IP。生产部署必备（AWS NLB / Cloudflare / HAProxy） |
-| Unix socket 上游 | `proxy_pass unix:/path` | 反向代理和 gRPC 支持 Unix domain socket 上游，同机通信比 loopback TCP 延迟低 10-30% |
 | TCP/UDP 四层代理 | `stream {}` 模块 | 纯字节转发，无协议解析，支持数据库/SSH/任意 TCP 代理 |
 | `mirror` 请求镜像 | `mirror` 指令 | 流量异步复制到镜像上游（灰度测试 / 影子流量） |
+| Admin WebSocket 实时推送 | — | 管理 API 实时事件推送（上游状态变化、证书续期通知等） |
 
 ### 中优先级
 
@@ -114,7 +116,7 @@
 | 功能 | 说明 |
 |------|------|
 | `map` 变量 | 配置层变量映射 |
-| Prometheus 指标主动推送 | 拉取端点完成后，增加 push gateway 支持 |
+| Prometheus 指标主动推送 | 拉取端点已完成，增加 push gateway 支持 |
 | 配置 Web UI | 可选的图形化配置界面 |
 
 ---
@@ -145,4 +147,4 @@
 
 ---
 
-*最后更新：2026-04-04*
+*最后更新：2026-04-05*

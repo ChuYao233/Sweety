@@ -86,19 +86,20 @@ prometheus_path    = "/metrics"    # 挂载在 admin_listen 上
 
 ### Admin API
 
-配置 `admin_listen` 后可使用 REST API（`/api/v1/*`）：
+配置 `admin_listen` 后启用完整的 REST 管理 API，对标 Caddy Admin API 全部功能并扩展更多端点：
 
-**已实现：**
-- `GET /api/v1/health` — 健康检查
-- `GET /api/v1/version` — 版本信息
-- `GET /api/v1/stats` — 全局请求统计快照
-- `GET /api/v1/plugins` — 已注册插件列表
-- `GET /api/v1/doc` — API 文档（JSON）
-- Bearer Token 鉴权
+- **配置树 CRUD**：`GET/POST/PUT/PATCH/DELETE /config/[path]` — 运行时增删改查任意配置
+- **整体热加载**：`POST /load` — 失败自动回滚
+- **持久化控制**：默认仅改运行时，`?save=true` 同时写入配置文件
+- **显式保存**：`POST /config/save` — 随时将运行配置保存到磁盘
+- **从磁盘重载**：`POST /config/reload` — 等价 `sweety reload`
+- **@id 直达**：`GET /id/:id` — 通过 `@id` 字段定位配置节点
+- **配置适配**：`POST /adapt` — TOML → JSON 转换
+- **上游状态**：`GET /reverse_proxy/upstreams` — Caddy 兼容格式
+- **Prometheus**：`GET /metrics` — text/plain 原生格式
+- **站点 / 上游 / 证书 / 缓存 / 日志 / 插件**管理端点
+- Bearer Token 鉴权 + CORS
 
-**v0.5 计划：**
-- 站点管理、上游节点控制、API 热重载
-- WebSocket 实时统计推送
-- Prometheus `/metrics` 端点
+详细文档：[管理 API](admin-api.md)
 
 安全建议：只监听 `127.0.0.1`，**不要暴露到公网**。

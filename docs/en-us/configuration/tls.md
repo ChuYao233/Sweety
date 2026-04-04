@@ -67,6 +67,43 @@ initial_rtt_ms               = 333
 max_ack_delay_ms             = 25
 ```
 
+## ACME Multi-Domain SAN Certificates
+
+When a site has multiple `server_name` entries, ACME automatically issues a single **SAN certificate** covering all domains — no extra configuration needed:
+
+```toml
+[[sites]]
+name        = "my-site"
+server_name = ["example.com", "www.example.com", "api.example.com"]
+listen      = [80]
+listen_tls  = [443]
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+# → Automatically issues one SAN certificate for all 3 domains
+```
+
+- Certificate file is named after the first non-wildcard domain (e.g. `example.com.crt`)
+- Auto-renewal check runs every 12 hours (renews 30 days before expiry)
+- Renewal failure does not affect the current certificate — only logged
+
+## ACME Instant Renewal
+
+Trigger certificate renewal immediately via the Admin API (without waiting for the auto-check cycle):
+
+```bash
+# Renew all ACME sites
+curl -X POST http://127.0.0.1:9099/api/certs/acme/renew \
+  -H "Authorization: Bearer $TOKEN"
+
+# Renew a specific site only
+curl -X POST "http://127.0.0.1:9099/api/certs/acme/renew?site=my-site" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Returns 202 Accepted — renewal runs asynchronously in the background. See [Admin API](./admin-api.md) for details.
+
 ## ACME DNS-01 Validation (Wildcard Certificates)
 
 DNS-01 validation can issue `*.example.com` wildcard certificates:

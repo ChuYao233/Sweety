@@ -15,6 +15,8 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 - TLS: rustls pure Rust, multi-cert SNI auto-routing, TLS session cache (65536 entries)
 - ACME HTTP-01 auto-certificates (Let's Encrypt / ZeroSSL / Buypass / LiteSSL)
 - ACME DNS-01 wildcard certificates (Cloudflare / Aliyun / Shell custom) (`69224f0`)
+- ACME SAN multi-domain certificates: multiple `server_name` entries auto-issue a single SAN cert
+- ACME instant renewal API: `POST /api/certs/acme/renew`, async background execution, failure keeps current cert
 - ACME self-signed placeholder on startup: auto-generates placeholder cert, hot-reloads on issuance (`ce644ad`)
 - QUIC 0-RTT (TLS Early Data): `enable_0rtt` config option, zero-RTT first request (`4667260`)
 
@@ -63,8 +65,10 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 ### Operations
 - Config hot reload: no connection drops (equivalent to nginx -s reload)
 - Access logs: combined / json / custom template, async writer (`d830ba7`)
-- Admin REST API foundation: health / version / stats / plugins / doc (`71d885c`) (site management, node control, API hot reload, WebSocket push planned for v0.5)
-- Prometheus `/metrics` endpoint (planned for v0.5)
+- Admin REST API (Caddy Admin API superset): config tree CRUD, @id node access, TOML→JSON adapter, site management, upstream node control (enable/disable/weight), cert management, cache management, log level toggle, plugin list, API doc endpoint, CORS support
+- Prometheus `/metrics` endpoint: text/plain format, requests / errors / bytes_sent / active_requests / ws_connections
+- PROXY protocol v1/v2: receive-side real IP parsing from LB/CDN + send-side forwarding (`proxy_protocol` / `send_proxy_protocol`)
+- Unix socket upstream: `addr = "unix:/path"` for both TCP and gRPC, 10-30% lower latency for same-host
 - Daemon mode: start / stop / restart / PID file (`5c1e836`)
 - Config validation: sweety validate (equivalent to nginx -t) (`71d885c`)
 - Multi-format config: TOML / JSON / YAML auto-detection
@@ -94,11 +98,9 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 
 | Feature | Nginx Equivalent | Description |
 |---------|-----------------|-------------|
-| Admin API v0.5 completion | — | Site management, upstream node control, API hot reload, WebSocket real-time push, Prometheus `/metrics` pull endpoint |
-| PROXY protocol v1/v2 | `proxy_protocol` | Receive: parse real client IP from LB/CDN; Send: pass client IP to upstream. Essential for production (AWS NLB / Cloudflare / HAProxy) |
-| Unix socket upstream | `proxy_pass unix:/path` | Reverse proxy and gRPC over Unix domain socket, 10-30% lower latency than loopback TCP for same-host communication |
 | TCP/UDP L4 proxy | `stream {}` module | Raw byte forwarding, no protocol parsing, supports database/SSH/any TCP proxy |
 | `mirror` request mirroring | `mirror` directive | Async traffic duplication to mirror upstream (canary testing / shadow traffic) |
+| Admin WebSocket real-time push | — | Admin API real-time event push (upstream status changes, cert renewal notifications, etc.) |
 
 ### Medium Priority
 
@@ -114,7 +116,7 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 | Feature | Description |
 |---------|-------------|
 | `map` variables | Config-level variable mapping |
-| Prometheus push | After pull endpoint is done, add push gateway support |
+| Prometheus push | Pull endpoint completed, add push gateway support |
 | Config Web UI | Optional graphical configuration interface |
 
 ---
@@ -145,4 +147,4 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 
 ---
 
-*Last updated: 2026-04-04*
+*Last updated: 2026-04-05*

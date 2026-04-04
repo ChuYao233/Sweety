@@ -67,6 +67,43 @@ initial_rtt_ms               = 333
 max_ack_delay_ms             = 25
 ```
 
+## ACME 多域名 SAN 证书
+
+当一个站点配置了多个 `server_name` 时，ACME 自动签发一张 **SAN 证书**覆盖所有域名，无需额外配置：
+
+```toml
+[[sites]]
+name        = "my-site"
+server_name = ["example.com", "www.example.com", "api.example.com"]
+listen      = [80]
+listen_tls  = [443]
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+# → 自动签发一张包含 3 个域名的 SAN 证书
+```
+
+- 证书文件以第一个非通配符域名命名（如 `example.com.crt`）
+- 每 12 小时自动检查续期（到期前 30 天续期）
+- 续期失败不影响当前证书，仅记录日志
+
+## ACME 即时续期
+
+通过 Admin API 可立即触发证书续期（不等待自动检查周期）：
+
+```bash
+# 续期所有 ACME 站点
+curl -X POST http://127.0.0.1:9099/api/certs/acme/renew \
+  -H "Authorization: Bearer $TOKEN"
+
+# 仅续期指定站点
+curl -X POST "http://127.0.0.1:9099/api/certs/acme/renew?site=my-site" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+返回 202 Accepted，续期在后台异步执行。详见 [管理 API](./admin-api.md)。
+
 ## ACME DNS-01 验证（通配符证书）
 
 DNS-01 验证可申请 `*.example.com` 通配符证书：

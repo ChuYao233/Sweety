@@ -28,6 +28,7 @@ function sidebarZh(): DefaultTheme.SidebarItem[] {
         { text: '缓存', link: '/configuration/cache' },
         { text: '速率限制', link: '/configuration/rate-limit' },
         { text: '内置预设', link: '/configuration/presets' },
+        { text: '管理 API', link: '/configuration/admin-api' },
       ],
     },
     {
@@ -78,6 +79,7 @@ function sidebarEn(): DefaultTheme.SidebarItem[] {
         { text: 'Cache', link: '/en-us/configuration/cache' },
         { text: 'Rate Limiting', link: '/en-us/configuration/rate-limit' },
         { text: 'Presets', link: '/en-us/configuration/presets' },
+        { text: 'Admin API', link: '/en-us/configuration/admin-api' },
       ],
     },
     {

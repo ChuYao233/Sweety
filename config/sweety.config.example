@@ -56,12 +56,25 @@ gzip_min_length = 1
 # Equivalent to Nginx: gzip_comp_level
 gzip_comp_level = 5
 
-# Admin API listen address (empty = disabled)
-# Example: "127.0.0.1:9090"
+# ─── Admin API ─────────────────────────────────────────────────────
+# Full-featured REST API (Caddy Admin API superset)
+# Includes: config tree CRUD, hot-reload, @id lookup, TOML→JSON adapter,
+#           upstream control, cert/cache/log management, Prometheus metrics
+# See docs: docs/configuration/admin-api.md
+#
+# Key endpoints:
+#   GET  /metrics                    — Prometheus text/plain metrics
+#   GET  /api/stats                  — JSON stats snapshot
+#   GET  /api/system                 — System info (uptime, workers, connections)
+#   POST /api/certs/acme/renew       — Instant ACME certificate renewal
+#   POST /config/reload              — Hot-reload config from disk
+#
+# Listen address (empty = disabled). Security: bind 127.0.0.1 only!
 admin_listen = ""
-
-# Admin API Bearer token for authentication
+# Bearer token for authentication (empty = no auth)
 admin_token = ""
+# Config changes are runtime-only by default.
+# Append ?save=true to write operations, or POST /config/save to persist.
 
 # Global error log path
 # error_log = "/var/log/sweety/error.log"
@@ -152,11 +165,15 @@ key  = "/etc/ssl/private/example.com.key"
 # key  = "/etc/ssl/private/rsa.key"
 
 # ACME automatic certificate
+# When a site has multiple server_name entries, ACME issues a single SAN certificate
+# covering ALL domains automatically (e.g. example.com + www.example.com in one cert).
+# Certificate file is named after the first non-wildcard domain.
 # acme = true
 # acme_email = "admin@example.com"
 # acme_provider = "letsencrypt"    # letsencrypt / zerossl / buypass / litessl / custom URL
 # acme_challenge = "http01"        # http01 / dns01
 # acme_renew_days_before = 30
+# Instant renewal via Admin API: POST /api/certs/acme/renew[?site=name]
 
 # DNS provider for dns01 challenge
 # [sites.tls.dns_provider]

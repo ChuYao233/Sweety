@@ -1,7 +1,7 @@
 # Sweety
 
 [![GitHub release](https://img.shields.io/github/v/tag/ChuYao233/Sweety)](https://github.com/ChuYao233/Sweety/releases)
-[![GitHub](https://img.shields.io/github/license/ChuYao233/Sweety)](https://github.com/ChuYao233/Sweety/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/ChuYao233/Sweety/blob/main/LICENSE)
 [![GitHub last commit](https://img.shields.io/github/last-commit/ChuYao233/Sweety)](https://github.com/ChuYao233/Sweety/commits/main)
 [![GitHub issues](https://img.shields.io/github/issues/ChuYao233/Sweety)](https://github.com/ChuYao233/Sweety/issues)
 

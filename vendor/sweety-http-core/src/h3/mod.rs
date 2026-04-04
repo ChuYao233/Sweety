@@ -7,6 +7,7 @@ mod proto;
 mod service;
 
 pub(crate) use self::proto::Dispatcher;
+pub(crate) use self::service::detect_max_h3_handlers;
 
 pub use self::body::RequestBody;
 pub use self::builder::H3ServiceBuilder;

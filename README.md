@@ -54,9 +54,9 @@ The underlying HTTP stack is forked from [xitca-web](https://github.com/HFQR/xit
 
 ### Operations
 
-- 🖥️ **Admin REST API** — health checks / stats / node management / hot reload
+- 🖥️ **Admin REST API** — health / version / stats / plugins (`/api/v1/*`); site management, node control, WebSocket push planned for v0.5
 - 📝 **Access Logs** — combined / JSON / custom template, async writer
-- 📊 **Prometheus Metrics** — `/metrics` endpoint built-in
+- 📊 **Prometheus Metrics** — `/metrics` endpoint (planned for v0.5)
 
 ---
 
@@ -132,7 +132,7 @@ For a complete configuration reference with all options, see [config/sweety.conf
 | FastCGI Response Cache | ✅ | ✅ | ❌ | ✅ |
 | Static File Memory Cache | ✅ | ✅ OS page cache | ❌ | ✅ |
 | Config Simplicity | ✅ Presets + sugar | ❌ Manual | ✅ Caddyfile | ⚠️ Verbose |
-| Admin REST API | ✅ | ❌ | ✅ | ❌ |
+| Admin REST API | ⚠️ Partial (v0.5) | ❌ | ✅ | ❌ |
 | Single Binary, No Deps | ✅ | ❌ | ✅ | ❌ |
 | Memory Safety | ✅ Rust | ❌ C | ✅ Go | ❌ C |
 | `if` / `map` Conditionals | ❌ | ✅ | ⚠️ Limited | ✅ mod_rewrite |

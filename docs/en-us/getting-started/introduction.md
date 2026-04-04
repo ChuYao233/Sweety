@@ -40,8 +40,8 @@ Sweety is a high-performance, multi-site web server written in Rust, aiming to c
 - **Hot Reload**: `sweety reload` reloads config without dropping connections
 - **Daemon Mode**: `sweety start/stop/restart`
 - **Config Validation**: `sweety validate` (equivalent to `nginx -t`)
-- **Prometheus Metrics**: Built-in `/metrics` endpoint
-- **Admin REST API**: Runtime status queries
+- **Prometheus Metrics**: `/metrics` endpoint (planned for v0.5)
+- **Admin REST API**: health / stats / plugins available (`/api/v1/*`); site management and node control planned for v0.5
 
 ## Comparison with Alternatives
 

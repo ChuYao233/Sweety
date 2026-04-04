@@ -40,8 +40,8 @@ Sweety 是用 Rust 编写的高性能多站点 Web 服务器，目标是兼顾 *
 - **热重载**：`sweety reload` 不断开连接重载配置
 - **Daemon 模式**：`sweety start/stop/restart`
 - **配置校验**：`sweety validate`（等价 `nginx -t`）
-- **Prometheus 指标**：内置 `/metrics` 端点
-- **Admin REST API**：运行时查询状态
+- **Prometheus 指标**：`/metrics` 端点（v0.5 计划）
+- **Admin REST API**：health / stats / plugins 已可用（`/api/v1/*`），站点管理和节点控制 v0.5 计划
 
 ## 与同类产品对比
 

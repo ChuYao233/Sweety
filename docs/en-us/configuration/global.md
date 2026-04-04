@@ -86,9 +86,19 @@ prometheus_path    = "/metrics"    # Mounted on admin_listen
 
 ### Admin API
 
-After configuring `admin_listen`, the following features become available:
-- `sweety reload` (hot reload)
+After configuring `admin_listen`, the REST API (`/api/v1/*`) becomes available:
+
+**Implemented:**
+- `GET /api/v1/health` — Health check
+- `GET /api/v1/version` — Version info
+- `GET /api/v1/stats` — Global request statistics snapshot
+- `GET /api/v1/plugins` — Registered plugin list
+- `GET /api/v1/doc` — API documentation (JSON)
+- Bearer Token authentication
+
+**Planned for v0.5:**
+- Site management, upstream node control, API hot reload
+- WebSocket real-time stats push
 - Prometheus `/metrics` endpoint
-- REST API for querying site status
 
 Security recommendation: Only listen on `127.0.0.1`, **never expose to the public internet**.

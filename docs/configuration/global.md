@@ -86,9 +86,19 @@ prometheus_path    = "/metrics"    # 挂载在 admin_listen 上
 
 ### Admin API
 
-配置 `admin_listen` 后可使用以下功能：
-- `sweety reload`（热重载）
+配置 `admin_listen` 后可使用 REST API（`/api/v1/*`）：
+
+**已实现：**
+- `GET /api/v1/health` — 健康检查
+- `GET /api/v1/version` — 版本信息
+- `GET /api/v1/stats` — 全局请求统计快照
+- `GET /api/v1/plugins` — 已注册插件列表
+- `GET /api/v1/doc` — API 文档（JSON）
+- Bearer Token 鉴权
+
+**v0.5 计划：**
+- 站点管理、上游节点控制、API 热重载
+- WebSocket 实时统计推送
 - Prometheus `/metrics` 端点
-- REST API 查询站点状态
 
 安全建议：只监听 `127.0.0.1`，**不要暴露到公网**。

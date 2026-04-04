@@ -156,33 +156,30 @@ admin_token  = "your-secret-token"
 
 ### Authentication
 
-All API requests require a Bearer Token:
+Endpoints requiring auth must include a Bearer Token:
 
 ```bash
-curl -H "Authorization: Bearer your-secret-token" http://127.0.0.1:9099/api/status
+curl -H "Authorization: Bearer your-secret-token" http://127.0.0.1:9099/api/v1/stats
 ```
 
-### Main Endpoints
+### Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/status` | Server status (version, uptime, connections) |
-| `GET` | `/api/sites` | All site config summaries |
-| `POST` | `/api/reload` | Trigger hot reload (equivalent to `sweety reload`) |
-| `GET` | `/metrics` | Prometheus metrics (no auth required) |
+| Method | Path | Auth | Status | Description |
+|--------|------|------|--------|-------------|
+| `GET` | `/api/v1/health` | No | ✅ | Health check |
+| `GET` | `/api/v1/version` | No | ✅ | Version info |
+| `GET` | `/api/v1/stats` | Yes | ✅ | Global request statistics snapshot |
+| `GET` | `/api/v1/plugins` | Yes | ✅ | Registered plugin list |
+| `GET` | `/api/v1/doc` | No | ✅ | API documentation (JSON) |
+| `GET` | `/api/v1/sites` | Yes | ⚠️ Stub | Site list (full in v0.5) |
+| `POST` | `/api/v1/reload` | Yes | 🚧 Planned | Hot reload (v0.5) |
+| `GET` | `/api/v1/upstreams` | Yes | 🚧 Planned | Upstream nodes & circuit breaker status (v0.5) |
+| `POST` | `/api/v1/upstreams/:name/nodes/:addr/enable` | Yes | 🚧 Planned | Enable node (v0.5) |
+| `POST` | `/api/v1/upstreams/:name/nodes/:addr/disable` | Yes | 🚧 Planned | Disable node (v0.5) |
+| — | WebSocket `/api/v1/stats/stream` | — | 🚧 Planned | Real-time stats push (v0.5) |
+| `GET` | `/metrics` | — | 🚧 Planned | Prometheus metrics endpoint (v0.5) |
 
-### Prometheus Metrics
-
-```bash
-curl http://127.0.0.1:9099/metrics
-```
-
-Metrics include:
-- `sweety_requests_total` — Total requests (by site, status code)
-- `sweety_active_connections` — Active connections
-- `sweety_request_duration_seconds` — Request duration distribution
-- `sweety_upstream_errors_total` — Upstream errors
-- `sweety_cache_hits_total` — Cache hits
+> ⚠️ `sweety reload` currently uses system signals for hot reload, not the Admin API. `POST /api/v1/reload` is not yet implemented.
 
 ---
 

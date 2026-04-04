@@ -63,8 +63,8 @@
 ### 运维
 - 配置热重载：不断开现有连接（等价 nginx -s reload）
 - 访问日志：combined / json / 自定义模板，异步写 (`d830ba7`)
-- Admin REST API：健康检查 / 统计 / 节点管理 / 热重载 (`71d885c`)
-- Prometheus `/metrics` 端点
+- Admin REST API 基础框架：health / version / stats / plugins / doc (`71d885c`)（站点管理、节点控制、API 热重载、WebSocket 推送计划 v0.5）
+- Prometheus `/metrics` 端点（计划 v0.5）
 - Daemon 模式：start / stop / restart / PID 文件 (`5c1e836`)
 - 配置验证：sweety validate（等价 nginx -t）(`71d885c`)
 - 多格式配置：TOML / JSON / YAML 自动识别
@@ -94,6 +94,7 @@
 
 | 功能 | 对应 Nginx | 说明 |
 |------|-----------|------|
+| Admin API v0.5 完善 | — | 站点管理、上游节点控制、API 热重载、WebSocket 实时推送、Prometheus `/metrics` 拉取端点 |
 | TCP/UDP 四层代理 | `stream {}` 模块 | 纯字节转发，无协议解析，支持数据库/SSH/任意 TCP 代理 |
 | `mirror` 请求镜像 | `mirror` 指令 | 流量异步复制到镜像上游（灰度测试 / 影子流量） |
 
@@ -111,7 +112,7 @@
 | 功能 | 说明 |
 |------|------|
 | `map` 变量 | 配置层变量映射 |
-| Prometheus 指标主动推送 | 当前仅支持拉取（`/metrics`） |
+| Prometheus 指标主动推送 | 拉取端点完成后，增加 push gateway 支持 |
 | 配置 Web UI | 可选的图形化配置界面 |
 
 ---

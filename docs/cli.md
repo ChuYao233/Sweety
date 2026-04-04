@@ -156,33 +156,30 @@ admin_token  = "your-secret-token"
 
 ### 鉴权
 
-所有 API 请求需携带 Bearer Token：
+需要鉴权的端点必须携带 Bearer Token：
 
 ```bash
-curl -H "Authorization: Bearer your-secret-token" http://127.0.0.1:9099/api/status
+curl -H "Authorization: Bearer your-secret-token" http://127.0.0.1:9099/api/v1/stats
 ```
 
-### 主要端点
+### 端点列表
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET` | `/api/status` | 服务器状态（版本、运行时间、连接数） |
-| `GET` | `/api/sites` | 所有站点配置摘要 |
-| `POST` | `/api/reload` | 触发热重载（等价 `sweety reload`） |
-| `GET` | `/metrics` | Prometheus 指标（无需鉴权） |
+| 方法 | 路径 | 鉴权 | 状态 | 说明 |
+|------|------|------|------|------|
+| `GET` | `/api/v1/health` | 否 | ✅ | 健康检查 |
+| `GET` | `/api/v1/version` | 否 | ✅ | 版本信息 |
+| `GET` | `/api/v1/stats` | 是 | ✅ | 全局请求统计快照 |
+| `GET` | `/api/v1/plugins` | 是 | ✅ | 已注册插件列表 |
+| `GET` | `/api/v1/doc` | 否 | ✅ | API 文档（JSON） |
+| `GET` | `/api/v1/sites` | 是 | ⚠️ 桩 | 站点列表（v0.5 完善） |
+| `POST` | `/api/v1/reload` | 是 | 🚧 计划 | 热重载（v0.5） |
+| `GET` | `/api/v1/upstreams` | 是 | 🚧 计划 | 上游节点及断路器状态（v0.5） |
+| `POST` | `/api/v1/upstreams/:name/nodes/:addr/enable` | 是 | 🚧 计划 | 启用节点（v0.5） |
+| `POST` | `/api/v1/upstreams/:name/nodes/:addr/disable` | 是 | 🚧 计划 | 禁用节点（v0.5） |
+| — | WebSocket `/api/v1/stats/stream` | — | 🚧 计划 | 实时统计推送（v0.5） |
+| `GET` | `/metrics` | — | 🚧 计划 | Prometheus 指标端点（v0.5） |
 
-### Prometheus 指标
-
-```bash
-curl http://127.0.0.1:9099/metrics
-```
-
-指标包括：
-- `sweety_requests_total` — 总请求数（按站点、状态码）
-- `sweety_active_connections` — 活跃连接数
-- `sweety_request_duration_seconds` — 请求耗时分布
-- `sweety_upstream_errors_total` — 上游错误数
-- `sweety_cache_hits_total` — 缓存命中数
+> ⚠️ `sweety reload` 当前通过系统信号实现热重载，不依赖 Admin API。`POST /api/v1/reload` 尚未实现。
 
 ---
 

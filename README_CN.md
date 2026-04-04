@@ -54,9 +54,9 @@
 
 ### 运维
 
-- 🖥️ **Admin REST API** — 健康检查 / 统计 / 节点管理 / 热重载
+- 🖥️ **Admin REST API** — health / version / stats / plugins (`/api/v1/*`)；站点管理、节点控制、WebSocket 推送计划 v0.5 实现
 - 📝 **访问日志** — combined / JSON / 自定义模板，异步写
-- 📊 **Prometheus 指标** — 内置 `/metrics` 端点
+- 📊 **Prometheus 指标** — `/metrics` 端点（计划 v0.5）
 
 ---
 
@@ -132,7 +132,7 @@ handler = "static"
 | FastCGI 响应缓存 | ✅ | ✅ | ❌ | ✅ |
 | 静态文件内存缓存 | ✅ | ✅ OS page cache | ❌ | ✅ |
 | 配置易用性 | ✅ 预设 + 语法糖 | ❌ 纯手写 | ✅ Caddyfile | ⚠️ 冗长 |
-| Admin REST API | ✅ | ❌ | ✅ | ❌ |
+| Admin REST API | ⚠️ 部分实现 (v0.5) | ❌ | ✅ | ❌ |
 | 单文件无依赖 | ✅ | ❌ | ✅ | ❌ |
 | 内存安全 | ✅ Rust | ❌ C | ✅ Go | ❌ C |
 | `if` / `map` 条件 | ❌ | ✅ | ⚠️ 有限 | ✅ mod_rewrite |

@@ -63,8 +63,8 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 ### Operations
 - Config hot reload: no connection drops (equivalent to nginx -s reload)
 - Access logs: combined / json / custom template, async writer (`d830ba7`)
-- Admin REST API: health checks / stats / node management / hot reload (`71d885c`)
-- Prometheus `/metrics` endpoint
+- Admin REST API foundation: health / version / stats / plugins / doc (`71d885c`) (site management, node control, API hot reload, WebSocket push planned for v0.5)
+- Prometheus `/metrics` endpoint (planned for v0.5)
 - Daemon mode: start / stop / restart / PID file (`5c1e836`)
 - Config validation: sweety validate (equivalent to nginx -t) (`71d885c`)
 - Multi-format config: TOML / JSON / YAML auto-detection
@@ -94,6 +94,7 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 
 | Feature | Nginx Equivalent | Description |
 |---------|-----------------|-------------|
+| Admin API v0.5 completion | — | Site management, upstream node control, API hot reload, WebSocket real-time push, Prometheus `/metrics` pull endpoint |
 | TCP/UDP L4 proxy | `stream {}` module | Raw byte forwarding, no protocol parsing, supports database/SSH/any TCP proxy |
 | `mirror` request mirroring | `mirror` directive | Async traffic duplication to mirror upstream (canary testing / shadow traffic) |
 
@@ -111,7 +112,7 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 | Feature | Description |
 |---------|-------------|
 | `map` variables | Config-level variable mapping |
-| Prometheus push | Currently pull-only (`/metrics`) |
+| Prometheus push | After pull endpoint is done, add push gateway support |
 | Config Web UI | Optional graphical configuration interface |
 
 ---

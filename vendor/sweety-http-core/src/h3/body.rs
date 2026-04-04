@@ -1,5 +1,4 @@
 use core::{
-    mem,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -48,8 +47,10 @@ impl Drop for RequestBody {
                     return;
                 }
                 Poll::Ready(Err(_)) | Poll::Pending => {
-                    // 与旧行为一致：避免 drop 触发 STOP_SENDING 导致客户端误判 errored
-                    mem::forget(rx);
+                    // 正常 drop：对 GET（无 body）客户端已 FIN，STOP_SENDING 是 no-op；
+                    // 对 POST（有未读 body），STOP_SENDING 是正确的协议行为。
+                    // 注意：不能用 mem::forget，否则 quinn connection Arc 引用永不归零，导致 OOM。
+                    drop(rx);
                     return;
                 }
             }

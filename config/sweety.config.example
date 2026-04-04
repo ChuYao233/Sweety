@@ -1,0 +1,514 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sweety Configuration Example
+#
+# This file demonstrates ALL available configuration options.
+# Copy to sweety.toml and modify as needed.
+# All values shown are DEFAULTS unless noted otherwise.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Global Settings ──────────────────────────────────────────────────────────
+[global]
+
+# Number of worker threads (0 = auto, equals CPU core count)
+# Equivalent to Nginx: worker_processes auto
+worker_threads = 0
+
+# Max concurrent connections per worker
+# Equivalent to Nginx: worker_connections
+worker_connections = 51200
+
+# Global max concurrent HTTP connections (0 = unlimited)
+# Production recommendation: 10000-50000
+max_connections = 0
+
+# Keep-Alive timeout in seconds (0 = disabled)
+# Equivalent to Nginx: keepalive_timeout
+keepalive_timeout = 60
+
+# FastCGI connect timeout (seconds)
+# Equivalent to Nginx: fastcgi_connect_timeout
+fastcgi_connect_timeout = 5
+
+# FastCGI read timeout (seconds)
+# Equivalent to Nginx: fastcgi_read_timeout
+fastcgi_read_timeout = 60
+
+# Max request body size in MB (0 = unlimited)
+# Equivalent to Nginx: client_max_body_size
+client_max_body_size = 50
+
+# Request header buffer size (KB)
+# Equivalent to Nginx: client_header_buffer_size
+client_header_buffer_size = 32
+
+# Request body buffer size (KB)
+# Equivalent to Nginx: client_body_buffer_size
+client_body_buffer_size = 512
+
+# Enable gzip compression globally
+gzip = false
+
+# Min file size (KB) to apply gzip (smaller files skip compression)
+# Equivalent to Nginx: gzip_min_length
+gzip_min_length = 1
+
+# Gzip compression level (1-9)
+# Equivalent to Nginx: gzip_comp_level
+gzip_comp_level = 5
+
+# Admin API listen address (empty = disabled)
+# Example: "127.0.0.1:9090"
+admin_listen = ""
+
+# Admin API Bearer token for authentication
+admin_token = ""
+
+# Global error log path
+# error_log = "/var/log/sweety/error.log"
+
+# Enable Prometheus metrics endpoint (mounted on admin_listen)
+prometheus_enabled = true
+
+# Prometheus metrics path
+prometheus_path = "/metrics"
+
+# Log level: error / warn / info / debug / trace
+log_level = "info"
+
+# ─── HTTP/2 Settings ──────────────────────────────────────────────────────────
+
+# Max concurrent streams per H2 connection
+# Equivalent to Nginx: http2_max_concurrent_streams
+h2_max_concurrent_streams = 128
+
+# Max concurrent in-flight handlers per connection (0 = unlimited)
+h2_max_pending_per_conn = 0
+
+# RST flood protection: max concurrent reset streams per connection
+h2_max_concurrent_reset_streams = 200
+
+# Max H2 frame size (bytes, RFC 7540 range: 16384-16777215)
+h2_max_frame_size = 65535
+
+# Max requests per H2 connection before GOAWAY (0 = unlimited)
+# Forces clients to reconnect, redistributing load across workers
+h2_max_requests_per_conn = 1000
+
+# ─── HTTP/3 Settings ──────────────────────────────────────────────────────────
+
+# Max concurrent H3 connections (0 = auto, based on 80% available memory / 16MB)
+# Each QUIC connection buffers up to send_window bytes; this limit prevents OOM.
+# Excess connections are queued (not rejected) until a slot becomes available.
+h3_max_handlers = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Site: Static File Server (simplest setup)
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "my-static-site"
+server_name = ["example.com", "www.example.com"]
+
+listen     = [80]
+listen_tls = [443]
+
+root  = "/var/www/html"
+index = ["index.html", "index.htm"]
+
+# access_log = "/var/log/sweety/access.log"
+# access_log_format = "combined"
+# error_log  = "/var/log/sweety/site_error.log"
+
+# Force HTTP -> HTTPS redirect
+force_https = true
+
+# Site-level gzip override (omit to inherit from global)
+# gzip = true
+# gzip_comp_level = 5
+
+# Enable WebSocket support
+websocket = true
+
+# Fallback site (catch-all for unmatched domains)
+fallback = false
+
+# Custom error pages
+# [sites.error_pages]
+# 404 = "/404.html"
+# 500 = "/50x.html"
+
+# ─── TLS Configuration ───────────────────────────────────────────────────────
+[sites.tls]
+# Manual certificate (choose ONE of: cert/key, certs, or acme)
+cert = "/etc/ssl/certs/example.com.pem"
+key  = "/etc/ssl/private/example.com.key"
+
+# Multiple certificates (e.g. ECDSA + RSA)
+# [[sites.tls.certs]]
+# cert = "/etc/ssl/certs/ecdsa.pem"
+# key  = "/etc/ssl/private/ecdsa.key"
+# [[sites.tls.certs]]
+# cert = "/etc/ssl/certs/rsa.pem"
+# key  = "/etc/ssl/private/rsa.key"
+
+# ACME automatic certificate
+# acme = true
+# acme_email = "admin@example.com"
+# acme_provider = "letsencrypt"    # letsencrypt / zerossl / buypass / litessl / custom URL
+# acme_challenge = "http01"        # http01 / dns01
+# acme_renew_days_before = 30
+
+# DNS provider for dns01 challenge
+# [sites.tls.dns_provider]
+# type = "cloudflare"
+# api_token = "your-cloudflare-api-token"
+# zone_id = "optional-zone-id"
+
+# [sites.tls.dns_provider]
+# type = "aliyun"
+# access_key_id = "your-key-id"
+# access_key_secret = "your-key-secret"
+
+# [sites.tls.dns_provider]
+# type = "shell"
+# set_script = "/usr/local/bin/dns-set.sh"
+# del_script = "/usr/local/bin/dns-del.sh"
+
+# TLS version range
+min_version = "tls1.2"
+max_version = "tls1.3"
+
+# Enabled protocols (order = priority)
+protocols = ["h3", "h2", "http/1.1"]
+
+# ─── HTTP/3 QUIC Transport Tuning ────────────────────────────────────────────
+[sites.tls.http3]
+# Max concurrent bidirectional streams per connection
+max_concurrent_bidi_streams = 200
+
+# Max concurrent unidirectional streams per connection
+max_concurrent_uni_streams = 100
+
+# Connection idle timeout (ms, 0 = disabled)
+idle_timeout_ms = 30000
+
+# Keep-Alive PING interval (ms, 0 = disabled)
+keep_alive_interval_ms = 10000
+
+# Connection-level receive window (bytes)
+receive_window = 8388608        # 8MB
+
+# Per-stream receive window (bytes)
+stream_receive_window = 2097152 # 2MB
+
+# Connection-level send window (bytes)
+send_window = 8388608           # 8MB
+
+# Enable 0-RTT (TLS Early Data)
+enable_0rtt = false
+
+# Enable PMTU discovery
+mtu_discovery = true
+
+# Initial RTT estimate (ms, 333 = quinn default, let it auto-converge)
+initial_rtt_ms = 333
+
+# Max ACK delay (ms, 25 = RFC 9000 default)
+max_ack_delay_ms = 25
+
+# ─── HSTS ────────────────────────────────────────────────────────────────────
+[sites.hsts]
+max_age = 31536000              # 1 year
+include_sub_domains = false
+preload = false
+
+# ─── Static File Location ────────────────────────────────────────────────────
+[[sites.locations]]
+path    = "/"
+handler = "static"
+# root  = "/var/www/override"   # Override site root for this location
+# cache_control = "public, max-age=3600"
+
+# try_files = ["$uri", "$uri/", "=404"]
+
+# Inject response headers
+# [[sites.locations.add_headers]]
+# name  = "X-Frame-Options"
+# value = "DENY"
+
+# Cache rules by file extension
+# [[sites.locations.cache_rules]]
+# pattern       = "\\.(css|js|woff2)$"
+# cache_control = "public, max-age=2592000"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Site: Reverse Proxy
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "my-api"
+server_name = ["api.example.com"]
+listen      = [80]
+listen_tls  = [443]
+force_https = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+protocols  = ["h2", "http/1.1"]
+
+# ─── Upstream Pool ────────────────────────────────────────────────────────────
+[[sites.upstreams]]
+name     = "backend"
+strategy = "round_robin"        # round_robin / weighted / least_conn / ip_hash
+
+# Keepalive connection pool
+keepalive          = 64
+keepalive_requests = 10000
+keepalive_time     = 0          # seconds (0 = unlimited)
+
+# Timeouts
+connect_timeout = 10            # seconds
+read_timeout    = 60
+write_timeout   = 60
+
+# Retry
+retry         = 2
+retry_timeout = 0               # seconds (0 = immediate)
+
+# ─── Upstream Nodes ───────────────────────────────────────────────────────────
+[[sites.upstreams.nodes]]
+addr   = "127.0.0.1:8080"
+weight = 1
+# tls          = false
+# tls_sni      = "internal.example.com"
+# tls_insecure = false
+# upstream_host = "internal.example.com"
+# http2 = false
+
+[[sites.upstreams.nodes]]
+addr   = "127.0.0.1:8081"
+weight = 1
+
+# ─── Health Check ─────────────────────────────────────────────────────────────
+[sites.upstreams.health_check]
+enabled  = true
+interval = 10                   # seconds
+timeout  = 5                    # seconds
+path     = "/health"
+
+# ─── Circuit Breaker ─────────────────────────────────────────────────────────
+[sites.upstreams.circuit_breaker]
+max_failures = 5                # failures within window to open circuit
+window_secs  = 60
+fail_timeout = 30               # seconds before half-open retry
+
+# ─── Reverse Proxy Location ──────────────────────────────────────────────────
+[[sites.locations]]
+path     = "/"
+handler  = "reverse_proxy"
+upstream = "backend"
+
+# Proxy headers
+[[sites.locations.proxy_set_headers]]
+name  = "X-Real-IP"
+value = "$remote_addr"
+
+[[sites.locations.proxy_set_headers]]
+name  = "X-Forwarded-For"
+value = "$remote_addr"
+
+[[sites.locations.proxy_set_headers]]
+name  = "X-Forwarded-Proto"
+value = "$scheme"
+
+[[sites.locations.proxy_set_headers]]
+name  = "Host"
+value = "$host"
+
+# Proxy cookie/redirect rewriting
+# strip_cookie_secure   = false
+# proxy_cookie_domain   = ".internal.example.com"
+# proxy_redirect_from   = "http://internal:8080/"
+# proxy_redirect_to     = "https://api.example.com/"
+
+# Proxy buffering (disable for SSE/streaming)
+# proxy_buffering = false
+
+# Response body replacement
+# [[sites.locations.sub_filter]]
+# pattern     = "http://internal"
+# replacement = "https://api.example.com"
+
+# ─── Proxy Cache ─────────────────────────────────────────────────────────────
+[sites.proxy_cache]
+# path               = "/var/cache/sweety/api"
+max_entries          = 1000
+ttl                  = 60
+cacheable_statuses   = [200, 301, 302]
+cacheable_methods    = ["GET", "HEAD"]
+bypass_headers       = ["Authorization"]
+# ignore_headers     = ["Cache-Control", "Set-Cookie"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Site: WordPress (PHP-FPM + preset)
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "my-wordpress"
+server_name = ["blog.example.com"]
+listen      = [80]
+listen_tls  = [443]
+root        = "/var/www/wordpress"
+force_https = true
+gzip        = true
+
+# Shorthand: auto-generates WordPress location rules
+preset = "wordpress"
+
+# Shorthand: auto-configures FastCGI (Unix socket or host:port)
+php_fastcgi = "/run/php/php8.2-fpm.sock"
+
+# Shorthand: auto-enables ACME with Let's Encrypt
+acme_email = "admin@example.com"
+
+# Or use full FastCGI config block instead of php_fastcgi shorthand:
+# [sites.fastcgi]
+# socket          = "/run/php/php8.2-fpm.sock"
+# # host          = "127.0.0.1"
+# # port          = 9000
+# pool_size       = 16
+# connect_timeout = 5
+# read_timeout    = 60
+#
+# [sites.fastcgi.cache]
+# path              = "/var/cache/sweety/wp"
+# max_entries       = 5000
+# ttl               = 300
+# cacheable_statuses = [200]
+# cacheable_methods  = ["GET", "HEAD"]
+# bypass_headers     = ["Cookie"]
+# ignore_headers     = ["Cache-Control", "Set-Cookie"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Site: Return / Redirect / Health Check
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "redirect-site"
+server_name = ["old.example.com"]
+listen      = [80]
+
+# ─── Rewrite Rules ────────────────────────────────────────────────────────────
+[[sites.rewrites]]
+pattern   = "^/old-path/(.*)"
+target    = "/new-path/$1"
+flag      = "permanent"         # last / break / redirect(302) / permanent(301)
+# condition = "!-f"             # optional: !-f (file not exist), !-d (dir not exist)
+
+# ─── Return Location ─────────────────────────────────────────────────────────
+[[sites.locations]]
+path        = "/health"
+handler     = "static"
+return_code = 200
+return_body = "OK"
+return_content_type = "text/plain; charset=utf-8"
+
+[[sites.locations]]
+path       = "/"
+handler    = "static"
+return_code = 301
+return_url  = "https://new.example.com$request_uri"
+
+# ─── Rate Limiting ────────────────────────────────────────────────────────────
+[sites.rate_limit]
+
+[[sites.rate_limit.rules]]
+dimension = "ip"
+rate      = 100                 # requests per second
+burst     = 200                 # token bucket capacity
+nodelay   = true
+
+[[sites.rate_limit.rules]]
+dimension    = "path"
+path_pattern = "^/api/"
+rate         = 50
+burst        = 100
+nodelay      = true
+
+[[sites.rate_limit.rules]]
+dimension   = "header"
+header_name = "X-API-Key"
+rate        = 1000
+burst       = 2000
+nodelay     = true
+
+# [[sites.rate_limit.rules]]
+# dimension = "ip_path"
+# rate      = 20
+# burst     = 40
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Site: WebSocket Proxy
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "ws-site"
+server_name = ["ws.example.com"]
+listen_tls  = [443]
+websocket   = true
+
+[sites.tls]
+cert = "/etc/ssl/certs/ws.example.com.pem"
+key  = "/etc/ssl/private/ws.example.com.key"
+
+[[sites.upstreams]]
+name = "ws-backend"
+strategy = "least_conn"
+
+[[sites.upstreams.nodes]]
+addr = "127.0.0.1:9001"
+
+[[sites.locations]]
+path            = "/ws"
+handler         = "websocket"
+upstream        = "ws-backend"
+max_connections = 10000
+
+# ─── Auth Request (subrequest authentication) ────────────────────────────────
+# [[sites.locations]]
+# path                 = "/protected"
+# handler              = "reverse_proxy"
+# upstream             = "backend"
+# auth_request         = "/auth/verify"
+# auth_failure_status  = 401
+#
+# [[sites.locations.auth_request_headers]]
+# name  = "X-Original-URI"
+# value = "$request_uri"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Site: gRPC Proxy
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "grpc-site"
+server_name = ["grpc.example.com"]
+listen_tls  = [443]
+
+[sites.tls]
+cert = "/etc/ssl/certs/grpc.example.com.pem"
+key  = "/etc/ssl/private/grpc.example.com.key"
+protocols = ["h2"]
+
+[[sites.upstreams]]
+name = "grpc-backend"
+
+[[sites.upstreams.nodes]]
+addr  = "127.0.0.1:50051"
+http2 = true
+
+[[sites.locations]]
+path     = "/"
+handler  = "grpc"
+upstream = "grpc-backend"

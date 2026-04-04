@@ -1,4 +1,4 @@
-//! `sweety reload` —— 热重载配置（向 Admin API 发送 POST /api/v1/reload）
+//! `sweety reload` —— 热重载配置（向 Admin API 发送 POST /api/config/reload）
 
 use std::path::PathBuf;
 
@@ -15,7 +15,7 @@ pub fn cmd_reload(config: &PathBuf) {
         eprintln!("请在配置文件中添加: admin_listen = \"127.0.0.1:9000\"");
         std::process::exit(1);
     }
-    let url = format!("http://{}/api/v1/reload", addr);
+    let url = format!("http://{}/api/config/reload", addr);
     info!("发送热重载请求到: {}", url);
     let token = &cfg.global.admin_token;
     match http_post(&url, token) {

@@ -7,7 +7,7 @@ pub mod validate;
 
 /// 输出 Admin REST API 文档 JSON
 pub fn cmd_api_doc() {
-    let doc = sweety_lib::admin_api::http::build_api_doc();
+    let doc = sweety_lib::admin_api::build_api_doc();
     println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
 }
 

@@ -1,6 +1,6 @@
 //! 管理 WebSocket API 模块
 //! 负责：实时统计数据推送、接收管理指令
-//! 连接地址：ws://<admin_listen>/api/v1/stats/stream
+//! 连接地址：ws://<admin_listen>/api/stats/stream
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -316,7 +316,7 @@ impl SweetyServer {
         }
 
         // 启动配置热重载后台线程（监听配置文件及证书目录变更，只更新变化站点，不断连）
-        if let Some(config_path) = self.config_path {
+        if let Some(ref config_path) = self.config_path {
             let resolvers_map: HashMap<u16, Arc<SniResolver>> = (*state.sni_resolvers).clone();
             let hot_ctx = HotReloadContext {
                 registry: registry.clone(),
@@ -324,7 +324,40 @@ impl SweetyServer {
                 port_sites: collect_port_sites(&cfg),
                 cfg_swap: cfg_swap.clone(),
             };
-            start_hot_reload(config_path, cfg.clone(), hot_ctx);
+            start_hot_reload(config_path.clone(), cfg.clone(), hot_ctx);
+        }
+
+        // 启动管理 REST API（独立线程 + 独立 tokio runtime，不影响主服务器性能）
+        if !cfg.global.admin_listen.is_empty() {
+            let resolvers_for_admin: HashMap<u16, Arc<SniResolver>> = (*state.sni_resolvers).clone();
+            let admin_ctx = crate::admin_api::AdminContext {
+                registry: registry.clone(),
+                metrics: metrics.clone(),
+                cfg: cfg_swap.clone(),
+                active_connections: state.active_connections.clone(),
+                sni_resolvers: resolvers_for_admin,
+                token: cfg.global.admin_token.clone(),
+                listen_addr: cfg.global.admin_listen.clone(),
+                start_time: std::time::Instant::now(),
+                config_path: self.config_path.clone(),
+            };
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("管理 API tokio runtime 创建失败: {}", e);
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    if let Err(e) = crate::admin_api::start(admin_ctx).await {
+                        tracing::error!("管理 API 启动失败: {}", e);
+                    }
+                });
+            });
         }
 
         // 运行服务器（阻塞）

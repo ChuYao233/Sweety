@@ -44,6 +44,20 @@ initial_rtt_ms   = 333     # 初始 RTT 估算（毫秒，quinn 默认值）
 max_ack_delay_ms = 25      # 最大 ACK 延迟（毫秒，RFC 9000 默认值）
 ```
 
+## 全局并发控制
+
+HTTP/3 的全局最大并发 handler 数在 `[global]` 中配置，而非站点级别：
+
+```toml
+[global]
+# 全局最大并发 H3 handler 数（0 = 自动，按系统可用内存 80% / 2MB 计算）
+# 每个 QUIC 连接最多缓冲 send_window 字节，此限制防止 OOM
+# 超出时新连接排队等待，不会被拒绝
+h3_max_handlers = 0
+```
+
+> 压测场景建议手动设置一个较高的值（如 `h3_max_handlers = 5000`），避免自动计算过于保守。
+
 ## 调优建议
 
 ### 高并发场景

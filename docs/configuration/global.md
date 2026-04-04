@@ -33,6 +33,9 @@ h2_max_concurrent_reset_streams = 200   # RST 洪水防护
 h2_max_frame_size               = 65535 # 最大帧大小（字节）
 h2_max_requests_per_conn        = 1000  # 单连接最大请求数（0 = 不限制）
 
+# ─── HTTP/3 ─────────────────────────────────────────────────────
+h3_max_handlers = 0   # 全局最大并发 H3 handler 数（0 = 自动，按可用内存 80% / 2MB 计算）
+
 # ─── 日志 ───────────────────────────────────────────────────────
 log_level = "info"      # error / warn / info / debug / trace
 error_log = "/var/log/sweety/error.log"  # 错误日志路径（可选）
@@ -70,9 +73,16 @@ prometheus_path    = "/metrics"    # 挂载在 admin_listen 上
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `h2_max_concurrent_streams` | `128` | 单连接最大并发请求数，等价 `nginx http2_max_concurrent_streams` |
+| `h2_max_pending_per_conn` | `0` | 单连接最大在途 handler 数，`0` 不限制。限制过多并发 handler 可降低内存峰值 |
 | `h2_max_concurrent_reset_streams` | `200` | 防 RST Flood 攻击（CVE-2023-44487） |
 | `h2_max_frame_size` | `65535` | HTTP/2 帧大小，影响大文件传输效率 |
 | `h2_max_requests_per_conn` | `1000` | 连接复用上限，超出后关闭连接，`0` 不限制 |
+
+### HTTP/3
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `h3_max_handlers` | `0` | 全局最大并发 H3 handler 数。`0` = 自动计算（系统可用内存 80% / 2MB）。每个 QUIC 连接最多缓冲 `send_window` 字节，此限制防止 OOM。超出时新连接排队而非拒绝 |
 
 ### Admin API
 

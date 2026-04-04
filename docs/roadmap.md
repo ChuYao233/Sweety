@@ -10,24 +10,27 @@
 ## 已完成
 
 ### 协议
-- HTTP/1.1 + HTTP/2 + HTTP/3（QUIC）同一进程同时监听
-- WebSocket H1 Upgrade（RFC 6455）+ H2 extended CONNECT（RFC 8441）全透传
+- HTTP/1.1 + HTTP/2 + HTTP/3（QUIC）同一进程同时监听 (`9447c8f`)
+- WebSocket H1 Upgrade（RFC 6455）+ H2 extended CONNECT（RFC 8441）全透传 (`c67fbc1`, `afb1763`, `60dc92a`)
 - TLS：rustls 纯 Rust，多证书 SNI 自动路由，TLS session cache（65536 entries）
 - ACME HTTP-01 自动证书（Let's Encrypt / ZeroSSL / Buypass / LiteSSL）
-- ACME DNS-01 通配符证书（Cloudflare / 阿里云 / Shell 自定义）
-- ACME 自签名占位启动：证书未就绪时自动生成占位证书，申请成功后热重载，对标 Caddy
+- ACME DNS-01 通配符证书（Cloudflare / 阿里云 / Shell 自定义）(`69224f0`)
+- ACME 自签名占位启动：证书未就绪时自动生成占位证书，申请成功后热重载 (`ce644ad`)
+- QUIC 0-RTT（TLS Early Data）：`enable_0rtt` 配置项，首请求免握手 (`4667260`)
 
 ### 请求处理
-- 静态文件：内存 LRU 缓存 + Range + ETag/Last-Modified + try_files + sendfile(2)
-- PHP/FastCGI：Unix Socket / TCP 连接池，fastcgi_cache，正确处理 HTTP/2 Cookie 合并（RFC 7540 §8.1.2.5）
-- 反向代理：轮询 / 加权 / 最少连接 / IP 哈希 + 连接池 + 断路器（三状态机）+ 主动健康检查 + proxy_cache
-- HTTP/2 上游支持（h2c + h2 over TLS）
+- 静态文件：内存 LRU 缓存 + Range + ETag/Last-Modified + try_files (`3633cb7`)
+- sendfile(2) 零拷贝快路径：H1 非 TLS 场景内核直传 (`b6c4d09`, `767151b`)
+- PHP/FastCGI：Unix Socket / TCP 连接池，fastcgi_cache，正确处理 HTTP/2 Cookie 合并（RFC 7540 §8.1.2.5）(`2fa052d`)
+- 反向代理：轮询 / 加权 / 最少连接 / IP 哈希 + 连接池 + 断路器 + 主动健康检查 + proxy_cache (`71d885c`)
+- HTTP/2 上游支持（h2c + h2 over TLS）(`8c95acc`)
 - gRPC 代理：application/grpc + gRPC-Web + Trailer 透传
 - auth_request 子请求鉴权
 - Brotli + gzip 双压缩（优先 br）
-- sub_filter 响应体内容替换
-- Expect: 100-continue 正确处理（RFC 7231 §5.1.1）
-- chunked 请求体流式透传（零内存拷贝）
+- sub_filter 响应体内容替换 (`d830ba7`)
+- cache `ignore_headers` 绕过 Cache-Control/Set-Cookie (`98d8238`)
+- Expect: 100-continue 正确处理（RFC 7231 §5.1.1）(`79a2f12`)
+- chunked 请求体流式透传（零内存拷贝）(`79a2f12`)
 - proxy_read_timeout 逐包语义（两包间隔超时，等价 Nginx 行为）
 
 ### 路由
@@ -36,37 +39,43 @@
 - Rewrite 规则引擎：正则捕获，last / break / redirect / permanent，!-f / !-d 条件
 
 ### 配置易用性（Caddy 风格）
-- `preset = "wordpress"` — 一行自动展开 WordPress 最优 location 规则
-- `preset = "laravel"` — 一行自动展开 Laravel 路由规则
-- `preset = "static"` — 静态站点预设
-- `php_fastcgi = "/tmp/php.sock"` — 一行代替完整 `[sites.fastcgi]` 块
-- `acme_email = "you@example.com"` — 一行开启 ACME 自动 HTTPS，无需写 `[sites.tls]`
+- `preset = "wordpress" / "laravel" / "static"` — 一行自动展开最优 location 规则 (`0aa1f6b`)
+- `php_fastcgi = "/tmp/php.sock"` — 一行代替完整 `[sites.fastcgi]` 块 (`0aa1f6b`)
+- `acme_email = "you@example.com"` — 一行开启 ACME 自动 HTTPS (`0aa1f6b`)
 
 ### 安全与可靠性
-- 断路器：三状态机（Closed → Open → Half-Open），比 Nginx max_fails 更精确
-- 五维度令牌桶限流：IP / 路径 / IP+路径 / Header / User-Agent
-- HSTS + force_https
+- 断路器：三状态机（Closed → Open → Half-Open）(`71d885c`)
+- 五维度令牌桶限流：IP / 路径 / IP+路径 / Header / User-Agent (`7e63b78`)
+- HSTS + force_https (`d1d30c7`)
 - 304 响应体强制为空（RFC 7230 §3.3）
+- H2 RST 洪水防护（CVE-2023-44487）：`h2_max_concurrent_reset_streams` (`4dd4062`)
 
 ### 性能架构
-- SO_REUSEPORT 多核扩展：每 worker 线程独立 bind，内核连接负载均衡
-- H2 per-connection writer loop：HEADERS 优先 + round-robin DATA 调度，消除 head-of-line blocking
-- 静态文件双键缓存（fast path 跳过 canonicalize/stat syscall，热路径零系统调用）
+- SO_REUSEPORT 多核扩展：每 worker 线程独立 bind，内核连接负载均衡 (`3de171b`)
+- H2 per-connection writer loop：HEADERS 优先 + round-robin DATA 调度，消除 head-of-line blocking (`26684f8`, `e56409c`)
+- H2 写公平性：固定 16KB chunk 轮转调度 + write batching (`e56409c`, `c95e77b`)
+- 静态文件双键缓存：fast path 跳过 canonicalize/stat syscall，热路径零系统调用 (`7e46872`)
+- H3 调度器优化：backpressure + body fast-path + BBR 拥塞控制 (`4667260`)
+- H3 全局并发 handler 限制（`h3_max_handlers`）：基于信号量防止 OOM (`e32a76c`, `e275b38`)
+- 反向代理连接池无锁优化：消除 `Arc<DashMap>` 锁竞争 (`bc50c69`)
+- tokio::fs 流式读取替代 mmap，修复大文件 1GB 内存尖峰 (`f71b19b`)
 
 ### 运维
 - 配置热重载：不断开现有连接（等价 nginx -s reload）
-- 访问日志：combined / json / 自定义模板，异步写
-- Admin REST API：健康检查 / 统计 / 节点管理 / 热重载
+- 访问日志：combined / json / 自定义模板，异步写 (`d830ba7`)
+- Admin REST API：健康检查 / 统计 / 节点管理 / 热重载 (`71d885c`)
 - Prometheus `/metrics` 端点
-- Daemon 模式：start / stop / restart / PID 文件
-- 配置验证：sweety validate（等价 nginx -t）
+- Daemon 模式：start / stop / restart / PID 文件 (`5c1e836`)
+- 配置验证：sweety validate（等价 nginx -t）(`71d885c`)
 - 多格式配置：TOML / JSON / YAML 自动识别
+- 标准响应头注入：Server / X-Content-Type-Options / Accept-Ranges / Date (`5e78e21`, `36a32b3`)
 
 ### 代码质量
-- config/model 拆分为 global.rs / site.rs / tls.rs / location.rs / upstream.rs
-- server/http.rs 拆分为 state.rs / router.rs / http.rs
+- config/model 拆分为 global.rs / site.rs / tls.rs / location.rs / upstream.rs (`e91e9f8`)
+- server/http.rs 拆分为 state.rs / router.rs / http.rs (`00232f2`)
 - handler/static_file 拆分为 cache.rs / compress.rs / range.rs / path.rs
 - handler/fastcgi 拆分为 proto.rs / response.rs
+- ACME 逻辑提取为独立 acme.rs (`f89da0b`)
 
 ---
 
@@ -74,8 +83,8 @@
 
 | 项目 | 说明 |
 |------|------|
-| 插件系统完善 | Rust trait 动态注册，完善 API 文档 |
-| 全局速率限流 | 当前为单 worker 令牌桶，计划基于 `DashMap` 实现跨 worker 共享 |
+| 插件系统完善 | Rust trait 动态注册（`8453c88`），完善 API 文档 |
+| 全局速率限流 | 当前为 256 分片 Mutex（`7e63b78`），计划基于 `DashMap` 实现跨 worker 共享 |
 
 ---
 
@@ -103,7 +112,6 @@
 |------|------|
 | `map` 变量 | 配置层变量映射 |
 | Prometheus 指标主动推送 | 当前仅支持拉取（`/metrics`） |
-| QUIC 0-RTT 支持 | 首请求免握手，注意重放攻击风险 |
 | 配置 Web UI | 可选的图形化配置界面 |
 
 ---
@@ -122,6 +130,7 @@
 | 静态文件内存缓存 | ✅ | ✅ OS page cache | ❌ | ✅ mod_cache |
 | FastCGI 响应缓存 | ✅ | ✅ | ❌ | ✅ mod_cache_disk |
 | H2 多核扩展 | ✅ SO_REUSEPORT | ✅ | ✅ | ✅ |
+| QUIC 0-RTT | ✅ | ❌ | ✅ | ❌ |
 | 配置易用性 | ✅ 预设 + 语法糖 | ❌ 纯手写 | ✅ Caddyfile | ⚠️ 冗长 |
 | 配置热重载 | ✅ 不断连 | ✅ | ✅ | ✅ graceful |
 | `if` / `map` 条件 | ❌ | ✅ | ⚠️ 有限 | ✅ mod_rewrite |
@@ -133,4 +142,4 @@
 
 ---
 
-*最后更新：2026-04-03*
+*最后更新：2026-04-04*

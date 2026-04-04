@@ -95,6 +95,8 @@
 | 功能 | 对应 Nginx | 说明 |
 |------|-----------|------|
 | Admin API v0.5 完善 | — | 站点管理、上游节点控制、API 热重载、WebSocket 实时推送、Prometheus `/metrics` 拉取端点 |
+| PROXY protocol v1/v2 | `proxy_protocol` | 接收端：解析 LB/CDN 发来的真实客户端 IP；发送端：向上游传递客户端 IP。生产部署必备（AWS NLB / Cloudflare / HAProxy） |
+| Unix socket 上游 | `proxy_pass unix:/path` | 反向代理和 gRPC 支持 Unix domain socket 上游，同机通信比 loopback TCP 延迟低 10-30% |
 | TCP/UDP 四层代理 | `stream {}` 模块 | 纯字节转发，无协议解析，支持数据库/SSH/任意 TCP 代理 |
 | `mirror` 请求镜像 | `mirror` 指令 | 流量异步复制到镜像上游（灰度测试 / 影子流量） |
 

@@ -95,6 +95,8 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 | Feature | Nginx Equivalent | Description |
 |---------|-----------------|-------------|
 | Admin API v0.5 completion | — | Site management, upstream node control, API hot reload, WebSocket real-time push, Prometheus `/metrics` pull endpoint |
+| PROXY protocol v1/v2 | `proxy_protocol` | Receive: parse real client IP from LB/CDN; Send: pass client IP to upstream. Essential for production (AWS NLB / Cloudflare / HAProxy) |
+| Unix socket upstream | `proxy_pass unix:/path` | Reverse proxy and gRPC over Unix domain socket, 10-30% lower latency than loopback TCP for same-host communication |
 | TCP/UDP L4 proxy | `stream {}` module | Raw byte forwarding, no protocol parsing, supports database/SSH/any TCP proxy |
 | `mirror` request mirroring | `mirror` directive | Async traffic duplication to mirror upstream (canary testing / shadow traffic) |
 

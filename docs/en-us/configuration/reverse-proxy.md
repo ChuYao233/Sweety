@@ -28,7 +28,7 @@ tls            = false         # TLS connection to upstream
 tls_sni        = "backend.internal"  # TLS SNI (defaults to addr host)
 tls_insecure   = false         # Skip upstream certificate verification
 upstream_host  = "backend.internal"  # Host header sent to upstream
-http2          = false         # Use HTTP/2 to connect upstream
+http2          = false         # Use HTTP/2 to connect upstream (h2 over TLS when tls=true, h2c cleartext when tls=false)
 
 [[sites.upstreams.nodes]]
 addr   = "10.0.0.2:8080"
@@ -89,6 +89,18 @@ addr  = "grpc-backend:50051"
 http2 = true
 tls   = true
 ```
+
+### h2c (Cleartext HTTP/2)
+
+When `http2 = true` and `tls = false` (default), Sweety connects to the upstream using h2c prior knowledge. Ideal for internal microservices and gRPC without TLS:
+
+```toml
+[[sites.upstreams.nodes]]
+addr  = "microservice:8080"
+http2 = true    # h2c: cleartext HTTP/2, single connection multiplexing
+```
+
+> ⚠️ h2c is only supported for reverse proxy → upstream direction. Client → Sweety cleartext HTTP/2 is not yet supported (planned).
 
 ## Common Location Configurations
 

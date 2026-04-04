@@ -28,7 +28,7 @@ tls            = false         # 是否 TLS 连接上游
 tls_sni        = "backend.internal"  # TLS SNI（不设则用 addr 的 host）
 tls_insecure   = false         # 跳过上游证书验证
 upstream_host  = "backend.internal"  # 发送给上游的 Host 头
-http2          = false         # 使用 HTTP/2 连接上游
+http2          = false         # 使用 HTTP/2 连接上游（tls=true 时 h2 over TLS，tls=false 时 h2c 明文）
 
 [[sites.upstreams.nodes]]
 addr   = "10.0.0.2:8080"
@@ -89,6 +89,18 @@ addr  = "grpc-backend:50051"
 http2 = true
 tls   = true
 ```
+
+### h2c（明文 HTTP/2）
+
+`http2 = true` 且 `tls = false`（默认）时，Sweety 使用 h2c prior knowledge 直连上游，适用于内网微服务、gRPC 无 TLS 场景：
+
+```toml
+[[sites.upstreams.nodes]]
+addr  = "microservice:8080"
+http2 = true    # h2c：明文 HTTP/2，单连接多路复用
+```
+
+> ⚠️ h2c 仅用于反向代理→上游方向。客户端→Sweety 方向的明文 HTTP/2 暂不支持（计划中）。
 
 ## 常用 Location 配置
 

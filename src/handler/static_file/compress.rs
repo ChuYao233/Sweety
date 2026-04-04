@@ -10,7 +10,10 @@ use sweety_web::{
 
 use crate::config::model::LocationConfig;
 
-/// pread 分块流式传输：共享 fd + spawn_blocking pread，无 seek，无竞争
+/// pread 分块流式传输：共享 fd + 异步 seek+read，无竞争
+///
+/// 同时向 response extensions 注入 `SendFileInfo`，H1 非 TLS 路径会走 sendfile(2) 零拷贝；
+/// TLS / H2 / H3 忽略 extension，使用 body 里的 pread_stream 作为回退。
 pub(super) fn stream_file_response_pread(
     fd: Arc<std::fs::File>,
     file_path: &Path,
@@ -21,10 +24,17 @@ pub(super) fn stream_file_response_pread(
     modified_secs: u64,
     location: &LocationConfig,
 ) -> WebResponse {
-    let stream = crate::handler::sendfile::pread_stream(fd, offset, len);
+    let stream = crate::handler::sendfile::pread_stream(fd.clone(), offset, len);
     let body = ResponseBody::box_stream(stream);
     let mut resp = WebResponse::new(body);
     super::set_file_headers(resp.headers_mut(), file_path, content_len, etag_val, modified_secs, location);
+
+    // Linux H1 非 TLS：注入 SendFileInfo，dispatcher 检测后走 sendfile(2) 零拷贝
+    #[cfg(target_os = "linux")]
+    resp.extensions_mut().insert(
+        sweety_web::SendFileInfo { fd, offset, len }
+    );
+
     resp
 }
 

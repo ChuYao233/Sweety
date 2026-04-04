@@ -316,3 +316,5 @@ pub use context::WebContext;
 pub use server::HttpServer;
 
 pub use sweety_http_core::bytes;
+#[cfg(target_os = "linux")]
+pub use sweety_http_core::sendfile_ext::SendFileInfo;

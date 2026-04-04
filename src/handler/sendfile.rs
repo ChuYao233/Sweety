@@ -142,6 +142,8 @@ where
     }
 }
 
+/// Linux/macOS HTTP/1.1：`sendfile(2)` 零拷贝
+///
 /// 直接在内核完成 file_fd → socket_fd 传输，无用户态内存拷贝。
 /// 返回实际传输字节数。
 #[cfg(target_os = "linux")]
@@ -257,9 +259,8 @@ pub async fn async_read_range(
     }
     let std_file = file.try_clone()?;
     let mut async_file = tokio::fs::File::from_std(std_file);
-    if offset > 0 {
-        async_file.seek(std::io::SeekFrom::Start(offset)).await?;
-    }
+    // 始终 seek（含 offset=0），dup 的 fd 继承原 fd 的文件指针，可能已在末尾
+    async_file.seek(std::io::SeekFrom::Start(offset)).await?;
     let mut buf = bytes::BytesMut::with_capacity(len);
     buf.resize(len, 0);
     async_file.read_exact(&mut buf).await?;
@@ -287,18 +288,20 @@ pub fn pread_exact(
 
 /// 从共享 fd 的 offset 开始，生成一个分块 Stream
 ///
-/// 使用 pread(2) 系统调用：直接在指定 offset 读，无 seek，无 try_clone，共享 fd 线程安全。
-/// 按 chunk_size 分块，每块一次 spawn_blocking，高并发下 pread 耗时极短（微秒级），
-/// blocking 线程池不会长期被占用。
+/// 使用 pread(2) 系统调用：共享原始 fd，无 try_clone，无 seek 竞争，线程安全。
+/// 高并发下不消耗额外 fd（1000 并发请求仍只使用 1 个文件 fd）。
+/// 每个 chunk 通过 spawn_blocking 在线程池执行同步 pread，不阻塞 async reactor。
 pub fn pread_stream(
     file: std::sync::Arc<std::fs::File>,
     offset: u64,
     len: u64,
 ) -> impl Stream<Item = IoResult<Bytes>> + Send + 'static {
-    let chunk_size = if len <= 256 * 1024 {
-        len as usize  // 小/中文件一次读完，只用一次 spawn_blocking
+    let chunk_size = if len <= 64 * 1024 {
+        64 * 1024usize       // 小文件：一次读完
+    } else if len <= 4 * 1024 * 1024 {
+        256 * 1024           // 中等文件：256KB chunk
     } else {
-        STREAM_CHUNK  // 大文件分 256KB chunk
+        STREAM_CHUNK         // 大文件：256KB chunk
     };
 
     async_stream::stream! {
@@ -308,7 +311,9 @@ pub fn pread_stream(
         while remaining > 0 {
             let to_read = (remaining as usize).min(chunk_size);
             let f = file.clone();
-            match tokio::task::spawn_blocking(move || pread_exact(&f, off, to_read)).await {
+            // pread(2)：在指定 offset 读，共享 fd 无竞争，不修改文件指针
+            let result = tokio::task::spawn_blocking(move || pread_exact(&f, off, to_read)).await;
+            match result {
                 Ok(Ok(bytes)) => {
                     let n = bytes.len() as u64;
                     if n == 0 { break; }

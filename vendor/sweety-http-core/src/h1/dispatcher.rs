@@ -237,32 +237,48 @@ where
                 SelectOutput::B(Ok(i)) => match i {},
             };
 
+            // 在 parts 被 encode_head 消耗前，提取 SendFileInfo（Linux 非 TLS）
+            #[cfg(target_os = "linux")]
+            let send_file_info: Option<crate::sendfile_ext::SendFileInfo> = if !self.ctx.is_tls() {
+                parts.extensions.get::<crate::sendfile_ext::SendFileInfo>().cloned()
+            } else {
+                None
+            };
+
             let encoder = &mut self.encode_head(parts, &body)?;
             let mut body = pin!(body);
 
-            loop {
-                match self
-                    .try_poll_body(body.as_mut())
-                    .select(self.io_ready(&mut body_reader))
-                    .await
-                {
-                    SelectOutput::A(Some(Ok(bytes))) => encoder.encode(bytes, &mut self.io.write_buf),
-                    SelectOutput::B(Ok(ready)) => {
-                        if ready.is_readable() {
-                            if let Err(e) = self.io.try_read() {
-                                body_reader.feed_error(e);
+            // sendfile(2) 快路径：drain 头部到 socket，然后内核零拷贝传文件
+            #[cfg(target_os = "linux")]
+            let did_sendfile = 'sf: {
+                let Some(sf) = send_file_info else { break 'sf false; };
+                let sock_fd = self.io.io.raw_fd();
+                if sock_fd == 0 { break 'sf false; }
+                self.io.drain_write().await?;
+                crate::sendfile_ext::sendfile_to_io(self.io.io, &sf.fd, sf.offset, sf.len).await?;
+                true
+            };
+            #[cfg(not(target_os = "linux"))]
+            let did_sendfile = false;
+
+            if !did_sendfile {
+                // 参考 H2 实现：顺序「拉取 body → encode → drain 写出」
+                // 确保 TLS 路径下数据立即加密并刷到 socket，不依赖 select io_ready
+                loop {
+                    match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+                        Some(Ok(bytes)) => {
+                            encoder.encode(bytes, &mut self.io.write_buf);
+                            // write_buf 超过 LIMIT 时立即 drain（像 H2 等窗口后发送一样）
+                            if !self.io.write_buf.want_write_buf() {
+                                self.io.drain_write().await?;
                             }
                         }
-                        if ready.is_writable() {
-                            self.io.try_write()?;
+                        None => {
+                            encoder.encode_eof(&mut self.io.write_buf);
+                            break;
                         }
+                        Some(Err(e)) => return Err(Error::Body(e)),
                     }
-                    SelectOutput::A(None) => {
-                        encoder.encode_eof(&mut self.io.write_buf);
-                        break;
-                    }
-                    SelectOutput::B(Err(e)) => return Err(e.into()),
-                    SelectOutput::A(Some(Err(e))) => return Err(Error::Body(e)),
                 }
             }
 
@@ -297,6 +313,7 @@ where
         }
     }
 
+    #[allow(dead_code)]
     fn try_poll_body<'b>(&self, mut body: Pin<&'b mut ResB>) -> impl Future<Output = Option<Result<Bytes, BE>>> + 'b {
         let want_buf = self.io.write_buf.want_write_buf();
         async move {
@@ -310,6 +327,7 @@ where
 
     // Check readable and writable state of BufferedIo and ready state of request body reader.
     // return error when runtime is shutdown.(See AsyncIo::ready for reason).
+    #[allow(dead_code)]
     async fn io_ready(&mut self, body_reader: &mut BodyReader) -> io::Result<Ready> {
         if !self.io.write_buf.want_write_io() {
             body_reader.ready(&mut self.io.read_buf).await;

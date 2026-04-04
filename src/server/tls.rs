@@ -103,12 +103,8 @@ impl TlsManager {
     /// `server_names` 供 ACME 模式定位证书文件（证书按域名存储）
     pub fn build_server_config(tls: &TlsConfig, server_names: &[String]) -> Result<ServerConfig> {
         if tls.acme {
-            // ACME 模式：用第一个非通配符域名定位证书（由 acme::acme_renewal_loop 按域名存储）
-            let domain = server_names.iter()
-                .find(|d| !d.starts_with("*."))
-                .or_else(|| server_names.first())
-                .map(|s| s.as_str())
-                .unwrap_or("localhost");
+            // ACME 模式：用主域名定位证书文件（与 acme 模块一致）
+            let domain = super::acme::primary_domain(server_names);
             let cert_path = super::acme::acme_cert_path(domain);
             let key_path  = super::acme::acme_key_path(domain);
             if cert_path.exists() && key_path.exists() {
@@ -134,12 +130,8 @@ impl TlsManager {
     pub fn build_quic_config(tls: &TlsConfig, server_names: &[String]) -> Result<sweety_io::net::QuicConfig> {
         let h3 = &tls.http3;
         let mut server_config = if tls.acme {
-            // ACME 模式：用第一个非通配符域名定位证书（证书按域名存储）
-            let domain = server_names.iter()
-                .find(|d| !d.starts_with("*."))
-                .or_else(|| server_names.first())
-                .map(|s| s.as_str())
-                .unwrap_or("localhost");
+            // ACME 模式：用主域名定位证书文件（与 acme 模块一致）
+            let domain = super::acme::primary_domain(server_names);
             let cert_path = super::acme::acme_cert_path(domain);
             let key_path  = super::acme::acme_key_path(domain);
             if cert_path.exists() && key_path.exists() {

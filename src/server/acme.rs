@@ -40,12 +40,22 @@ pub(super) fn acme_cache_dir() -> PathBuf {
         .join("acme")
 }
 
-pub(super) fn acme_cert_path(domain: &str) -> PathBuf {
+pub fn acme_cert_path(domain: &str) -> PathBuf {
     acme_cache_dir().join(format!("{}.crt", domain))
 }
 
-pub(super) fn acme_key_path(domain: &str) -> PathBuf {
+pub fn acme_key_path(domain: &str) -> PathBuf {
     acme_cache_dir().join(format!("{}.key", domain))
+}
+
+/// 从域名列表中选取主域名（用于证书文件命名）
+/// 优先选第一个非通配符域名，否则取第一个
+pub fn primary_domain(server_names: &[String]) -> &str {
+    server_names.iter()
+        .find(|d| !d.starts_with("*."))
+        .or_else(|| server_names.first())
+        .map(|s| s.as_str())
+        .unwrap_or("localhost")
 }
 
 // ─────────────────────────────────────────────
@@ -75,96 +85,96 @@ pub async fn acme_renewal_loop(
                 }
             };
             let renew_days = tls.acme_renew_days_before;
-
             let use_dns01 = tls.acme_challenge.as_str() == "dns01";
 
-            // DNS-01 模式：支持通配符证书（*.example.com）
-            // HTTP-01 模式：跳过通配符域名
-            for domain in &site.server_name {
-                // HTTP-01 不支持通配符证书
-                if !use_dns01 && domain.starts_with("*.") {
-                    warn!("ACME HTTP-01 不支持通配符证书 '{}'，请改用 acme_challenge = \"dns01\"", domain);
-                    continue;
-                }
-
-                let cert_path = acme_cert_path(domain);
-                let key_path  = acme_key_path(domain);
-
-                // 解析证书真实到期日，判断是否需续期
-                if cert_path.exists() && !cert_needs_renewal(&cert_path, renew_days) {
-                    continue;
-                }
-
-                info!("开始为域名 '{}' 申请/续期 ACME 证书（{}）",
-                    domain, if use_dns01 { "DNS-01" } else { "HTTP-01" });
-
-                let result = if use_dns01 {
-                    // DNS-01：需要 dns_provider 配置
-                    match &tls.dns_provider {
-                        Some(provider) => {
-                            request_acme_cert_dns01(
-                                domain, &email, &tls.acme_provider, provider
-                            ).await
-                        }
-                        None => {
-                            Err(anyhow::anyhow!(
-                                "域名 '{}' 配置了 acme_challenge=dns01 但没有配置 dns_provider", domain
-                            ))
-                        }
+            // 过滤可用域名（HTTP-01 不支持通配符）
+            let domains: Vec<String> = site.server_name.iter()
+                .filter(|d| {
+                    if !use_dns01 && d.starts_with("*.") {
+                        warn!("ACME HTTP-01 不支持通配符证书 '{}'，请改用 acme_challenge = \"dns01\"", d);
+                        false
+                    } else {
+                        true
                     }
-                } else {
-                    // HTTP-01
-                    request_acme_cert(domain, &email, &tls.acme_provider).await
-                };
+                })
+                .cloned()
+                .collect();
+            if domains.is_empty() { continue; }
 
-                match result {
-                    Ok((cert_pem, key_pem)) => {
-                        if let Err(e) = save_cert_files(&cert_path, &key_path, &cert_pem, &key_pem) {
-                            error!("ACME 证书保存失败 ({}): {}", domain, e);
-                        } else {
-                            info!("ACME 证书申请成功: {}", domain);
-                            reload_acme_cert_in_resolvers(
-                                &cert_path, &key_path,
-                                &site.server_name,
-                                &sni_resolvers,
-                            );
-                        }
+            // 用主域名定位证书文件（与 tls.rs build_server_config 一致）
+            let primary = primary_domain(&domains);
+            let cert_path = acme_cert_path(primary);
+            let key_path  = acme_key_path(primary);
+
+            // 检查是否需要续期
+            if cert_path.exists() && !cert_needs_renewal(&cert_path, renew_days) {
+                continue;
+            }
+
+            info!("开始为站点 '{}' 申请/续期 ACME SAN 证书（{} 个域名: {}）",
+                site.name, domains.len(), domains.join(", "));
+
+            let result = if use_dns01 {
+                match &tls.dns_provider {
+                    Some(provider) => {
+                        request_acme_cert_dns01(&domains, &email, &tls.acme_provider, provider).await
                     }
-                    Err(e) => {
-                        error!("ACME 证书申请失败 ({}): {}", domain, e);
-                        // 指数退避重试：1min → 5min → 30min → 2h → 12h
-                        // 防止被 CA 限速封退（Let's Encrypt 限制：5 次/小时/域名）
-                        let backoff_steps: &[u64] = &[60, 300, 1800, 7200];
-                        let mut last_err = e;
-                        let mut succeeded = false;
-                        for &wait_secs in backoff_steps {
-                            warn!("ACME 将在 {}s 后重试申请证书: {}", wait_secs, domain);
-                            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-                            let retry_result = if use_dns01 {
-                                match &tls.dns_provider {
-                                    Some(provider) => request_acme_cert_dns01(domain, &email, &tls.acme_provider, provider).await,
-                                    None => break,
-                                }
-                            } else {
-                                request_acme_cert(domain, &email, &tls.acme_provider).await
-                            };
-                            match retry_result {
-                                Ok((cert_pem, key_pem)) => {
-                                    if let Err(e) = save_cert_files(&cert_path, &key_path, &cert_pem, &key_pem) {
-                                        error!("ACME 证书保存失败 ({}): {}", domain, e);
-                                    } else {
-                                        info!("ACME 证书重试申请成功: {}", domain);
-                                        reload_acme_cert_in_resolvers(&cert_path, &key_path, &site.server_name, &sni_resolvers);
-                                    }
-                                    succeeded = true;
-                                    break;
-                                }
-                                Err(e) => { last_err = e; }
+                    None => {
+                        Err(anyhow::anyhow!(
+                            "站点 '{}' 配置了 acme_challenge=dns01 但没有配置 dns_provider", site.name
+                        ))
+                    }
+                }
+            } else {
+                request_acme_cert(&domains, &email, &tls.acme_provider).await
+            };
+
+            match result {
+                Ok((cert_pem, key_pem)) => {
+                    if let Err(e) = save_cert_files(&cert_path, &key_path, &cert_pem, &key_pem) {
+                        error!("ACME 证书保存失败 ({}): {}", site.name, e);
+                    } else {
+                        info!("ACME SAN 证书申请成功: {} ({})", site.name, domains.join(", "));
+                        reload_acme_cert_in_resolvers(
+                            &cert_path, &key_path,
+                            &site.server_name,
+                            &sni_resolvers,
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!("ACME 证书申请失败 ({}): {}", site.name, e);
+                    // 指数退避重试：1min → 5min → 30min → 2h
+                    let backoff_steps: &[u64] = &[60, 300, 1800, 7200];
+                    let mut last_err = e;
+                    let mut succeeded = false;
+                    for &wait_secs in backoff_steps {
+                        warn!("ACME 将在 {}s 后重试: {}", wait_secs, site.name);
+                        tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                        let retry_result = if use_dns01 {
+                            match &tls.dns_provider {
+                                Some(provider) => request_acme_cert_dns01(&domains, &email, &tls.acme_provider, provider).await,
+                                None => break,
                             }
+                        } else {
+                            request_acme_cert(&domains, &email, &tls.acme_provider).await
+                        };
+                        match retry_result {
+                            Ok((cert_pem, key_pem)) => {
+                                if let Err(e) = save_cert_files(&cert_path, &key_path, &cert_pem, &key_pem) {
+                                    error!("ACME 证书保存失败 ({}): {}", site.name, e);
+                                } else {
+                                    info!("ACME 证书重试成功: {}", site.name);
+                                    reload_acme_cert_in_resolvers(&cert_path, &key_path, &site.server_name, &sni_resolvers);
+                                }
+                                succeeded = true;
+                                break;
+                            }
+                            Err(e) => { last_err = e; }
                         }
-                        if !succeeded {
-                            error!("ACME 证书申请多次重试均失败 ({})，等待12h后再次尝试: {}", domain, last_err);
-                        }
+                    }
+                    if !succeeded {
+                        error!("ACME 多次重试均失败 ({})，等待12h后再次尝试: {}", site.name, last_err);
                     }
                 }
             }
@@ -179,15 +189,19 @@ pub async fn acme_renewal_loop(
 // 内部实现：证书申请
 // ─────────────────────────────────────────────
 
-/// 通过 instant-acme（HTTP-01）申请证书
+/// 通过 instant-acme（HTTP-01）申请 SAN 多域名证书
 ///
 /// HTTP-01：Let's Encrypt 访问 http://domain/.well-known/acme-challenge/<token>
 /// Sweety 在 80 端口响应，完全不依赖 443 是否已有证书。
+/// 一次申请覆盖 `domains` 中所有域名（SAN 证书）。
 ///
 /// `acme_provider` 支持: letsencrypt / letsencrypt_staging / zerossl / buypass / 自定义 URL
-async fn request_acme_cert(domain: &str, email: &str, acme_provider: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+async fn request_acme_cert(domains: &[String], email: &str, acme_provider: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     use instant_acme::{Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus};
     use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+
+    if domains.is_empty() { bail!("域名列表为空"); }
+    let domains_display = domains.join(", ");
 
     // 根据 provider 选择 ACME 目录 URL
     let directory_url = match acme_provider {
@@ -198,7 +212,7 @@ async fn request_acme_cert(domain: &str, email: &str, acme_provider: &str) -> Re
         "litessl"             => LITESSL,
         custom                => custom,
     };
-    info!("ACME 使用提供商: {} ({})", acme_provider, directory_url);
+    info!("ACME HTTP-01 使用提供商: {} ({})，域名: {}", acme_provider, directory_url, domains_display);
 
     let cache_dir = acme_cache_dir();
     std::fs::create_dir_all(&cache_dir)
@@ -223,26 +237,31 @@ async fn request_acme_cert(domain: &str, email: &str, acme_provider: &str) -> Re
             directory_url,
             None,
         ).await.context("创建 ACME 账号失败")?;
-        // 保存账号凭据到本地
         let json = serde_json::to_string(&creds).context("序列化 ACME 账号凭据失败")?;
         std::fs::write(&creds_path, json)
             .with_context(|| format!("保存 ACME 账号凭据失败: {}", creds_path.display()))?;
         account
     };
 
-    // 创建新订单
+    // 创建新订单（所有域名作为 SAN）
+    let identifiers: Vec<Identifier> = domains.iter()
+        .map(|d| Identifier::Dns(d.clone()))
+        .collect();
     let mut order = account.new_order(&NewOrder {
-        identifiers: &[Identifier::Dns(domain.to_string())],
+        identifiers: &identifiers,
     }).await.context("创建 ACME 订单失败")?;
 
-    // 获取 HTTP-01 challenge
+    // 获取所有域名的 HTTP-01 challenge（每个域名一个 authorization）
     let authorizations = order.authorizations().await.context("获取 ACME 授权失败")?;
     let mut challenges_to_cleanup: Vec<String> = Vec::new();
 
     for auth in &authorizations {
+        let auth_domain = match &auth.identifier {
+            Identifier::Dns(d) => d.as_str(),
+        };
         let challenge = auth.challenges.iter()
             .find(|c| c.r#type == ChallengeType::Http01)
-            .with_context(|| format!("域名 {} 没有 HTTP-01 challenge", domain))?;
+            .with_context(|| format!("域名 {} 没有 HTTP-01 challenge", auth_domain))?;
 
         let key_auth = order.key_authorization(challenge);
         let token = challenge.token.clone();
@@ -253,7 +272,7 @@ async fn request_acme_cert(domain: &str, email: &str, acme_provider: &str) -> Re
 
         // 通知 ACME 服务器可以开始验证
         order.set_challenge_ready(&challenge.url).await
-            .context("通知 ACME challenge ready 失败")?;
+            .with_context(|| format!("通知 ACME challenge ready 失败 ({})", auth_domain))?;
     }
 
     // 等待订单完成（最多 5 分钟轮询）
@@ -266,14 +285,14 @@ async fn request_acme_cert(domain: &str, email: &str, acme_provider: &str) -> Re
             OrderStatus::Valid => break,
             OrderStatus::Invalid => {
                 for t in &challenges_to_cleanup { ACME_HTTP01_TOKENS.remove(t); }
-                bail!("ACME 订单验证失败（Invalid），请检查域名 DNS 解析和 80 端口是否可达");
+                bail!("ACME 订单验证失败（Invalid），请检查所有域名 DNS 解析和 80 端口是否可达: {}", domains_display);
             }
             OrderStatus::Pending => {
                 if std::time::Instant::now() > deadline {
                     for t in &challenges_to_cleanup { ACME_HTTP01_TOKENS.remove(t); }
-                    bail!("ACME 订单验证超时（5分钟）");
+                    bail!("ACME 订单验证超时（5分钟）: {}", domains_display);
                 }
-                info!("ACME 等待验证中... ({})", domain);
+                info!("ACME 等待验证中... ({})", domains_display);
             }
             OrderStatus::Processing => {
                 if std::time::Instant::now() > deadline {
@@ -287,9 +306,9 @@ async fn request_acme_cert(domain: &str, email: &str, acme_provider: &str) -> Re
     // 清理 token
     for t in &challenges_to_cleanup { ACME_HTTP01_TOKENS.remove(t); }
 
-    // 生成 CSR 并提交
+    // 生成 CSR 并提交（所有域名作为 SAN）
     let key_pair = KeyPair::generate().context("生成 ACME 密钥对失败")?;
-    let mut params = CertificateParams::new(vec![domain.to_string()])
+    let mut params = CertificateParams::new(domains.to_vec())
         .context("构建证书参数失败")?;
     params.distinguished_name = DistinguishedName::new();
     let csr = params.serialize_request(&key_pair).context("生成 CSR 失败")?;
@@ -321,18 +340,22 @@ async fn request_acme_cert(domain: &str, email: &str, acme_provider: &str) -> Re
     Ok((cert_chain_pem.into_bytes(), key_pem.into_bytes()))
 }
 
-/// 通过 instant-acme（DNS-01）申请证书，支持通配符证书（*.example.com）
+/// 通过 instant-acme（DNS-01）申请 SAN 多域名证书，支持通配符（*.example.com）
 ///
 /// DNS-01：在 DNS 上设置 `_acme-challenge.<domain>` TXT 记录完成验证
 /// 不需要 80 端口可达，适合内网/防火墙场景和通配符证书
+/// 一次申请覆盖 `domains` 中所有域名（SAN 证书）
 async fn request_acme_cert_dns01(
-    domain: &str,
+    domains: &[String],
     email: &str,
     acme_provider: &str,
     dns_provider: &crate::config::model::DnsProviderConfig,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     use instant_acme::{Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus};
     use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+
+    if domains.is_empty() { bail!("域名列表为空"); }
+    let domains_display = domains.join(", ");
 
     let directory_url = match acme_provider {
         "letsencrypt"         => LETS_ENCRYPT_PROD,
@@ -342,7 +365,7 @@ async fn request_acme_cert_dns01(
         "litessl"             => LITESSL,
         custom                => custom,
     };
-    info!("ACME DNS-01 使用提供商: {} ({})", acme_provider, directory_url);
+    info!("ACME DNS-01 使用提供商: {} ({})，域名: {}", acme_provider, directory_url, domains_display);
 
     let cache_dir = acme_cache_dir();
     std::fs::create_dir_all(&cache_dir)
@@ -368,40 +391,43 @@ async fn request_acme_cert_dns01(
         account
     };
 
-    let identifier = Identifier::Dns(domain.to_string());
-
+    // 创建新订单（所有域名作为 SAN）
+    let identifiers: Vec<Identifier> = domains.iter()
+        .map(|d| Identifier::Dns(d.clone()))
+        .collect();
     let mut order = account.new_order(&NewOrder {
-        identifiers: &[identifier],
+        identifiers: &identifiers,
     }).await.context("创建 ACME 订单失败")?;
 
     let authorizations = order.authorizations().await.context("获取 ACME 授权失败")?;
-    let mut cleanup_records: Vec<(String, String)> = Vec::new(); // (domain, txt_value)
+    let mut cleanup_records: Vec<(String, String)> = Vec::new();
 
     for auth in &authorizations {
-        // DNS-01 必须用于通配符，普通域名也可用
+        let auth_domain = match &auth.identifier {
+            Identifier::Dns(d) => d.as_str(),
+        };
         let challenge = auth.challenges.iter()
             .find(|c| c.r#type == ChallengeType::Dns01)
-            .with_context(|| format!("域名 {} 没有 DNS-01 challenge", domain))?;
+            .with_context(|| format!("域名 {} 没有 DNS-01 challenge", auth_domain))?;
 
         let key_auth = order.key_authorization(challenge);
-        let txt_value = key_auth.dns_value(); // DNS-01 专用：对 key_authorization 做 SHA-256 base64
+        let txt_value = key_auth.dns_value();
 
-        info!("DNS-01: 设置 TXT 记录 domain={} value={}", domain, txt_value);
+        info!("DNS-01: 设置 TXT 记录 domain={} value={}", auth_domain, txt_value);
 
-        // 调用 DNS provider API 设置 TXT 记录
-        super::dns01::set_dns01_record(dns_provider, domain, &txt_value).await
-            .with_context(|| format!("DNS-01 设置 TXT 记录失败 ({})", domain))?;
+        super::dns01::set_dns01_record(dns_provider, auth_domain, &txt_value).await
+            .with_context(|| format!("DNS-01 设置 TXT 记录失败 ({})", auth_domain))?;
 
-        cleanup_records.push((domain.to_string(), txt_value.to_string()));
-
-        // 等待 DNS 传播（推荐至少 30 秒）
-        info!("DNS-01: 等待 DNS 传播（60 秒）...");
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        cleanup_records.push((auth_domain.to_string(), txt_value.to_string()));
 
         // 通知 ACME 服务器可以开始验证
         order.set_challenge_ready(&challenge.url).await
-            .context("通知 ACME DNS-01 challenge ready 失败")?;
+            .with_context(|| format!("通知 ACME DNS-01 challenge ready 失败 ({})", auth_domain))?;
     }
+
+    // 所有 challenge 设置完毕后统一等待 DNS 传播
+    info!("DNS-01: 等待 DNS 传播（60 秒）... 域名: {}", domains_display);
+    tokio::time::sleep(Duration::from_secs(60)).await;
 
     // 等待订单完成（最多 5 分钟）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
@@ -414,16 +440,16 @@ async fn request_acme_cert_dns01(
                 for (d, v) in &cleanup_records {
                     super::dns01::delete_dns01_record(dns_provider, d, v).await.ok();
                 }
-                bail!("ACME DNS-01 订单验证失败（Invalid）");
+                bail!("ACME DNS-01 订单验证失败（Invalid）: {}", domains_display);
             }
             OrderStatus::Pending | OrderStatus::Processing => {
                 if std::time::Instant::now() > deadline {
                     for (d, v) in &cleanup_records {
                         super::dns01::delete_dns01_record(dns_provider, d, v).await.ok();
                     }
-                    bail!("ACME DNS-01 订单超时（5 分钟）");
+                    bail!("ACME DNS-01 订单超时（5 分钟）: {}", domains_display);
                 }
-                info!("DNS-01: 等待验证中... ({})", domain);
+                info!("DNS-01: 等待验证中... ({})", domains_display);
             }
         }
     }
@@ -434,9 +460,9 @@ async fn request_acme_cert_dns01(
             .unwrap_or_else(|e| warn!("DNS-01 清理 TXT 记录失败 ({}): {}", d, e));
     }
 
-    // 生成 CSR 并提交
+    // 生成 CSR 并提交（所有域名作为 SAN）
     let key_pair = KeyPair::generate().context("生成 ACME 密钥对失败")?;
-    let mut params = CertificateParams::new(vec![domain.to_string()])
+    let mut params = CertificateParams::new(domains.to_vec())
         .context("构建证书参数失败")?;
     params.distinguished_name = DistinguishedName::new();
     let csr = params.serialize_request(&key_pair).context("生成 CSR 失败")?;
@@ -464,7 +490,7 @@ async fn request_acme_cert_dns01(
         b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or_default()).collect::<Vec<_>>().join("\n")
     );
 
-    info!("ACME DNS-01 证书申请成功: {}", domain);
+    info!("ACME DNS-01 SAN 证书申请成功: {}", domains_display);
     Ok((cert_chain_pem.into_bytes(), key_pem.into_bytes()))
 }
 
@@ -520,6 +546,109 @@ pub(super) fn reload_acme_cert_in_resolvers(
         }
         Err(e) => error!("ACME 证书热重载失败: {}", e),
     }
+}
+
+/// 立即为指定站点（或所有 ACME 站点）触发证书续期
+///
+/// - `site_filter`：Some("site-name") 仅续期指定站点，None 续期所有 ACME 站点
+/// - 按站点申请 SAN 多域名证书（一张证书覆盖站点所有域名）
+/// - 申请失败时保留当前证书，仅记录错误日志
+/// - 返回 (触发数, 跳过数, 错误列表)
+pub async fn acme_renew_now(
+    cfg: &AppConfig,
+    sni_resolvers: &HashMap<u16, Arc<SniResolver>>,
+    site_filter: Option<&str>,
+) -> (usize, usize, Vec<String>) {
+    let mut triggered = 0usize;
+    let mut skipped = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    for site in &cfg.sites {
+        // 按站点名过滤
+        if let Some(name) = site_filter {
+            if site.name != name { continue; }
+        }
+
+        let Some(tls) = &site.tls else { skipped += 1; continue };
+        if !tls.acme { skipped += 1; continue }
+
+        let email = match &tls.acme_email {
+            Some(e) => e.clone(),
+            None => {
+                let msg = format!("站点 '{}' 未配置 acme_email，跳过", site.name);
+                warn!("{}", msg);
+                errors.push(msg);
+                continue;
+            }
+        };
+
+        let use_dns01 = tls.acme_challenge.as_str() == "dns01";
+
+        // 过滤可用域名（HTTP-01 不支持通配符）
+        let domains: Vec<String> = site.server_name.iter()
+            .filter(|d| {
+                if !use_dns01 && d.starts_with("*.") {
+                    let msg = format!("HTTP-01 不支持通配符 '{}'，跳过", d);
+                    warn!("{}", msg);
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        if domains.is_empty() {
+            errors.push(format!("站点 '{}' 过滤后无可用域名", site.name));
+            continue;
+        }
+
+        // 用主域名定位证书文件
+        let primary = primary_domain(&domains);
+        let cert_path = acme_cert_path(primary);
+        let key_path  = acme_key_path(primary);
+
+        info!("API 触发即时续期: 站点 '{}' ({} 个域名: {}，{})",
+            site.name, domains.len(), domains.join(", "),
+            if use_dns01 { "DNS-01" } else { "HTTP-01" });
+
+        let result = if use_dns01 {
+            match &tls.dns_provider {
+                Some(provider) => {
+                    request_acme_cert_dns01(&domains, &email, &tls.acme_provider, provider).await
+                }
+                None => {
+                    Err(anyhow::anyhow!("站点 '{}' 配置了 dns01 但没有 dns_provider", site.name))
+                }
+            }
+        } else {
+            request_acme_cert(&domains, &email, &tls.acme_provider).await
+        };
+
+        match result {
+            Ok((cert_pem, key_pem)) => {
+                if let Err(e) = save_cert_files(&cert_path, &key_path, &cert_pem, &key_pem) {
+                    let msg = format!("证书保存失败 ({}): {}", site.name, e);
+                    error!("{}", msg);
+                    errors.push(msg);
+                } else {
+                    info!("API 即时续期成功: {} ({})", site.name, domains.join(", "));
+                    reload_acme_cert_in_resolvers(
+                        &cert_path, &key_path,
+                        &site.server_name,
+                        sni_resolvers,
+                    );
+                    triggered += 1;
+                }
+            }
+            Err(e) => {
+                let msg = format!("站点 '{}' 证书申请失败: {}（继续使用当前证书）", site.name, e);
+                error!("{}", msg);
+                errors.push(msg);
+            }
+        }
+    }
+
+    (triggered, skipped, errors)
 }
 
 /// 保存证书文件到磁盘

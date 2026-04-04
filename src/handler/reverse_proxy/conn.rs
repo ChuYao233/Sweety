@@ -7,6 +7,8 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tracing::debug;
 use sweety_web::{
     body::{RequestBody, ResponseBody},
@@ -17,6 +19,7 @@ use super::error::{IoContext, ProxyError};
 use super::pool::{ConnPool, PooledConn};
 use super::response::{apply_response_headers, parse_status_code};
 use super::tls_client::tls_connect;
+use crate::config::model::UpstreamAddr;
 use crate::middleware::proxy_cache::{CacheKey, ProxyCache};
 
 /// 向上游转发请求，优先复用连接池里的 idle 连接
@@ -24,7 +27,7 @@ use crate::middleware::proxy_cache::{CacheKey, ProxyCache};
 #[allow(clippy::too_many_arguments)]
 pub async fn forward_request(
     pool: &ConnPool,
-    upstream_addr: &str,
+    upstream_addr: &UpstreamAddr,
     method: &str,
     path: &str,
     host: &str,
@@ -49,8 +52,13 @@ pub async fn forward_request(
     write_timeout_secs: u64,
     // false = 流式透传（不等上游响应体完成即开始转发）
     proxy_buffering: bool,
+    // 向上游发送 PROXY protocol 头（0=不发送，1=v1，2=v2）
+    send_proxy_protocol: u8,
+    // 客户端真实 socket 地址（用于 PROXY protocol src）
+    client_addr: Option<std::net::SocketAddr>,
 ) -> Result<WebResponse> {
-    debug!("转发 {} {} → {} (tls={})", method, path, upstream_addr, use_tls);
+    let addr_display = upstream_addr.as_str();
+    debug!("转发 {} {} → {} (tls={})", method, path, addr_display, use_tls);
 
     // 从 extra_headers 提取 Content-Length（如果客户端提供了就透传，否则用 chunked）
     let known_content_length: Option<u64> = extra_headers.iter()
@@ -61,7 +69,7 @@ pub async fn forward_request(
     let has_expect_continue = extra_headers.iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("expect") && v.eq_ignore_ascii_case("100-continue"));
 
-    let key = PooledConn::key(upstream_addr, use_tls);
+    let key = PooledConn::key_from_addr(upstream_addr, use_tls);
 
     // body 用 Option 包装：首次 take() 消费，若 body 未消费则可重试（idle 连接失效场景）
     let mut body_slot = Some(req_body);
@@ -69,15 +77,15 @@ pub async fn forward_request(
     for attempt in 0..2u8 {
         let (conn, created_at, req_count) = if attempt == 0 {
             match pool.acquire(&key) {
-                Some((c, ca, rc)) => { debug!("复用 idle 连接: {}", upstream_addr); (c, ca, rc) }
+                Some((c, ca, rc)) => { debug!("复用 idle 连接: {}", addr_display); (c, ca, rc) }
                 None => {
-                    let c = new_conn(upstream_addr, use_tls, tls_sni, tls_insecure, connect_timeout_secs).await?;
+                    let c = new_conn(upstream_addr, use_tls, tls_sni, tls_insecure, connect_timeout_secs, send_proxy_protocol, client_addr).await?;
                     (c, Instant::now(), 0u64)
                 }
             }
         } else {
-            debug!("重试新建连接: {}", upstream_addr);
-            let c = new_conn(upstream_addr, use_tls, tls_sni, tls_insecure, connect_timeout_secs).await?;
+            debug!("重试新建连接: {}", addr_display);
+            let c = new_conn(upstream_addr, use_tls, tls_sni, tls_insecure, connect_timeout_secs, send_proxy_protocol, client_addr).await?;
             (c, Instant::now(), 0u64)
         };
 
@@ -169,33 +177,109 @@ async fn pipe_request_body<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// 新建一个上游连接
+/// 新建一个上游连接（TCP 或 Unix socket）
+///
+/// TCP 路径：TcpStream::connect + 可选 TLS，与原实现完全一致
+/// Unix 路径：UnixStream::connect + 可选 TLS，仅 unix 平台编译
+///
+/// PROXY protocol 注入时序：connect → PROXY header → TLS 握手
+/// （PROXY header 是传输层协议，必须在 TLS 加密之前发送）
 async fn new_conn(
-    upstream_addr: &str,
+    upstream_addr: &UpstreamAddr,
     use_tls: bool,
     tls_sni: &str,
     tls_insecure: bool,
     connect_timeout_secs: u64,
+    send_proxy_protocol: u8,
+    client_addr: Option<std::net::SocketAddr>,
 ) -> Result<PooledConn> {
     let timeout = if connect_timeout_secs > 0 { connect_timeout_secs } else { 10 };
-    let tcp = tokio::time::timeout(
-        Duration::from_secs(timeout),
-        TcpStream::connect(upstream_addr),
-    ).await
-    .map_err(|_| ProxyError::ConnTimeout {
-        addr: upstream_addr.to_string(),
-        timeout_secs: timeout,
-    })
-    .and_then(|r| r.map_err(|e| ProxyError::from_io(upstream_addr, e, IoContext::Connect)))?;
-    // TCP_NODELAY：禁用 Nagle，确保请求头和 body 立即发出，降低代理延迟
-    let _ = tcp.set_nodelay(true);
+    let addr_str = upstream_addr.as_str();
 
-    if use_tls {
-        let tls = tls_connect(tcp, tls_sni, tls_insecure).await?;
-        Ok(PooledConn::Tls(Box::new(tls)))
-    } else {
-        Ok(PooledConn::Tcp(tcp))
+    match upstream_addr {
+        UpstreamAddr::Tcp(addr) => {
+            let mut tcp = tokio::time::timeout(
+                Duration::from_secs(timeout),
+                TcpStream::connect(addr.as_str()),
+            ).await
+            .map_err(|_| ProxyError::ConnTimeout {
+                addr: addr.clone(),
+                timeout_secs: timeout,
+            })
+            .and_then(|r| r.map_err(|e| ProxyError::from_io(addr_str, e, IoContext::Connect)))?;
+            // TCP_NODELAY：禁用 Nagle，确保请求头和 body 立即发出，降低代理延迟
+            let _ = tcp.set_nodelay(true);
+
+            // PROXY protocol 注入（在 TLS 握手之前）
+            if send_proxy_protocol > 0 {
+                if let Some(src) = client_addr {
+                    let dst = tcp.local_addr().unwrap_or_else(|_| src);
+                    write_proxy_header(&mut tcp, send_proxy_protocol, src, dst).await?;
+                }
+            }
+
+            if use_tls {
+                let tls = tls_connect(tcp, tls_sni, tls_insecure).await?;
+                Ok(PooledConn::Tls(Box::new(tls)))
+            } else {
+                Ok(PooledConn::Tcp(tcp))
+            }
+        }
+        #[cfg(unix)]
+        UpstreamAddr::Unix(path) => {
+            let mut uds = tokio::time::timeout(
+                Duration::from_secs(timeout),
+                UnixStream::connect(path.as_str()),
+            ).await
+            .map_err(|_| ProxyError::ConnTimeout {
+                addr: format!("unix:{}", path),
+                timeout_secs: timeout,
+            })
+            .and_then(|r| r.map_err(|e| ProxyError::from_io(addr_str, e, IoContext::Connect)))?;
+
+            // PROXY protocol 注入（在 TLS 握手之前）
+            if send_proxy_protocol > 0 {
+                if let Some(src) = client_addr {
+                    // Unix socket 没有本地 TCP 地址，dst 使用 src 的 IP + port 0
+                    let dst = std::net::SocketAddr::new(src.ip(), 0);
+                    write_proxy_header(&mut uds, send_proxy_protocol, src, dst).await?;
+                }
+            }
+
+            if use_tls {
+                let tls = tls_connect(uds, tls_sni, tls_insecure).await?;
+                Ok(PooledConn::TlsUnix(Box::new(tls)))
+            } else {
+                Ok(PooledConn::Unix(uds))
+            }
+        }
     }
+}
+
+/// 向上游连接写入 PROXY protocol 头（v1 文本或 v2 二进制）
+async fn write_proxy_header<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    version: u8,
+    src: std::net::SocketAddr,
+    dst: std::net::SocketAddr,
+) -> Result<()> {
+    use super::proxy_protocol::{encode_v1, encode_v2};
+    match version {
+        1 => {
+            let (buf, len) = encode_v1(src, dst);
+            writer.write_all(&buf[..len]).await
+                .map_err(|e| anyhow::anyhow!("写入 PROXY v1 头失败: {}", e))?;
+        }
+        2 => {
+            let (buf, len) = encode_v2(src, dst);
+            writer.write_all(&buf[..len]).await
+                .map_err(|e| anyhow::anyhow!("写入 PROXY v2 头失败: {}", e))?;
+        }
+        _ => {
+            debug!("未知 send_proxy_protocol 版本 {}，跳过", version);
+        }
+    }
+    Ok(())
 }
 
 /// HTTP/1.1 请求发送 + 响应读取（支持 chunked 流式请求体、100-Continue、逐包超时）
@@ -746,29 +830,47 @@ fn rewrite_body_urls(
     bytes
 }
 
-/// 健康检查探活（HEAD 请求，支持 HTTP/HTTPS）
-pub async fn probe_health(addr: &str, path: &str, use_tls: bool, sni: &str, insecure: bool) -> Result<u16> {
-    let tcp = TcpStream::connect(addr).await?;
-    let req = format!("HEAD {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    if use_tls {
-        let tls = tls_connect(tcp, sni, insecure).await?;
-        let (r, mut w) = tokio::io::split(tls);
-        w.write_all(req.as_bytes()).await?;
-        w.flush().await?;
-        let mut buf: BufReader<_> = BufReader::new(r);
-        let mut line = String::new();
-        buf.read_line(&mut line).await?;
-        Ok(parse_status_code(&line))
-    } else {
-        let (r, mut w) = tokio::io::split(tcp);
-        w.write_all(req.as_bytes()).await?;
-        w.flush().await?;
-        let mut buf: BufReader<_> = BufReader::new(r);
-        let mut line = String::new();
-        buf.read_line(&mut line).await?;
-        Ok(parse_status_code(&line))
+/// 健康检查探活（HEAD 请求，支持 TCP/Unix + HTTP/HTTPS）
+pub async fn probe_health(addr: &UpstreamAddr, path: &str, use_tls: bool, sni: &str, insecure: bool) -> Result<u16> {
+    let host = addr.as_str();
+    let req = format!("HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    /// 泛型内部函数：对任意 IO 流发送 HEAD 探活请求，编译器单态化消除虚调用
+    async fn do_probe<IO: AsyncRead + AsyncWrite + Unpin>(
+        io: IO, req: &[u8], use_tls: bool, sni: &str, insecure: bool,
+    ) -> Result<u16> {
+        if use_tls {
+            let tls = tls_connect(io, sni, insecure).await?;
+            let (r, mut w) = tokio::io::split(tls);
+            w.write_all(req).await?;
+            w.flush().await?;
+            let mut buf: BufReader<_> = BufReader::new(r);
+            let mut line = String::new();
+            buf.read_line(&mut line).await?;
+            Ok(parse_status_code(&line))
+        } else {
+            let (r, mut w) = tokio::io::split(io);
+            w.write_all(req).await?;
+            w.flush().await?;
+            let mut buf: BufReader<_> = BufReader::new(r);
+            let mut line = String::new();
+            buf.read_line(&mut line).await?;
+            Ok(parse_status_code(&line))
+        }
+    }
+
+    match addr {
+        UpstreamAddr::Tcp(a) => {
+            let tcp = TcpStream::connect(a.as_str()).await?;
+            do_probe(tcp, req.as_bytes(), use_tls, sni, insecure).await
+        }
+        #[cfg(unix)]
+        UpstreamAddr::Unix(p) => {
+            let uds = UnixStream::connect(p.as_str()).await?;
+            do_probe(uds, req.as_bytes(), use_tls, sni, insecure).await
+        }
     }
 }
 
 // 让泛型约束更简洁
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWrite};

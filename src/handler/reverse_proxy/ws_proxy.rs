@@ -21,7 +21,11 @@ use bytes::Bytes;
 use futures_util::stream::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf as TokioReadBuf};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tracing::{debug, trace, warn};
+
+use crate::config::model::UpstreamAddr;
 use sweety_web::{
     body::{RequestBody, ResponseBody},
     http::{StatusCode, WebResponse},
@@ -147,7 +151,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_ws_proxy(
     ctx: &WebContext<'_, AppState>,
-    upstream_addr: &str,
+    upstream_addr: &UpstreamAddr,
     use_tls: bool,
     tls_sni: &str,
     tls_insecure: bool,
@@ -169,7 +173,7 @@ pub async fn handle_ws_proxy(
     ).await {
         Ok(resp) => resp,
         Err(e) => {
-            warn!("WS 代理失败 → {}: {}", upstream_addr, e);
+            warn!("WS 代理失败 → {}: {}", upstream_addr.as_str(), e);
             let mut resp = WebResponse::new(ResponseBody::empty());
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
             resp
@@ -180,7 +184,7 @@ pub async fn handle_ws_proxy(
 #[allow(clippy::too_many_arguments)]
 async fn do_ws_proxy(
     ctx: &WebContext<'_, AppState>,
-    upstream_addr: &str,
+    upstream_addr: &UpstreamAddr,
     use_tls: bool,
     tls_sni: &str,
     tls_insecure: bool,
@@ -194,18 +198,10 @@ async fn do_ws_proxy(
     proxy_redirect_to: Option<&str>,
     is_h2_ws: bool,
 ) -> Result<WebResponse> {
-    debug!("WS 代理: {} (tls={}) path={} host={}", upstream_addr, use_tls, path, upstream_host);
+    let addr_display = upstream_addr.as_str();
+    debug!("WS 代理: {} (tls={}) path={} host={}", addr_display, use_tls, path, upstream_host);
 
-    // ── Step 1：连接上游 ──────────────────────────────────────────────────
-    let tcp = tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect(upstream_addr),
-    ).await
-    .map_err(|_| anyhow::anyhow!("连接上游超时: {}", upstream_addr))??;
-    // TCP_NODELAY：WebSocket 帧通常很小，禁用 Nagle 降低帧延迟
-    let _ = tcp.set_nodelay(true);
-
-    // ── Step 2：构造并发送 HTTP Upgrade 请求 ─────────────────────────────
+    // ── Step 1：构造 HTTP Upgrade 请求 ──────────────────────────────────
     // 预分配容量，用 push_str 替代 format! 减少堆分配
     let mut upgrade_req = String::with_capacity(
         path.len() + upstream_host.len() + extra_headers.len() * 32 + 128
@@ -248,18 +244,57 @@ async fn do_ws_proxy(
     }
     upgrade_req.push_str("Connection: Upgrade\r\n\r\n");
 
-    // 根据是否需要 TLS 分支处理
-    if use_tls {
-        let tls = tls_connect(tcp, tls_sni, tls_insecure).await?;
-        ws_handshake_and_relay(
-            ctx, tls, upgrade_req, is_h2_ws,
-            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
-        ).await
-    } else {
-        ws_handshake_and_relay(
-            ctx, tcp, upgrade_req, is_h2_ws,
-            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
-        ).await
+    // ── Step 2：连接上游 + TLS + 握手 + 双向转发 ───────────────
+    /// 泛型内部函数：对任意 IO 流完成 WS 握手和双向转发
+    async fn ws_connect_and_relay<IO: AsyncRead + AsyncReadExt + AsyncWrite + AsyncWriteExt + Unpin + Send + 'static>(
+        ctx: &WebContext<'_, AppState>,
+        io: IO, use_tls: bool, tls_sni: &str, tls_insecure: bool,
+        upgrade_req: String, is_h2_ws: bool,
+        strip_cookie_secure: bool, proxy_cookie_domain: Option<&str>,
+        proxy_redirect_from: Option<&str>, proxy_redirect_to: Option<&str>,
+    ) -> Result<WebResponse> {
+        if use_tls {
+            let tls = tls_connect(io, tls_sni, tls_insecure).await?;
+            ws_handshake_and_relay(
+                ctx, tls, upgrade_req, is_h2_ws,
+                strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
+            ).await
+        } else {
+            ws_handshake_and_relay(
+                ctx, io, upgrade_req, is_h2_ws,
+                strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
+            ).await
+        }
+    }
+
+    match upstream_addr {
+        UpstreamAddr::Tcp(addr) => {
+            let tcp = tokio::time::timeout(
+                Duration::from_secs(10),
+                TcpStream::connect(addr.as_str()),
+            ).await
+            .map_err(|_| anyhow::anyhow!("连接上游超时: {}", addr_display))??;
+            // TCP_NODELAY：WebSocket 帧通常很小，禁用 Nagle 降低帧延迟
+            let _ = tcp.set_nodelay(true);
+            ws_connect_and_relay(
+                ctx, tcp, use_tls, tls_sni, tls_insecure,
+                upgrade_req, is_h2_ws,
+                strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
+            ).await
+        }
+        #[cfg(unix)]
+        UpstreamAddr::Unix(path) => {
+            let uds = tokio::time::timeout(
+                Duration::from_secs(10),
+                UnixStream::connect(path.as_str()),
+            ).await
+            .map_err(|_| anyhow::anyhow!("连接上游超时: {}", addr_display))??;
+            ws_connect_and_relay(
+                ctx, uds, use_tls, tls_sni, tls_insecure,
+                upgrade_req, is_h2_ws,
+                strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
+            ).await
+        }
     }
 }
 

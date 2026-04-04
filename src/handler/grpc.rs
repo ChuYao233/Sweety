@@ -117,7 +117,7 @@ pub async fn handle_sweety(
     }
     drop(body_stream);
 
-    debug!("gRPC 转发: {} {} → {} body={}B", method, path, node.addr, req_body.len());
+    debug!("gRPC 转发: {} {} → {} body={}B", method, path, node.addr.as_str(), req_body.len());
 
     node.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -134,6 +134,8 @@ pub async fn handle_sweety(
         0, 0, 0, // keepalive_requests, keepalive_time, keepalive_max_idle（gRPC 不限制）
         10, 60, 60, // connect_timeout, read_timeout, write_timeout（gRPC 默认值）
         true,        // proxy_buffering=true（gRPC 必须完整读取响应体）
+        node.send_proxy_protocol,
+        Some(*ctx.req().body().socket_addr()),
     ).await;
 
     node.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -166,8 +168,8 @@ pub async fn handle_sweety(
             if node.fail_count.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
                 node.mark_unhealthy();
             }
-            tracing::error!("gRPC 代理失败 → {}: {}", node.addr, e);
-            grpc_error(StatusCode::BAD_GATEWAY, 14, &format!("上游 {} 响应失败", node.addr))
+            tracing::error!("gRPC 代理失败 → {}: {}", node.addr.as_str(), e);
+            grpc_error(StatusCode::BAD_GATEWAY, 14, &format!("上游 {} 响应失败", node.addr.as_str()))
         }
     }
 }

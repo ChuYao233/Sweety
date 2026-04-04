@@ -24,7 +24,7 @@ pub use site::{HstsConfig, SiteConfig};
 pub use tls::{CertKeyPair, DnsProviderConfig, Http3Config, TlsConfig};
 pub use upstream::{
     CircuitBreakerConfig, FastCgiCacheConfig, FastCgiConfig, HealthCheckConfig,
-    LoadBalanceStrategy, UpstreamConfig, UpstreamNode,
+    LoadBalanceStrategy, UpstreamAddr, UpstreamConfig, UpstreamNode,
 };
 
 // ─────────────────────────────────────────────

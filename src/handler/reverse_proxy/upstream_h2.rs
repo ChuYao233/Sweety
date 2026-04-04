@@ -10,9 +10,12 @@ use dashmap::DashMap;
 use h2::client::{self, SendRequest};
 use http::Request;
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 use super::tls_client::tls_connect;
+use crate::config::model::UpstreamAddr;
 
 /// 单条 H2 连接句柄
 struct H2Conn {
@@ -21,7 +24,7 @@ struct H2Conn {
 
 /// 单节点 H2 连接池
 pub struct H2NodePool {
-    addr: String,
+    addr: UpstreamAddr,
     use_tls: bool,
     tls_sni: String,
     tls_insecure: bool,
@@ -32,7 +35,7 @@ pub struct H2NodePool {
 
 impl H2NodePool {
     pub fn new(
-        addr: &str,
+        addr: &UpstreamAddr,
         use_tls: bool,
         tls_sni: &str,
         tls_insecure: bool,
@@ -40,7 +43,7 @@ impl H2NodePool {
         connect_timeout_secs: u64,
     ) -> Self {
         Self {
-            addr: addr.to_string(),
+            addr: addr.clone(),
             use_tls,
             tls_sni: tls_sni.to_string(),
             tls_insecure,
@@ -75,33 +78,58 @@ impl H2NodePool {
         Err(anyhow!("h2 连接池为空"))
     }
 
-    /// 新建一条 H2 连接
+    /// 新建一条 H2 连接（TCP 或 Unix socket）
+    ///
+    /// h2 的 handshake() 本身是泛型的，只需改连接建立部分。
+    /// 用内部泛型函数消除代码重复，编译器单态化后零开销。
     async fn new_conn(&self) -> Result<SendRequest<Bytes>> {
-        let tcp = tokio::time::timeout(
-            self.connect_timeout,
-            TcpStream::connect(&self.addr),
-        ).await
-        .map_err(|_| anyhow!("h2 connect timeout: {}", self.addr))?
-        .map_err(|e| anyhow!("h2 connect: {e}"))?;
-        let _ = tcp.set_nodelay(true);
+        let addr_str = self.addr.as_str();
 
-        if self.use_tls {
-            let tls = tls_connect(tcp, &self.tls_sni, self.tls_insecure).await?;
-            let (sender, conn) = client::Builder::new()
-                .initial_window_size(1 << 20)   // 1MB 流量控制窗口
-                .initial_connection_window_size(1 << 21) // 2MB 连接级窗口
-                .handshake(tls).await
-                .map_err(|e| anyhow!("h2 tls handshake: {e}"))?;
-            tokio::spawn(async move { let _ = conn.await; });
-            Ok(sender)
-        } else {
-            let (sender, conn) = client::Builder::new()
-                .initial_window_size(1 << 20)
-                .initial_connection_window_size(1 << 21)
-                .handshake(tcp).await
-                .map_err(|e| anyhow!("h2c handshake: {e}"))?;
-            tokio::spawn(async move { let _ = conn.await; });
-            Ok(sender)
+        /// 对任意 IO 流执行 H2 握手（可选 TLS），编译器单态化消除虚调用
+        async fn h2_handshake<IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(
+            io: IO, use_tls: bool, tls_sni: &str, tls_insecure: bool,
+        ) -> Result<SendRequest<Bytes>> {
+            if use_tls {
+                let tls = tls_connect(io, tls_sni, tls_insecure).await?;
+                let (sender, conn) = client::Builder::new()
+                    .initial_window_size(1 << 20)   // 1MB 流量控制窗口
+                    .initial_connection_window_size(1 << 21) // 2MB 连接级窗口
+                    .handshake(tls).await
+                    .map_err(|e| anyhow!("h2 tls handshake: {e}"))?;
+                tokio::spawn(async move { let _ = conn.await; });
+                Ok(sender)
+            } else {
+                let (sender, conn) = client::Builder::new()
+                    .initial_window_size(1 << 20)
+                    .initial_connection_window_size(1 << 21)
+                    .handshake(io).await
+                    .map_err(|e| anyhow!("h2c handshake: {e}"))?;
+                tokio::spawn(async move { let _ = conn.await; });
+                Ok(sender)
+            }
+        }
+
+        match &self.addr {
+            UpstreamAddr::Tcp(addr) => {
+                let tcp = tokio::time::timeout(
+                    self.connect_timeout,
+                    TcpStream::connect(addr.as_str()),
+                ).await
+                .map_err(|_| anyhow!("h2 connect timeout: {}", addr_str))?
+                .map_err(|e| anyhow!("h2 connect: {e}"))?;
+                let _ = tcp.set_nodelay(true);
+                h2_handshake(tcp, self.use_tls, &self.tls_sni, self.tls_insecure).await
+            }
+            #[cfg(unix)]
+            UpstreamAddr::Unix(path) => {
+                let uds = tokio::time::timeout(
+                    self.connect_timeout,
+                    UnixStream::connect(path.as_str()),
+                ).await
+                .map_err(|_| anyhow!("h2 unix connect timeout: {}", addr_str))?
+                .map_err(|e| anyhow!("h2 unix connect: {e}"))?;
+                h2_handshake(uds, self.use_tls, &self.tls_sni, self.tls_insecure).await
+            }
         }
     }
 
@@ -142,14 +170,14 @@ impl H2UpstreamPools {
 
     pub fn get_or_create(
         &self,
-        addr: &str,
+        addr: &UpstreamAddr,
         use_tls: bool,
         tls_sni: &str,
         tls_insecure: bool,
         max_conns: usize,
         connect_timeout_secs: u64,
     ) -> Arc<H2NodePool> {
-        let key = format!("{}:{}", if use_tls {"tls"} else {"plain"}, addr);
+        let key = format!("{}:{}", if use_tls {"tls"} else {"plain"}, addr.as_str());
         self.inner.entry(key).or_insert_with(|| {
             Arc::new(H2NodePool::new(addr, use_tls, tls_sni, tls_insecure, max_conns, connect_timeout_secs))
         }).clone()

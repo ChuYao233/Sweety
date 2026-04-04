@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-use crate::config::model::{LoadBalanceStrategy, UpstreamConfig, UpstreamNode};
+use crate::config::model::{LoadBalanceStrategy, UpstreamAddr, UpstreamConfig, UpstreamNode};
 use super::circuit_breaker::CircuitBreaker;
 
 // ─────────────────────────────────────────────
@@ -18,7 +18,7 @@ use super::circuit_breaker::CircuitBreaker;
 
 /// 单个上游节点运行时状态
 pub struct NodeState {
-    pub addr: String,
+    pub addr: UpstreamAddr,
     pub weight: u32,
     /// 健康标志（1 = 健康，0 = 不健康）
     pub healthy: AtomicU32,
@@ -36,6 +36,8 @@ pub struct NodeState {
     pub upstream_host: Option<String>,
     /// 是否用 HTTP/2 连接上游（h2c 或 h2 over TLS）
     pub http2: bool,
+    /// 向上游发送 PROXY protocol 头（0=不发送，1=v1文本，2=v2二进制）
+    pub send_proxy_protocol: u8,
     /// 断路器（None = 未配置，则全程无概履开销）
     pub circuit_breaker: Option<CircuitBreaker>,
 }
@@ -53,7 +55,12 @@ impl std::fmt::Debug for NodeState {
 
 impl NodeState {
     pub fn new(node: &UpstreamNode, cb_cfg: Option<&crate::config::model::CircuitBreakerConfig>) -> Self {
-        let host_part = node.addr.split(':').next().unwrap_or(&node.addr).to_string();
+        // TCP 地址取 host 部分作 SNI；Unix socket 无意义，默认 "localhost"
+        let host_part = match &node.addr {
+            UpstreamAddr::Tcp(s) => s.split(':').next().unwrap_or(s).to_string(),
+            #[cfg(unix)]
+            UpstreamAddr::Unix(_) => "localhost".to_string(),
+        };
         let sni = node.tls_sni.clone().unwrap_or_else(|| host_part.clone());
         let circuit_breaker = cb_cfg.map(|c| {
             CircuitBreaker::new(c.max_failures, c.window_secs, c.fail_timeout)
@@ -69,6 +76,7 @@ impl NodeState {
             tls_insecure: node.tls_insecure,
             upstream_host: node.upstream_host.clone(),
             http2: node.http2,
+            send_proxy_protocol: node.send_proxy_protocol,
             circuit_breaker,
         }
     }
@@ -89,13 +97,13 @@ impl NodeState {
 
     pub fn mark_unhealthy(&self) {
         self.healthy.store(0, Ordering::Relaxed);
-        warn!("上游节点 {} 标记为不健康", self.addr);
+        warn!("上游节点 {} 标记为不健康", self.addr.as_str());
     }
 
     pub fn mark_healthy(&self) {
         self.healthy.store(1, Ordering::Relaxed);
         self.fail_count.store(0, Ordering::Relaxed);
-        debug!("上游节点 {} 恢复健康", self.addr);
+        debug!("上游节点 {} 恢复健康", self.addr.as_str());
     }
 
     /// 记录一次成功（含断路器）
@@ -252,28 +260,28 @@ pub async fn health_check_task(pool: Arc<UpstreamPool>, check_path: String, inte
     loop {
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
         for node in &pool.nodes {
-            let addr     = node.addr.clone();
             let path     = check_path.clone();
             let use_tls  = node.tls;
             let sni      = node.tls_sni.clone();
             let insecure = node.tls_insecure;
+            let addr_display = node.addr.as_str().to_string();
 
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
-                super::conn::probe_health(&addr, &path, use_tls, &sni, insecure),
+                super::conn::probe_health(&node.addr, &path, use_tls, &sni, insecure),
             ).await;
 
             match result {
                 Ok(Ok(code)) if (200..300).contains(&code) => node.mark_healthy(),
                 Ok(Ok(code)) => {
-                    warn!("健康检查 {} 返回 {}", addr, code);
+                    warn!("健康检查 {} 返回 {}", addr_display, code);
                     node.fail_count.fetch_add(1, Ordering::Relaxed);
                     if node.fail_count.load(Ordering::Relaxed) >= 3 {
                         node.mark_unhealthy();
                     }
                 }
-                Ok(Err(e)) => { warn!("健康检查 {} 失败: {}", addr, e); node.mark_unhealthy(); }
-                Err(_)     => { warn!("健康检查 {} 超时", addr); node.mark_unhealthy(); }
+                Ok(Err(e)) => { warn!("健康检查 {} 失败: {}", addr_display, e); node.mark_unhealthy(); }
+                Err(_)     => { warn!("健康检查 {} 超时", addr_display); node.mark_unhealthy(); }
             }
         }
     }
@@ -292,12 +300,14 @@ mod tests {
         UpstreamPool {
             nodes: nodes.iter().map(|(addr, weight)| {
                 Arc::new(NodeState::new(&UpstreamNode {
-                    addr: addr.to_string(),
+                    addr: UpstreamAddr::parse(addr),
                     weight: *weight,
                     tls: false,
                     tls_sni: None,
                     tls_insecure: false,
                     upstream_host: None,
+                    http2: false,
+                    send_proxy_protocol: 0,
                 }, None))
             }).collect(),
             strategy,
@@ -316,7 +326,7 @@ mod tests {
     #[test]
     fn test_round_robin() {
         let pool = make_pool(LoadBalanceStrategy::RoundRobin, &[("a:80", 1), ("b:80", 1), ("c:80", 1)]);
-        let addrs: Vec<String> = (0..6).map(|_| pool.pick(None).unwrap().addr.clone()).collect();
+        let addrs: Vec<String> = (0..6).map(|_| pool.pick(None).unwrap().addr.as_str().to_string()).collect();
         assert_eq!(&addrs[..3], &["a:80", "b:80", "c:80"]);
         assert_eq!(&addrs[3..], &["a:80", "b:80", "c:80"]);
     }
@@ -326,7 +336,7 @@ mod tests {
         let pool = make_pool(LoadBalanceStrategy::RoundRobin, &[("a:80", 1), ("b:80", 1)]);
         pool.nodes[0].mark_unhealthy();
         for _ in 0..5 {
-            assert_eq!(pool.pick(None).unwrap().addr, "b:80");
+            assert_eq!(pool.pick(None).unwrap().addr.as_str(), "b:80");
         }
     }
 
@@ -342,16 +352,16 @@ mod tests {
         let pool = make_pool(LoadBalanceStrategy::LeastConn, &[("a:80", 1), ("b:80", 1)]);
         pool.nodes[0].active_connections.store(5, Ordering::Relaxed);
         pool.nodes[1].active_connections.store(1, Ordering::Relaxed);
-        assert_eq!(pool.pick(None).unwrap().addr, "b:80");
+        assert_eq!(pool.pick(None).unwrap().addr.as_str(), "b:80");
     }
 
     #[test]
     fn test_ip_hash_consistent() {
         let pool = make_pool(LoadBalanceStrategy::IpHash, &[("a:80", 1), ("b:80", 1), ("c:80", 1)]);
         let ip = "192.168.1.100";
-        let first = pool.pick(Some(ip)).unwrap().addr.clone();
+        let first = pool.pick(Some(ip)).unwrap().addr.as_str().to_string();
         for _ in 0..10 {
-            assert_eq!(pool.pick(Some(ip)).unwrap().addr, first);
+            assert_eq!(pool.pick(Some(ip)).unwrap().addr.as_str(), first);
         }
     }
 }

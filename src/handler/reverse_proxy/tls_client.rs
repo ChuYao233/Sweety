@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use rustls::ClientConfig as RustlsClientConfig;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsConnector;
 
 /// 全局单例 TLS 客户端配置（启用 session cache，跳过证书验证模式）
@@ -13,16 +13,16 @@ static TLS_CLIENT_INSECURE: std::sync::OnceLock<Arc<RustlsClientConfig>> = std::
 /// 全局单例 TLS 客户端配置（启用 session cache，标准证书验证模式）
 static TLS_CLIENT_SECURE:   std::sync::OnceLock<Arc<RustlsClientConfig>> = std::sync::OnceLock::new();
 
-/// 对已建立的 TCP 连接执行 TLS 握手，返回加密流
+/// 对已建立的连接执行 TLS 握手，返回加密流
+///
+/// 泛型 IO：支持 TcpStream 和 UnixStream，编译器对具体类型单态化，零虚函数开销
 ///
 /// ClientConfig 全局单例：
 /// - 启用 session cache（ClientSessionMemoryCache 1024），允许 TLS session resumption
 /// - 避免每次请求新建 config 导致 session cache 失效
-pub async fn tls_connect(
-    tcp: TcpStream,
-    sni: &str,
-    insecure: bool,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+pub async fn tls_connect<IO>(io: IO, sni: &str, insecure: bool) -> Result<tokio_rustls::client::TlsStream<IO>>
+where IO: AsyncRead + AsyncWrite + Unpin
+{
     let config = if insecure {
         TLS_CLIENT_INSECURE.get_or_init(build_insecure_config).clone()
     } else {
@@ -31,7 +31,7 @@ pub async fn tls_connect(
     let connector = TlsConnector::from(config);
     let server_name = rustls::pki_types::ServerName::try_from(sni.to_string())
         .map_err(|e| anyhow::anyhow!("无效的 TLS SNI '{}': {}", sni, e))?;
-    connector.connect(server_name, tcp).await
+    connector.connect(server_name, io).await
         .map_err(|e| anyhow::anyhow!("TLS 握手失败 ({}): {}", sni, e))
 }
 

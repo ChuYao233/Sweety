@@ -110,11 +110,61 @@ pub enum LoadBalanceStrategy {
     IpHash,
 }
 
+/// 上游节点地址类型（配置加载时解析，运行时零开销分派）
+#[derive(Debug, Clone, Serialize)]
+pub enum UpstreamAddr {
+    /// TCP 地址（host:port）
+    Tcp(String),
+    /// Unix domain socket 路径（仅 unix 平台）
+    #[cfg(unix)]
+    Unix(String),
+}
+
+impl UpstreamAddr {
+    /// 从配置字符串解析：以 "unix:" 开头视为 Unix socket，否则视为 TCP
+    pub fn parse(addr: &str) -> Self {
+        #[cfg(unix)]
+        {
+            if let Some(path) = addr.strip_prefix("unix:") {
+                return Self::Unix(path.to_string());
+            }
+        }
+        Self::Tcp(addr.to_string())
+    }
+
+    /// 是否为 Unix socket
+    #[inline(always)]
+    pub fn is_unix(&self) -> bool {
+        #[cfg(unix)]
+        { matches!(self, Self::Unix(_)) }
+        #[cfg(not(unix))]
+        { false }
+    }
+
+    /// 返回用于日志/pool key 的显示字符串
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Tcp(s) => s,
+            #[cfg(unix)]
+            Self::Unix(s) => s,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UpstreamAddr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: serde::Deserializer<'de> {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::parse(&s))
+    }
+}
+
 /// 单个上游节点
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UpstreamNode {
-    /// 节点地址（host:port）
-    pub addr: String,
+    /// 节点地址：TCP "host:port" 或 Unix socket "unix:/path/to/sock"
+    pub addr: UpstreamAddr,
 
     /// 权重（用于 Weighted 策略）
     #[serde(default = "default_weight")]
@@ -139,6 +189,10 @@ pub struct UpstreamNode {
     /// 是否用 HTTP/2 连接上游（h2c 或 h2 over TLS）
     #[serde(default)]
     pub http2: bool,
+
+    /// 向上游发送 PROXY protocol 头（0=不发送，1=v1文本，2=v2二进制）
+    #[serde(default)]
+    pub send_proxy_protocol: u8,
 }
 
 /// 健康检查配置

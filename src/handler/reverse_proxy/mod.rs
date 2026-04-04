@@ -1,17 +1,19 @@
 ﻿//! 反向代理处理器
 //! 支持：HTTP / HTTPS / WS / WSS + gzip / chunked 透传
 //! 子模块职责：
-//!   lb.rs           — 负载均衡、节点状态、健康检查
-//!   tls_client.rs   — TLS 客户端连接
-//!   conn.rs         — HTTP/1.1 连接层（发请求/读响应）
-//!   upstream_h2.rs  — HTTP/2 上游连接池（h2c / h2 over TLS）
-//!   response.rs     — 响应头透传、Cookie/Location 改写
+//!   lb.rs              — 负载均衡、节点状态、健康检查
+//!   tls_client.rs      — TLS 客户端连接
+//!   conn.rs            — HTTP/1.1 连接层（发请求/读响应）
+//!   upstream_h2.rs     — HTTP/2 上游连接池（h2c / h2 over TLS）
+//!   response.rs        — 响应头透传、Cookie/Location 改写
+//!   proxy_protocol.rs  — PROXY protocol v1/v2 编码器 + 解析器
 
 pub mod circuit_breaker;
 pub mod conn;
 pub mod error;
 pub mod lb;
 pub mod pool;
+pub mod proxy_protocol;
 pub mod response;
 pub mod tls_client;
 pub mod upstream_h2;
@@ -206,8 +208,8 @@ pub async fn handle_sweety(
             Ok(r) => { node.record_success(); r }
             Err(e) => {
                 node.record_failure();
-                error!("H2 反向代理失败 → {}: {}", node.addr, e);
-                response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 H2 {} 失败: {}", node.addr, e))
+                error!("H2 反向代理失败 → {}: {}", node.addr.as_str(), e);
+                response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 H2 {} 失败: {}", node.addr.as_str(), e))
             }
         }
     } else {
@@ -228,7 +230,7 @@ pub async fn handle_sweety(
                     tokio::time::sleep(tokio::time::Duration::from_secs(pool.retry_timeout)).await;
                 }
                 if let Some(new_node) = pool.pick(Some(&client_ip_str)) {
-                    tracing::debug!("反向代理第 {} 次重试，节点: {}", attempt, new_node.addr);
+                    tracing::debug!("反向代理第 {} 次重试，节点: {}", attempt, new_node.addr.as_str());
                 }
             }
 
@@ -250,6 +252,8 @@ pub async fn handle_sweety(
                 pool.read_timeout,
                 pool.write_timeout,
                 location.proxy_buffering,
+                node.send_proxy_protocol,
+                Some(*ctx.req().body().socket_addr()),
             ).await;
 
             match result {
@@ -261,13 +265,13 @@ pub async fn handle_sweety(
                 Err(e) => {
                     node.record_failure();
                     last_err = format!("{}", e);
-                    error!("反向代理转发失败 (attempt {}/{}) → {}: {}", attempt + 1, max_attempts, node.addr, e);
+                    error!("反向代理转发失败 (attempt {}/{}) → {}: {}", attempt + 1, max_attempts, node.addr.as_str(), e);
                 }
             }
         }
 
         resp_opt.unwrap_or_else(|| {
-            response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败: {}", node.addr, last_err))
+            response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败: {}", node.addr.as_str(), last_err))
         })
     };
 

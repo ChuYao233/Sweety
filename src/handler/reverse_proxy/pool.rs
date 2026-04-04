@@ -17,7 +17,11 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio_rustls::client::TlsStream;
+
+use crate::config::model::UpstreamAddr;
 
 // per-thread 连接池存储：key = "tcp:addr" 或 "tls:addr"
 // 使用 thread_local! 完全消除跨 worker 的锁竞争，等价 Nginx per-worker keepalive
@@ -118,10 +122,15 @@ struct IdleConn {
     request_count: u64,
 }
 
-/// 池化连接（TCP 或 TLS 统一枚举）
+/// 池化连接（TCP / TLS / Unix socket 统一枚举）
+/// 编译器对 match 枚举的内联等价于直接调用，零虚函数开销
 pub enum PooledConn {
     Tcp(TcpStream),
     Tls(Box<TlsStream<TcpStream>>),
+    #[cfg(unix)]
+    Unix(UnixStream),
+    #[cfg(unix)]
+    TlsUnix(Box<TlsStream<UnixStream>>),
 }
 
 impl PooledConn {
@@ -133,13 +142,36 @@ impl PooledConn {
         k.push_str(addr);
         k
     }
+
+    /// 从 UpstreamAddr 生成连接池 key，区分 tcp/tls/unix/tls-unix
+    pub fn key_from_addr(addr: &UpstreamAddr, tls: bool) -> String {
+        match addr {
+            UpstreamAddr::Tcp(s) => {
+                let prefix = if tls { "tls:" } else { "tcp:" };
+                let mut k = String::with_capacity(prefix.len() + s.len());
+                k.push_str(prefix);
+                k.push_str(s);
+                k
+            }
+            #[cfg(unix)]
+            UpstreamAddr::Unix(s) => {
+                let prefix = if tls { "tls-unix:" } else { "unix:" };
+                let mut k = String::with_capacity(prefix.len() + s.len());
+                k.push_str(prefix);
+                k.push_str(s);
+                k
+            }
+        }
+    }
 }
 
 /// TcpStream 和 TlsStream 在实际使用中都是 Unpin 安全的
 impl Unpin for PooledConn {}
 
 /// 为 PooledConn 实现 AsyncRead + AsyncWrite，统一读写接口
+/// #[inline(always)] 确保编译器将 match 分派内联到调用点，等价于直接调用
 impl AsyncRead for PooledConn {
+    #[inline(always)]
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -148,11 +180,16 @@ impl AsyncRead for PooledConn {
         match self.get_mut() {
             PooledConn::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             PooledConn::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+            #[cfg(unix)]
+            PooledConn::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(unix)]
+            PooledConn::TlsUnix(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
 
 impl AsyncWrite for PooledConn {
+    #[inline(always)]
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -161,9 +198,14 @@ impl AsyncWrite for PooledConn {
         match self.get_mut() {
             PooledConn::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             PooledConn::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+            #[cfg(unix)]
+            PooledConn::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(unix)]
+            PooledConn::TlsUnix(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
+    #[inline(always)]
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -171,9 +213,14 @@ impl AsyncWrite for PooledConn {
         match self.get_mut() {
             PooledConn::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
             PooledConn::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+            #[cfg(unix)]
+            PooledConn::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(unix)]
+            PooledConn::TlsUnix(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
+    #[inline(always)]
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -181,6 +228,10 @@ impl AsyncWrite for PooledConn {
         match self.get_mut() {
             PooledConn::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             PooledConn::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+            #[cfg(unix)]
+            PooledConn::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(unix)]
+            PooledConn::TlsUnix(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }

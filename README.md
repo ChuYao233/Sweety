@@ -1,193 +1,171 @@
 # Sweety
 
-高性能、单文件部署的多站点 Web 服务器，纯 Rust 编写。
-Sweety 试图兼顾 nginx 级别的可调优能力，以及 Caddy 式的最小配置体验。
+[![GitHub release](https://img.shields.io/github/v/tag/ChuYao233/Sweety)](https://github.com/ChuYao233/Sweety/releases)
+[![GitHub](https://img.shields.io/github/license/ChuYao233/Sweety)](https://github.com/ChuYao233/Sweety/blob/main/LICENSE)
+[![GitHub last commit](https://img.shields.io/github/last-commit/ChuYao233/Sweety)](https://github.com/ChuYao233/Sweety/commits/main)
+[![GitHub issues](https://img.shields.io/github/issues/ChuYao233/Sweety)](https://github.com/ChuYao233/Sweety/issues)
 
+[简体中文](/README_CN.md) | [English](/README.md)
 
-底层 HTTP 栈 fork 自 [xitca-web](https://github.com/HFQR/xitca-web)，自主维护于 `vendor/` 目录，包含多项生产场景性能修复和优化。
+> A high-performance, single-binary, multi-site web server written in pure Rust.
+> Nginx-level tunability meets Caddy-style simplicity.
 
-Sweety 当前在小文件高并发和大文件传输场景下均优于 nginx 默认配置，主要优化空间集中在 100KB ~ 5MB 的 HTTPS/H2 中等体积响应区间。
-> ## 性能基准
->
-> **测试环境**：Intel J4105 四核四线程 @ 1.5GHz · 2GB RAM · Debian Linux
-> **测试工具**：[bombardier](https://github.com/codesenberg/bombardier) v1.2.6
-> **对比版本**：Nginx 1.28.1 vs Sweety v0.7.1
-> **协议**：HTTPS/2，TLS 1.3，Keep-Alive，证书 ECDSA P-256
->
-> **复现命令**：
-> ```bash
-> # 小文件高并发（1KB / 10KB / 100KB）
-> bombardier -c 1000 -d 30s -k --latencies --http2 -t 30s https://<host>/1kb.bin
-> # 中文件（1MB）
-> bombardier -c 200 -d 30s -k --latencies --http2 -t 30s https://<host>/1mb.bin
-> # 大文件（10MB）
-> bombardier -c 100 -d 30s -k --latencies --http2 -t 30s https://<host>/10mb.bin
-> ```
->
-> ### 小文件高并发（1KB，-c 1000）
->
-> | 指标 | Nginx 1.28.1 | Sweety | 优势 |
-> |------|------------|--------|------|
-> | RPS | ~6,227 | **15,133** | **+143%** |
-> | 吞吐量 | 8.08 MB/s | **16.91 MB/s** | **+109%** |
-> | P50 延迟 | 109.88ms | **65.12ms** | 节省 41% |
-> | P90 延迟 | 284.93ms | **68.02ms** | **节省 76%** |
-> | P95 延迟 | 530.32ms | **69.16ms** | **节省 87%** |
-> | P99 延迟 | 1,360ms | **76.14ms** | **节省 94%** |
-> | Stdev | 179.27ms | **7.16ms** | **极其平稳** |
-> | 错误数 | ~20,467 (GOAWAY¹) | **0** | 零错误 |
->
-> ### 小文件（10KB，-c 1000）
->
-> | 指标 | Nginx 1.28.1 | Sweety | 优势 |
-> |------|------------|--------|------|
-> | RPS | 6,024 | **12,697** | **+111%** |
-> | 吞吐量 | 56.07 MB/s | **126.26 MB/s** | **+125%** |
-> | P50 延迟 | 123.47ms | **79.08ms** | 节省 36% |
-> | P90 延迟 | 263.96ms | **81.85ms** | **节省 69%** |
-> | P99 延迟 | 1,400ms | **86.70ms** | **节省 94%** |
-> | Stdev | 160.47ms | **1.96ms** | **极其平稳** |
-> | 错误数 | 17,903 (GOAWAY¹) | **0** | 零错误 |
->
-> ### 中文件（100KB，-c 1000）
->
-> | 指标 | Nginx 1.28.1 | Sweety | 差异 |
-> |------|------------|--------|------|
-> | RPS | **2,594** | 1,398 | Nginx +86% |
-> | 吞吐量 | **253.14 MB/s** | 138.43 MB/s | Nginx 带宽更高 |
-> | P50 延迟 | **397.73ms** | 613.71ms | — |
-> | P99 延迟 | 719.53ms | 2,150ms | — |
-> | 错误数 | 1,284 (GOAWAY¹) | **0** | Sweety 零错误 |
->
-> ### 中文件（1MB，-c 200）
->
-> | 指标 | Nginx 1.28.1 | Sweety | 差异 |
-> |------|------------|--------|------|
-> | RPS | **218.93** | 176.23 | Nginx +24% |
-> | 吞吐量 | **216.55 MB/s** | 179.55 MB/s | Nginx 带宽更高 |
-> | P50 延迟 | **0.90s** | 1.00s | 相近 |
-> | P99 延迟 | 2.50s | **1.94s** | Sweety 更低 |
-> | 错误数 | 167 (GOAWAY¹) | **0** | Sweety 零错误 |
->
-> ### 大文件（10MB，-c 100）
->
-> | 指标 | Nginx 1.28.1 | Sweety | 差异 |
-> |------|------------|--------|------|
-> | RPS | 14.53 | **16.75** | **+15%** |
-> | 吞吐量 | 170.40 MB/s | **180.17 MB/s** | **+6%** |
-> | P50 延迟 | 6.25s | **5.25s** | 节省 16% |
-> | P99 延迟 | 8.28s | **7.88s** | 相近 |
-> | 错误数 | 0 | **0** | 持平 |
->
-> ### 结论
->
-> | 场景 | 优势方 | 说明 |
-> |------|--------|------|
-> | **小文件（≤10KB）高并发** | **Sweety 大幅领先** | RPS +100%~+143%，延迟尾部低 94%，零 GOAWAY 错误 |
-> | **大文件（≥10MB）** | **Sweety 持平/小幅领先** | 吞吐 +6%，延迟更低，内存恒定 |
-> | **中文件（100KB~1MB）带宽压力** | Nginx 更高 | Nginx sendfile 内核路径优势，Sweety RPS 较低 |
->
-> **Sweety 优势场景**：API 网关 / 小静态资源 CDN 分发 / 高并发低延迟要求 / 零运维（ACME 自动证书 + 热重载）
-> **Nginx 优势场景**：百 KB 级大量并发下载（sendfile 内核优化），极端带宽压榨
->
-> ---
-> ¹ **GOAWAY 说明**：Nginx 默认 `http2_max_concurrent_streams 128`，bombardier `-c 1000` 发起 1000 个并发 stream，超出单连接上限后 Nginx 按 RFC 7540 发送 GOAWAY 通知客户端新开连接，bombardier 重试失败计入 error。这是**正确的 H2 流控行为，不是 Nginx 的 bug 或配置错误**。配置 `http2_max_concurrent_streams 1024` 可消除此错误，但会将所有流集中在少数连接上，单核 TLS 加密成为瓶颈。Sweety 同样默认 128，差异在于 Sweety 的 H2 实现对超额 stream 采用排队而非立即 GOAWAY，因此无错误但高并发下延迟更高（见 100KB P99 对比）。
+The underlying HTTP stack is forked from [xitca-web](https://github.com/HFQR/xitca-web) and independently maintained under `vendor/`, with numerous production-oriented performance fixes and optimizations.
+
+📚 **[Documentation](https://sweety.2o.nz)** | ⚙️ **[Config Example](config/sweety.config.example)** | � **[Benchmarks](https://sweety.2o.nz/benchmark/)** | �️ **[Roadmap](https://sweety.2o.nz/roadmap/)**
 
 ---
 
-## 文档
+## Features
 
-| | |
-|---|---|
-| 📚 完整文档 | [docs/](docs/README.md) |
-| 🚀 快速开始 | [docs/getting-started/quickstart.md](docs/getting-started/quickstart.md) |
-| ⚙️ 配置参考 | [docs/configuration/overview.md](docs/configuration/overview.md) |
-| 🗺️ Roadmap | [docs/roadmap.md](docs/roadmap.md) |
-| 📄 配置示例 | [config/sweety.example.toml](config/sweety.example.toml) |
+### Protocol Support
 
----
+- 🌐 **HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC)** — all protocols served from a single process
+- 🔒 **TLS** — pure Rust via Rustls, zero OpenSSL dependency; multi-cert SNI with automatic selection
+- 📜 **ACME Auto-Certificates** — HTTP-01 + DNS-01, supports Let's Encrypt / ZeroSSL / Buypass; wildcard certs; self-signed placeholder on startup, hot-reload on issuance (Caddy-style)
+- 🔌 **WebSocket** — H1 Upgrade (RFC 6455) + H2 extended CONNECT (RFC 8441) full passthrough
 
-## 特性速览
+### Request Handling
 
-### 协议
-- **HTTP/1.1 + HTTP/2 + HTTP/3（QUIC）** 同一进程同时监听
-- **TLS**：Rustls 纯 Rust，无 OpenSSL 依赖；多证书 SNI 自动选最优
-- **ACME 自动证书**：HTTP-01 + DNS-01，支持 Let's Encrypt / ZeroSSL / Buypass，通配符证书；自签名占位启动，申请成功后热重载（对标 Caddy）
-- **WebSocket**：H1 Upgrade（RFC 6455）+ H2 extended CONNECT（RFC 8441）全透传
+- 📁 **Static Files** — in-memory cache + Range + ETag/Last-Modified + `try_files` + sendfile(2) zero-copy
+- 🐘 **PHP / FastCGI** — Unix socket / TCP connection pool + `fastcgi_cache`; correct HTTP/2 Cookie merging (RFC 7540 §8.1.2.5), compatible with WordPress / Laravel
+- 🔄 **Reverse Proxy** — round-robin / weighted / least-conn / IP hash + connection pool + active health checks + `proxy_cache`
+- 📡 **gRPC Proxy** — automatic `application/grpc` + Trailer handling
+- 🔑 **auth_request** — subrequest-based authentication
 
-### 请求处理
-- **静态文件**：内存缓存 + Range + ETag/Last-Modified + `try_files` + sendfile(2)
-- **PHP/FastCGI**：Unix Socket / TCP 连接池 + `fastcgi_cache`；正确处理 HTTP/2 Cookie 合并（RFC 7540 §8.1.2.5），兼容 WordPress / Laravel 等主流框架
-- **反向代理**：轮询 / 加权 / 最少连接 / IP 哈希 + 连接池 + 主动健康检查 + `proxy_cache`
-- **gRPC 代理**：自动处理 `application/grpc` + Trailer
-- **auth_request** 子请求鉴权
+### Routing
 
-### 路由
-- 虚拟主机（精确 / 通配符 / fallback 兜底）
-- Location 四级优先级：`= 精确` > `^~ 前缀优先` > `~ 正则` > `普通前缀`
-- Rewrite 规则：正则捕获，`last/break/redirect/permanent`，`!-f/!-d` 条件
+- 🏠 **Virtual Hosts** — exact match / wildcard / fallback catch-all
+- 📍 **Location Priority** — `= exact` > `^~ prefix-priority` > `~ regex` > `prefix`
+- ✏️ **Rewrite Rules** — regex capture, `last/break/redirect/permanent`, `!-f/!-d` conditions
 
-### 性能架构
-- **SO_REUSEPORT 多核扩展**：每个 worker 线程独立 bind 同一端口，内核负载均衡，无锁竞争
-- **H2 per-connection writer loop**：每连接单独 writer task，HEADERS 优先 + round-robin DATA 调度，消除 head-of-line blocking
-- **write fairness**：固定 16KB chunk 轮转调度，防止大流下载饿死小请求
-- **零 CPU 空转**：writer loop 基于 `tokio::select!` 事件驱动，无 busy spin
+### Performance Architecture
 
-### 可靠性
-- **断路器**：三状态机（Closed → Open → Half-Open），比 Nginx `max_fails` 更精确
-- **五维度令牌桶限流**：IP / 路径 / IP+路径 / Header / User-Agent
-- **配置热重载**：不断开现有连接，等价 `nginx -s reload`
+- ⚡ **SO_REUSEPORT Multi-Core Scaling** — each worker thread independently binds the same port, kernel load-balances, zero lock contention
+- 🚀 **H2 Per-Connection Writer Loop** — dedicated writer task per connection, HEADERS-priority + round-robin DATA scheduling, eliminates head-of-line blocking
+- ⚖️ **Write Fairness** — fixed 16KB chunk round-robin, prevents large downloads from starving small requests
+- 💤 **Zero CPU Idle Spin** — writer loop is `tokio::select!` event-driven, no busy spin
 
-### 运维
-- **Admin REST API**：健康检查 / 统计 / 节点管理 / 热重载
-- **访问日志**：combined / json / 自定义模板，异步写
-- **Prometheus 指标**：`/metrics` 端点
+### Reliability
+
+- 🛡️ **Circuit Breaker** — three-state machine (Closed → Open → Half-Open), more precise than Nginx `max_fails`
+- 🚦 **5-Dimension Rate Limiting** — IP / path / IP+path / header / User-Agent token buckets
+- 🔥 **Hot Reload** — reload config without dropping existing connections (`nginx -s reload` equivalent)
+
+### Operations
+
+- 🖥️ **Admin REST API** — health checks / stats / node management / hot reload
+- 📝 **Access Logs** — combined / JSON / custom template, async writer
+- 📊 **Prometheus Metrics** — `/metrics` endpoint built-in
 
 ---
 
-## 快速编译 & 运行
+## Quick Start
+
+### Installation
+
+#### Build from Source
 
 ```bash
+# Clone and build
+git clone https://github.com/ChuYao233/Sweety.git
+cd Sweety
 cargo build --release
 
-# 验证配置（等价 nginx -t）
-./target/release/sweety validate
-
-# 启动
-./target/release/sweety run
-
-# 热重载
-./target/release/sweety reload
+# The binary is at target/release/sweety
 ```
 
+#### Download Pre-built Binary
+
+Pre-built binaries for Linux (x86_64 musl static) are available on the [Releases](https://github.com/ChuYao233/Sweety/releases) page.
+
+### Usage
+
+```bash
+# Validate configuration (equivalent to nginx -t)
+./sweety validate
+
+# Start the server
+./sweety run
+
+# Hot reload configuration
+./sweety reload
+```
+
+### Minimal Configuration
+
+```toml
+[global]
+log_level = "info"
+
+[[sites]]
+name        = "my-site"
+server_name = ["example.com"]
+listen      = [80]
+listen_tls  = [443]
+root        = "/var/www/html"
+
+# Automatic HTTPS — just add your email
+acme_email = "you@example.com"
+
+[[sites.locations]]
+path    = "/"
+handler = "static"
+```
+
+For a complete configuration reference with all options, see [config/sweety.config.example](config/sweety.config.example).
+
 ---
 
-## 横向对比
+## Comparison
 
-> ⚠️ Sweety 尚未经过生产环境验证，欢迎在测试/开发环境试用并反馈问题。
+> ⚠️ Sweety has not yet been validated in production. Feedback from testing/staging environments is welcome.
 
-| 功能 | Sweety | Nginx | Caddy | Apache |
-|------|--------|-------|-------|--------|
-| HTTP/3 内置 | ✅ | ❌ 需重编译 | ✅ | ❌ 实验模块 |
-| ACME 自动证书 | ✅ HTTP-01 + DNS-01 | ❌ 需 certbot | ✅ | ❌ 需插件 |
-| Brotli 压缩 | ✅ 内置 | ❌ 第三方模块 | ✅ | ✅ mod_brotli |
-| 断路器 | ✅ 三状态机 | ⚠️ max_fails 仅计数 | ❌ | ❌ |
-| WebSocket H2（RFC 8441） | ✅ | ✅ | ✅ | ✅ |
-| gRPC 代理 | ✅ | ✅（商业版全功能） | ✅ | ⚠️ 有限 |
-| FastCGI 响应缓存 | ✅ | ✅ | ❌ | ✅ |
-| 静态文件内存缓存 | ✅ | ✅ OS page cache | ❌ | ✅ |
-| 配置易用性 | ✅ 预设 + 语法糖 | ❌ 纯手写 | ✅ Caddyfile | ⚠️ 冗长 |
+| Feature | Sweety | Nginx | Caddy | Apache |
+|---------|--------|-------|-------|--------|
+| Built-in HTTP/3 | ✅ | ❌ Requires recompile | ✅ | ❌ Experimental |
+| ACME Auto-Cert | ✅ HTTP-01 + DNS-01 | ❌ Needs certbot | ✅ | ❌ Needs plugin |
+| Brotli Compression | ✅ Built-in | ❌ Third-party module | ✅ | ✅ mod_brotli |
+| Circuit Breaker | ✅ 3-state FSM | ⚠️ max_fails only | ❌ | ❌ |
+| WebSocket H2 (RFC 8441) | ✅ | ✅ | ✅ | ✅ |
+| gRPC Proxy | ✅ | ✅ (full in Plus) | ✅ | ⚠️ Limited |
+| FastCGI Response Cache | ✅ | ✅ | ❌ | ✅ |
+| Static File Memory Cache | ✅ | ✅ OS page cache | ❌ | ✅ |
+| Config Simplicity | ✅ Presets + sugar | ❌ Manual | ✅ Caddyfile | ⚠️ Verbose |
 | Admin REST API | ✅ | ❌ | ✅ | ❌ |
-| 单文件无依赖 | ✅ | ❌ | ✅ | ❌ |
-| 内存安全 | ✅ Rust | ❌ C | ✅ Go | ❌ C |
-| `if` / `map` 条件 | ❌ | ✅ | ⚠️ 有限 | ✅ mod_rewrite |
-| TCP/UDP 四层代理 | ❌ | ✅ stream | ❌ | ❌ |
-| **生产检验** | ⚠️ **未验证** | ✅ 广泛 | ✅ 广泛 | ✅ 广泛 |
-
-完整差距跟踪与计划：[docs/roadmap.md](docs/roadmap.md)
+| Single Binary, No Deps | ✅ | ❌ | ✅ | ❌ |
+| Memory Safety | ✅ Rust | ❌ C | ✅ Go | ❌ C |
+| `if` / `map` Conditionals | ❌ | ✅ | ⚠️ Limited | ✅ mod_rewrite |
+| TCP/UDP L4 Proxy | ❌ | ✅ stream | ❌ | ❌ |
+| **Production Proven** | ⚠️ **Not yet** | ✅ Widely | ✅ Widely | ✅ Widely |
 
 ---
+
+## Performance
+
+> Test environment: 2C/1G Debian · TLSv1.3 · h2load 15s · 1000 connections
+
+| Proto | File | Sweety RPS | Nginx RPS | Δ |
+|-------|------|-----------|-----------|---|
+| H1 | 1 KB | **107,524** | 18,480 | **+482%** |
+| H2 | 1 KB | **28,345** | 18,479 | **+53%** |
+| H3 | 1 KB | **28,901** | 15,411 | **+88%** |
+| H3 | 10 KB | **14,452** | 5,564 | **+160%** |
+| H2 | 100 KB | **1,386** | 258 | **+437%** |
+
+- **P99 Latency**: H1 1KB 114ms vs 691ms (**−83%**); H2 1KB 376ms vs 853ms (**−56%**)
+- **Memory**: Idle **8.65 MB** vs 75.34 MB (**−88%**), 44–79% less under most loads
+- **Zero errors** across all test scenarios
+- Nginx leads at 100KB–1MB H2 due to `sendfile(2)` kernel zero-copy
+
+👉 **[Full benchmark results and methodology](https://sweety.2o.nz/benchmark/)**
+
+---
+
+## Contributing
+
+Contributions are welcome! Please open an issue or pull request on [GitHub](https://github.com/ChuYao233/Sweety).
 
 ## License
 
-Apache License 2.0
+[Apache License 2.0](LICENSE)

@@ -102,6 +102,107 @@ http2 = true    # h2c: cleartext HTTP/2, single connection multiplexing
 
 > ⚠️ h2c is only supported for reverse proxy → upstream direction. Client → Sweety cleartext HTTP/2 is not yet supported (planned).
 
+## Unix Socket Upstream
+
+Prefix the address with `unix:` to specify a Unix domain socket path. Ideal for same-host backends — bypasses the TCP/IP stack entirely, reducing latency by 10-30%. Equivalent to Nginx `proxy_pass http://unix:/path/to/sock`.
+
+### HTTP/1.1 Reverse Proxy
+
+```toml
+[[sites.upstreams]]
+name = "local-app"
+
+[[sites.upstreams.nodes]]
+addr = "unix:/run/myapp/app.sock"
+# upstream_host = "app.internal"   # Optional: Host header sent to upstream
+```
+
+### gRPC over Unix Socket (h2c)
+
+```toml
+[[sites.upstreams]]
+name = "grpc-local"
+
+[[sites.upstreams.nodes]]
+addr  = "unix:/run/grpc-service/grpc.sock"
+http2 = true    # h2c over Unix socket, single-connection multiplexing
+```
+
+### WebSocket over Unix Socket
+
+```toml
+[[sites.upstreams]]
+name = "ws-local"
+
+[[sites.upstreams.nodes]]
+addr = "unix:/run/ws-service/ws.sock"
+
+[[sites.locations]]
+path     = "/ws"
+handler  = "websocket"
+upstream = "ws-local"
+```
+
+### Node Field Reference
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `addr` | string | **required** | TCP `host:port` or Unix socket `unix:/path/to/sock` |
+| `weight` | u32 | 1 | Weight for weighted round-robin |
+| `tls` | bool | false | TLS connection to upstream |
+| `tls_sni` | string | addr host | TLS SNI hostname |
+| `tls_insecure` | bool | false | Skip upstream certificate verification |
+| `upstream_host` | string | — | Host header sent to upstream |
+| `http2` | bool | false | HTTP/2 upstream (h2c or h2 over TLS) |
+| `send_proxy_protocol` | u8 | 0 | Send PROXY protocol to upstream (0=off, 1=v1, 2=v2) |
+
+> 💡 Unix sockets don't support TCP-specific `TCP_NODELAY`, but since they bypass the entire TCP/IP stack, total latency is still lower.
+
+## PROXY Protocol
+
+When Sweety is deployed behind a CDN or load balancer, the real client IP is replaced by the proxy's address. PROXY protocol is a transport-layer protocol where the upstream proxy sends a header containing the real client address right after TCP connection establishment, before any HTTP data.
+
+Sweety supports both **receiving** (parsing PROXY headers from inbound connections) and **sending** (injecting PROXY headers to upstream).
+
+### Receiving (Site-level)
+
+Enable `proxy_protocol = true` in the site config to automatically parse PROXY protocol v1/v2 headers from inbound connections:
+
+```toml
+[[sites]]
+name           = "behind-lb"
+server_name    = ["api.example.com"]
+listen         = [80]
+listen_tls     = [443]
+proxy_protocol = true    # Parse inbound PROXY protocol, extract real client IP
+```
+
+> ⚠️ **Enable ONLY if the upstream proxy actually sends PROXY protocol.** If clients connect directly (without PROXY headers), connections will be rejected.
+
+### Sending (Node-level)
+
+Configure `send_proxy_protocol` on upstream nodes to forward real client IP to backends:
+
+```toml
+[[sites.upstreams.nodes]]
+addr                = "10.0.0.5:8080"
+send_proxy_protocol = 1    # Send v1 text format
+# send_proxy_protocol = 2  # Or v2 binary format (more compact, faster to parse)
+```
+
+| Value | Format | Description |
+|-------|--------|-------------|
+| `0` | — | Disabled (default) |
+| `1` | v1 text | `PROXY TCP4 192.168.1.1 10.0.0.1 12345 80\r\n` |
+| `2` | v2 binary | 28 bytes (IPv4) / 52 bytes (IPv6), faster to parse |
+
+### Typical Deployment Topology
+
+```
+Client → CDN/LB ──PROXY protocol──→ Sweety ──PROXY protocol──→ Backend
+                  (proxy_protocol=true)      (send_proxy_protocol=1)
+```
+
 ## Common Location Configurations
 
 ### Forward All Requests

@@ -102,6 +102,107 @@ http2 = true    # h2c：明文 HTTP/2，单连接多路复用
 
 > ⚠️ h2c 仅用于反向代理→上游方向。客户端→Sweety 方向的明文 HTTP/2 暂不支持（计划中）。
 
+## Unix Socket 上游
+
+地址以 `unix:` 前缀指定 Unix domain socket 路径，适用于同主机后端（绕过 TCP/IP 协议栈，延迟降低 10-30%）。等价 Nginx `proxy_pass http://unix:/path/to/sock`。
+
+### HTTP/1.1 反代
+
+```toml
+[[sites.upstreams]]
+name = "local-app"
+
+[[sites.upstreams.nodes]]
+addr = "unix:/run/myapp/app.sock"
+# upstream_host = "app.internal"   # 可选：发送给上游的 Host 头
+```
+
+### gRPC over Unix socket（h2c）
+
+```toml
+[[sites.upstreams]]
+name = "grpc-local"
+
+[[sites.upstreams.nodes]]
+addr  = "unix:/run/grpc-service/grpc.sock"
+http2 = true    # h2c over Unix socket，单连接多路复用
+```
+
+### WebSocket over Unix socket
+
+```toml
+[[sites.upstreams]]
+name = "ws-local"
+
+[[sites.upstreams.nodes]]
+addr = "unix:/run/ws-service/ws.sock"
+
+[[sites.locations]]
+path     = "/ws"
+handler  = "websocket"
+upstream = "ws-local"
+```
+
+### 节点字段参考
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `addr` | string | **必填** | TCP `host:port` 或 Unix socket `unix:/path/to/sock` |
+| `weight` | u32 | 1 | 加权轮询权重 |
+| `tls` | bool | false | 是否 TLS 连接上游 |
+| `tls_sni` | string | addr host | TLS SNI 主机名 |
+| `tls_insecure` | bool | false | 跳过上游证书验证 |
+| `upstream_host` | string | — | 发送给上游的 Host 头 |
+| `http2` | bool | false | HTTP/2 上游（h2c 或 h2 over TLS） |
+| `send_proxy_protocol` | u8 | 0 | 向上游发送 PROXY protocol（0=关闭, 1=v1, 2=v2） |
+
+> 💡 Unix socket 不支持 TCP 特有的 `TCP_NODELAY` 优化，但由于绕过了整个 TCP/IP 协议栈，总延迟仍然更低。
+
+## PROXY Protocol
+
+当 Sweety 部署在 CDN / 负载均衡器后面时，客户端真实 IP 会被前置代理替换。PROXY protocol 是一种传输层协议，由前置代理在 TCP 连接建立后、HTTP 数据之前发送一个包含真实客户端地址的头。
+
+Sweety 同时支持 **接收端**（从入站连接解析 PROXY header）和 **发送端**（向上游注入 PROXY header）。
+
+### 接收端（站点级）
+
+在站点配置中启用 `proxy_protocol = true`，Sweety 会自动解析入站连接的 PROXY protocol v1/v2 头：
+
+```toml
+[[sites]]
+name           = "behind-lb"
+server_name    = ["api.example.com"]
+listen         = [80]
+listen_tls     = [443]
+proxy_protocol = true    # 解析入站 PROXY protocol，提取真实客户端 IP
+```
+
+> ⚠️ **仅当前置代理确实发送 PROXY protocol 时才启用**。如果客户端直连（不发送 PROXY header），连接会被拒绝。
+
+### 发送端（节点级）
+
+在上游节点配置 `send_proxy_protocol` 向后端传递真实客户端 IP：
+
+```toml
+[[sites.upstreams.nodes]]
+addr                = "10.0.0.5:8080"
+send_proxy_protocol = 1    # 发送 v1 文本格式
+# send_proxy_protocol = 2  # 或 v2 二进制格式（更紧凑，解析更快）
+```
+
+| 值 | 格式 | 说明 |
+|----|------|------|
+| `0` | — | 不发送（默认） |
+| `1` | v1 文本 | `PROXY TCP4 192.168.1.1 10.0.0.1 12345 80\r\n` |
+| `2` | v2 二进制 | 28 字节（IPv4）/ 52 字节（IPv6），解析更快 |
+
+### 典型部署拓扑
+
+```
+Client → CDN/LB ──PROXY protocol──→ Sweety ──PROXY protocol──→ Backend
+                  (proxy_protocol=true)      (send_proxy_protocol=1)
+```
+
 ## 常用 Location 配置
 
 ### 转发所有请求

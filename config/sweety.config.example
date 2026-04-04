@@ -512,3 +512,77 @@ http2 = true
 path     = "/"
 handler  = "grpc"
 upstream = "grpc-backend"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Site: Unix Socket Upstream (same-host backend, ~10-30% lower latency vs TCP)
+# Equivalent to Nginx: proxy_pass http://unix:/path/to/sock
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name        = "unix-socket-site"
+server_name = ["app.example.com"]
+listen      = [80]
+listen_tls  = [443]
+force_https = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+
+# ─── Unix Socket Upstream (HTTP/1.1) ────────────────────────────────────────
+[[sites.upstreams]]
+name = "local-app"
+
+[[sites.upstreams.nodes]]
+addr = "unix:/run/myapp/app.sock"    # Unix domain socket path, prefixed with "unix:"
+# upstream_host = "app.internal"     # Optional: Host header sent to upstream
+
+[[sites.locations]]
+path     = "/"
+handler  = "reverse_proxy"
+upstream = "local-app"
+
+# ─── Unix Socket + h2c (gRPC over Unix socket) ─────────────────────────────
+[[sites.upstreams]]
+name = "grpc-local"
+
+[[sites.upstreams.nodes]]
+addr  = "unix:/run/grpc-service/grpc.sock"
+http2 = true                         # h2c over Unix socket (single-conn multiplexing)
+
+[[sites.locations]]
+path     = "/grpc/"
+handler  = "grpc"
+upstream = "grpc-local"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Site: PROXY Protocol (behind CDN/Load Balancer)
+# Equivalent to Nginx: listen 80 proxy_protocol; proxy_protocol on;
+# ═══════════════════════════════════════════════════════════════════════════════
+[[sites]]
+name           = "behind-lb"
+server_name    = ["api.example.com"]
+listen         = [80]
+listen_tls     = [443]
+proxy_protocol = true      # Parse PROXY protocol v1/v2 from inbound connections
+                            # ⚠️ Enable ONLY if the upstream LB/CDN sends PROXY protocol
+force_https    = true
+
+[sites.tls]
+acme       = true
+acme_email = "admin@example.com"
+
+# ─── Backend that also expects PROXY protocol (chained proxies) ─────────────
+[[sites.upstreams]]
+name = "internal-api"
+
+[[sites.upstreams.nodes]]
+addr                = "10.0.0.5:8080"
+send_proxy_protocol = 1     # Forward real client IP via PROXY protocol v1 to upstream
+# send_proxy_protocol = 2   # Or use v2 binary format (more compact, faster to parse)
+
+[[sites.locations]]
+path     = "/"
+handler  = "reverse_proxy"
+upstream = "internal-api"

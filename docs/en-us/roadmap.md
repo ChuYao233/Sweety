@@ -15,8 +15,8 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 - TLS: rustls pure Rust, multi-cert SNI auto-routing, TLS session cache (65536 entries)
 - ACME HTTP-01 auto-certificates (Let's Encrypt / ZeroSSL / Buypass / LiteSSL)
 - ACME DNS-01 wildcard certificates (Cloudflare / Aliyun / Shell custom) (`69224f0`)
-- ACME SAN multi-domain certificates: multiple `server_name` entries auto-issue a single SAN cert
-- ACME instant renewal API: `POST /api/certs/acme/renew`, async background execution, failure keeps current cert
+- ACME SAN multi-domain certificates: multiple `server_name` entries auto-issue a single SAN cert (`906d6b3`)
+- ACME instant renewal API: `POST /api/certs/acme/renew`, async background execution, failure keeps current cert (`906d6b3`)
 - ACME self-signed placeholder on startup: auto-generates placeholder cert, hot-reloads on issuance (`ce644ad`)
 - QUIC 0-RTT (TLS Early Data): `enable_0rtt` config option, zero-RTT first request (`4667260`)
 
@@ -65,8 +65,8 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 ### Operations
 - Config hot reload: no connection drops (equivalent to nginx -s reload)
 - Access logs: combined / json / custom template, async writer (`d830ba7`)
-- Admin REST API (Caddy Admin API superset): config tree CRUD, @id node access, TOML→JSON adapter, site management, upstream node control (enable/disable/weight), cert management, cache management, log level toggle, plugin list, API doc endpoint, CORS support
-- Prometheus `/metrics` endpoint: text/plain format, requests / errors / bytes_sent / active_requests / ws_connections
+- Admin REST API (Caddy Admin API superset): config tree CRUD, @id node access, TOML→JSON adapter, site management, upstream node control (enable/disable/weight), cert management, cache management, log level toggle, plugin list, API doc endpoint, CORS support (`868ca1e`)
+- Prometheus `/metrics` endpoint: text/plain format, requests / errors / bytes_sent / active_requests / ws_connections (`94f5e11`)
 - PROXY protocol v1/v2: receive-side real IP parsing from LB/CDN + send-side forwarding (`proxy_protocol` / `send_proxy_protocol`)
 - Unix socket upstream: `addr = "unix:/path"` for both TCP and gRPC, 10-30% lower latency for same-host
 - Daemon mode: start / stop / restart / PID file (`5c1e836`)

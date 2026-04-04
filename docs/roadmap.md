@@ -15,8 +15,8 @@
 - TLS：rustls 纯 Rust，多证书 SNI 自动路由，TLS session cache（65536 entries）
 - ACME HTTP-01 自动证书（Let's Encrypt / ZeroSSL / Buypass / LiteSSL）
 - ACME DNS-01 通配符证书（Cloudflare / 阿里云 / Shell 自定义）(`69224f0`)
-- ACME SAN 多域名证书：单站点多 `server_name` 自动签发一张 SAN 证书
-- ACME 即时续期 API：`POST /api/certs/acme/renew`，后台异步执行，失败不影响当前证书
+- ACME SAN 多域名证书：单站点多 `server_name` 自动签发一张 SAN 证书 (`906d6b3`)
+- ACME 即时续期 API：`POST /api/certs/acme/renew`，后台异步执行，失败不影响当前证书 (`906d6b3`)
 - ACME 自签名占位启动：证书未就绪时自动生成占位证书，申请成功后热重载 (`ce644ad`)
 - QUIC 0-RTT（TLS Early Data）：`enable_0rtt` 配置项，首请求免握手 (`4667260`)
 
@@ -65,8 +65,8 @@
 ### 运维
 - 配置热重载：不断开现有连接（等价 nginx -s reload）
 - 访问日志：combined / json / 自定义模板，异步写 (`d830ba7`)
-- Admin REST API（Caddy Admin API 超集）：配置树 CRUD、@id 节点直达、TOML→JSON 适配器、站点管理、上游节点控制（enable/disable/weight）、证书管理、缓存管理、日志级别热切换、插件列表、API 文档端点、CORS 支持
-- Prometheus `/metrics` 端点：text/plain 格式，支持 requests / errors / bytes_sent / active_requests / ws_connections
+- Admin REST API（Caddy Admin API 超集）：配置树 CRUD、@id 节点直达、TOML→JSON 适配器、站点管理、上游节点控制（enable/disable/weight）、证书管理、缓存管理、日志级别热切换、插件列表、API 文档端点、CORS 支持 (`868ca1e`)
+- Prometheus `/metrics` 端点：text/plain 格式，支持 requests / errors / bytes_sent / active_requests / ws_connections (`94f5e11`)
 - PROXY protocol v1/v2：接收端解析 LB/CDN 真实 IP + 发送端透传（`proxy_protocol` / `send_proxy_protocol`）
 - Unix socket 上游：`addr = "unix:/path"` TCP 和 gRPC 均支持，同机通信延迟低 10-30%
 - Daemon 模式：start / stop / restart / PID 文件 (`5c1e836`)

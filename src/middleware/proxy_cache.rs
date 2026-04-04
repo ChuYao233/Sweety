@@ -221,6 +221,36 @@ impl ProxyCache {
         }
     }
 
+    /// 返回缓存统计信息（管理 API 使用）
+    pub fn stats(&self) -> serde_json::Value {
+        let total = self.mem.len();
+        let mut expired = 0usize;
+        for entry in self.mem.iter() {
+            if entry.value().is_expired() { expired += 1; }
+        }
+        serde_json::json!({
+            "entries": total,
+            "max_entries": self.max_entries,
+            "expired": expired,
+            "ttl_secs": self.ttl.as_secs(),
+            "has_disk": self.disk_path.is_some(),
+        })
+    }
+
+    /// 清除所有缓存条目（管理 API 使用）
+    pub fn purge_all(&self) {
+        self.mem.clear();
+        // 清除磁盘缓存
+        if let Some(ref disk) = self.disk_path {
+            if let Ok(entries) = std::fs::read_dir(disk) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        debug!("proxy_cache 已清除所有条目");
+    }
+
     /// 近似 LRU 淘汰：删除约 10% 最旧/已过期条目
     fn evict(&self) {
         let evict_count = (self.max_entries / 10).max(1);

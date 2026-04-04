@@ -35,6 +35,36 @@ use sweety_web::{
 use super::response::{apply_response_headers, parse_status_code};
 use super::tls_client::tls_connect;
 use crate::server::http::AppState;
+use crate::middleware::metrics::GlobalMetrics;
+
+/// WebSocket 指标包装层：创建时 ws_connected，Drop 时 ws_disconnected
+struct WsMetricsStream<S> {
+    inner: S,
+    metrics: std::sync::Arc<GlobalMetrics>,
+}
+
+impl<S> WsMetricsStream<S> {
+    fn new(inner: S, metrics: std::sync::Arc<GlobalMetrics>) -> Self {
+        metrics.ws_connected();
+        Self { inner, metrics }
+    }
+}
+
+impl<S> Drop for WsMetricsStream<S> {
+    fn drop(&mut self) {
+        self.metrics.ws_disconnected();
+    }
+}
+
+impl<S: Stream<Item = Result<Bytes, io::Error>> + Unpin> Stream for WsMetricsStream<S> {
+    type Item = Result<Bytes, io::Error>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+}
+
+// SAFETY: 与 BiDirStream 相同理由，仅在单个 tokio task 中 poll
+unsafe impl<S: Send> Send for WsMetricsStream<S> {}
 
 /// 双向 WebSocket 转发 Stream
 ///
@@ -345,7 +375,10 @@ where
     let (upstream_read, upstream_write) = tokio::io::split(upstream);
     let bidir = BiDirStream::new(upstream_read, upstream_write, client_body, prefetched_upstream);
 
-    let mut final_resp = WebResponse::new(ResponseBody::box_stream(bidir));
+    // 用 WsMetricsStream 包装，跟踪 WebSocket 连接数（创建时 +1，Drop 时 -1）
+    let ws_stream = WsMetricsStream::new(bidir, ctx.state().metrics.clone());
+
+    let mut final_resp = WebResponse::new(ResponseBody::box_stream(ws_stream));
 
     if is_h2_ws {
         // H2 extended CONNECT（RFC 8441）：返回 200，无 Upgrade/Connection 头

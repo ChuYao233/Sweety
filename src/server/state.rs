@@ -42,6 +42,15 @@ pub struct AppState {
     pub h3_ports: Arc<HashSet<u16>>,
 }
 
+/// active_requests RAII 守卫：Drop 时自动调用 metrics.dec_active()
+pub(crate) struct RequestGuard(pub(crate) Arc<GlobalMetrics>);
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.0.dec_active();
+    }
+}
+
 /// max_connections / limit_conn RAII 守卫：Drop 时自动减计数器
 pub(crate) struct ConnGuard(pub(crate) Arc<std::sync::atomic::AtomicUsize>);
 

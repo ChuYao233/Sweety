@@ -50,9 +50,10 @@ impl GlobalMetrics {
         Self::default()
     }
 
-    /// 请求开始时调用
+    /// 请求开始时调用（同时递增 total_requests 和 active_requests）
     pub fn inc_requests(&self) {
         self.total_requests.add(1, Ordering::Relaxed);
+        self.active_requests.add(1, Ordering::Relaxed);
     }
 
     /// 请求结束时调用
@@ -123,8 +124,11 @@ mod tests {
         m.inc_requests();
         let snap = m.snapshot();
         assert_eq!(snap.total_requests, 2);
-        // inc_requests 只增加 total_requests，不影响 active_requests
-        assert_eq!(snap.active_requests, 0);
+        // inc_requests 同时递增 active_requests
+        assert_eq!(snap.active_requests, 2);
+        // dec_active 递减 active_requests
+        m.dec_active();
+        assert_eq!(m.snapshot().active_requests, 1);
     }
 
     #[test]

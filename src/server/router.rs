@@ -16,7 +16,7 @@ use sweety_web::{
 
 use crate::config::model::HandlerType;
 use crate::middleware::access_log::AccessLogEntry;
-use super::state::{AppState, ConnGuard};
+use super::state::{AppState, ConnGuard, RequestGuard};
 
 /// 多站点请求分发处理器
 ///
@@ -31,20 +31,18 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         None
     };
 
+    // 活跃连接计数（始终递增，Drop 时自动递减）
+    let cur = state.active_connections.fetch_add(1, Ordering::Relaxed);
+    let _conn_guard = ConnGuard(state.active_connections.clone());
+
     // max_connections 限流：超出并发上限时返回 503
-    let _conn_guard: Option<ConnGuard> = if state.max_connections > 0 {
-        let cur = state.active_connections.fetch_add(1, Ordering::Relaxed);
-        if cur >= state.max_connections {
-            state.active_connections.fetch_sub(1, Ordering::Relaxed);
-            state.metrics.record_status(503);
-            return make_error_resp(StatusCode::SERVICE_UNAVAILABLE);
-        }
-        Some(ConnGuard(state.active_connections.clone()))
-    } else {
-        None
-    };
+    if state.max_connections > 0 && cur >= state.max_connections {
+        state.metrics.record_status(503);
+        return make_error_resp(StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     state.metrics.inc_requests();
+    let _req_guard = RequestGuard(state.metrics.clone());
 
     // ACME HTTP-01 challenge 响应（优先于所有站点匹配）
     {
@@ -58,6 +56,7 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
                     let mut resp = WebResponse::new(ResponseBody::from(body));
                     *resp.status_mut() = StatusCode::OK;
                     resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+                    state.metrics.record_status(200);
                     return resp;
                 }
             }
@@ -132,9 +131,11 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
 
     if let Some(ref rp) = rewritten {
         if let Some(rest) = rp.strip_prefix("REDIRECT:301:") {
+            state.metrics.record_status(301);
             return make_redirect_resp(rest, StatusCode::MOVED_PERMANENTLY);
         }
         if let Some(rest) = rp.strip_prefix("REDIRECT:302:") {
+            state.metrics.record_status(302);
             return make_redirect_resp(rest, StatusCode::FOUND);
         }
     }
@@ -380,6 +381,16 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         HeaderValue::from_static("nosniff"),
     );
 
+    // 统计：记录发送字节数
+    let bytes_sent: u64 = resp.headers()
+        .get(sweety_web::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if bytes_sent > 0 {
+        state.metrics.record_bytes_sent(bytes_sent);
+    }
+
     // 访问日志
     if let Some(logger) = &site.access_logger {
         let duration_ms = req_start.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
@@ -395,11 +406,7 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
                 _                                  => "HTTP/?",
             }.to_string(),
             status:    resp.status().as_u16(),
-            bytes_sent: resp.headers()
-                .get(sweety_web::http::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0u64),
+            bytes_sent,
             referer: ctx.req().headers()
                 .get(sweety_web::http::header::REFERER)
                 .and_then(|v| v.to_str().ok())

@@ -114,6 +114,10 @@ pub struct GlobalConfig {
     /// HTTP/2 单连接最大请求数（0 = 不限制，默认 1000）
     #[serde(default = "default_h2_max_requests_per_conn")]
     pub h2_max_requests_per_conn: usize,
+
+    /// HTTP/3 全局最大并发 handler 数（0 = 自动，按系统可用内存 80% / 2MB 计算）
+    #[serde(default)]
+    pub h3_max_handlers: usize,
 }
 
 impl Default for GlobalConfig {
@@ -142,6 +146,7 @@ impl Default for GlobalConfig {
             h2_max_concurrent_reset_streams: default_h2_max_concurrent_reset_streams(),
             h2_max_frame_size: default_h2_max_frame_size(),
             h2_max_requests_per_conn: default_h2_max_requests_per_conn(),
+            h3_max_handlers: 0,
         }
     }
 }

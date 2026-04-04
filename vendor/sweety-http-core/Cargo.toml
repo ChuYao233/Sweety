@@ -142,6 +142,7 @@ optional = true
 version = "1.30"
 features = [
     "rt",
+    "sync",
     "time",
 ]
 optional = true

@@ -32,6 +32,22 @@ impl TcpStream {
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         self.0.set_nodelay(nodelay)
     }
+
+    /// 获取本地监听地址（用于 PROXY protocol 端口检测）
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+
+    /// 非消耗式窥探 TCP 缓冲区（PROXY protocol 头检测）
+    pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.peek(buf).await
+    }
+
+    /// 精确读取 n 字节（消耗 PROXY protocol 头）
+    pub async fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        use tokio::io::AsyncReadExt;
+        self.0.read_exact(buf).await.map(|_| ())
+    }
 }
 
 impl From<tokio::net::TcpStream> for TcpStream {

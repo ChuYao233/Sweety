@@ -147,6 +147,19 @@ impl SweetyServer {
             .map(|(port, _, _)| port)
             .collect();
 
+        // 收集需要解析 PROXY protocol 的端口（站点级 proxy_protocol=true 的所有 listen/listen_tls 端口）
+        // 注册到 vendor 全局，非 PP 端口零开销
+        {
+            let pp_ports: HashSet<u16> = cfg.sites.iter()
+                .filter(|s| s.proxy_protocol)
+                .flat_map(|s| s.listen.iter().chain(s.listen_tls.iter()).copied())
+                .collect();
+            if !pp_ports.is_empty() {
+                info!("PROXY protocol 接收端已启用，端口: {:?}", pp_ports);
+            }
+            sweety_web::set_proxy_protocol_ports(pp_ports);
+        }
+
         // 第二步：构建 state
         let state = AppState {
             registry: registry.clone(),

@@ -127,7 +127,30 @@ where
                 res
             }
             ServerStream::Tcp(io, _addr) => {
-                let io = TcpStream::from_std(io).expect("TODO: handle io error");
+                let mut io = TcpStream::from_std(io).expect("TODO: handle io error");
+
+                // ── PROXY protocol 接收端（零开销分支） ──────────────
+                // 仅当本地端口在 proxy_protocol_ports 集合中时才执行 IO
+                // 非 PP 端口：一次 OnceLock::get + HashSet::contains → false，零额外 IO
+                let mut _addr = _addr;
+                if let Ok(local) = io.local_addr() {
+                    if crate::is_proxy_protocol_port(local.port()) {
+                        match parse_proxy_protocol_header(&mut io).await {
+                            Ok(Some(real_src)) => {
+                                tracing::debug!("PROXY protocol: 真实客户端 {} (原始 {})", real_src, _addr);
+                                _addr = real_src;
+                            }
+                            Ok(None) => {
+                                // LOCAL 命令（健康检查），保留原始地址
+                            }
+                            Err(e) => {
+                                tracing::warn!("PROXY protocol 解析失败: {}，关闭连接", e);
+                                return Err(HttpServiceError::Timeout(TimeoutError::TlsAccept));
+                            }
+                        }
+                    }
+                }
+
                 let mut _tls_stream = self
                     .tls_acceptor
                     .call(io)
@@ -227,5 +250,122 @@ where
     #[inline]
     async fn ready(&self) -> Self::Ready {
         self.service.ready().await
+    }
+}
+
+// ─── PROXY protocol 接收端内联解析器 ────────────────────────────────────────
+// 零堆分配：栈上 232 字节缓冲区 + peek/read_exact
+// 返回 Ok(Some(src_addr)) | Ok(None) = LOCAL 命令 | Err
+
+/// PROXY protocol v2 签名（12 字节）
+const PP_V2_SIG: [u8; 12] = [
+    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+];
+
+async fn parse_proxy_protocol_header(
+    io: &mut TcpStream,
+) -> Result<Option<core::net::SocketAddr>, std::io::Error> {
+    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let mut buf = [0u8; 232];
+    let n = io.peek(&mut buf).await?;
+    if n < 8 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "PROXY protocol: 数据不足",
+        ));
+    }
+
+    // ── 检测 v2 二进制签名 ──────────────────────────────────────
+    if n >= 16 && buf[..12] == PP_V2_SIG {
+        let ver_cmd = buf[12];
+        let version = ver_cmd >> 4;
+        let command = ver_cmd & 0x0F;
+        if version != 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "PROXY v2: 版本号不是 2",
+            ));
+        }
+        let addr_len = u16::from_be_bytes([buf[14], buf[15]]) as usize;
+        let total = 16 + addr_len;
+        if n < total {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "PROXY v2: 数据不足",
+            ));
+        }
+        // 消耗 PP 头字节
+        io.read_exact(&mut buf[..total]).await?;
+
+        if command == 0 {
+            return Ok(None); // LOCAL
+        }
+        if command != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "PROXY v2: 未知命令",
+            ));
+        }
+        let af = buf[13] >> 4;
+        match af {
+            1 if addr_len >= 12 => {
+                // AF_INET
+                let src_ip = Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
+                let src_port = u16::from_be_bytes([buf[24], buf[25]]);
+                Ok(Some(SocketAddr::new(IpAddr::V4(src_ip), src_port)))
+            }
+            2 if addr_len >= 36 => {
+                // AF_INET6
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&buf[16..32]);
+                let src_ip = Ipv6Addr::from(b);
+                let src_port = u16::from_be_bytes([buf[48], buf[49]]);
+                Ok(Some(SocketAddr::new(IpAddr::V6(src_ip), src_port)))
+            }
+            _ => Ok(None), // UNSPEC / AF_UNIX → 视为 LOCAL
+        }
+    }
+    // ── 检测 v1 文本 "PROXY " ──────────────────────────────────
+    else if n >= 8 && buf[..6] == *b"PROXY " {
+        // 查找 \r\n
+        let end = buf[..n.min(108)]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "PROXY v1: 未找到 \\r\\n")
+            })?;
+        let total = end + 2;
+
+        // 先消耗 PP 头字节（read_exact 需要 &mut buf），再从已读数据解析
+        io.read_exact(&mut buf[..total]).await?;
+
+        let line = core::str::from_utf8(&buf[6..end]).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "PROXY v1: 非 UTF-8")
+        })?;
+
+        if line.starts_with("UNKNOWN") {
+            return Ok(None);
+        }
+        // "TCP4 src dst sport dport" 或 "TCP6 ..."
+        let parts: Vec<&str> = line.splitn(5, ' ').collect();
+        if parts.len() != 5 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "PROXY v1: 字段数量不正确",
+            ));
+        }
+        let src_ip: IpAddr = parts[1].parse().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "PROXY v1: 源 IP 无效")
+        })?;
+        let src_port: u16 = parts[3].parse().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "PROXY v1: 源端口无效")
+        })?;
+        Ok(Some(SocketAddr::new(src_ip, src_port)))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "PROXY protocol: 既非 v1 也非 v2 格式",
+        ))
     }
 }

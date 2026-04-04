@@ -113,6 +113,13 @@ pub struct SiteConfig {
     #[serde(default)]
     pub force_https: bool,
 
+    /// 是否在该站点的监听端口上启用 PROXY protocol 解析
+    /// 启用后，Sweety 会从入站连接的第一个数据包解析 PROXY protocol v1/v2 头，
+    /// 提取真实客户端 IP（适用于 CDN/LB → Sweety 场景）
+    /// ⚠️ 仅当前置代理确实发送 PROXY protocol 时才启用，否则连接会断开
+    #[serde(default)]
+    pub proxy_protocol: bool,
+
     /// 自定义错误页（等价 Nginx error_page 404 /404.html）
     #[serde(default, deserialize_with = "deserialize_u16_map")]
     pub error_pages: HashMap<u16, String>,

@@ -83,3 +83,24 @@ pub use self::builder::HttpServiceBuilder;
 pub(crate) fn unspecified_socket_addr() -> core::net::SocketAddr {
     core::net::SocketAddr::V4(core::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0))
 }
+
+// ─── PROXY protocol 接收端（全局端口集合） ──────────────────────────────────
+// OnceLock 保证只写一次，后续读取为零开销的原子 Relaxed 指针加载
+// 非 PP 端口：一次 HashSet::contains → false → 零额外 IO
+
+static PROXY_PROTOCOL_PORTS: std::sync::OnceLock<std::collections::HashSet<u16>> =
+    std::sync::OnceLock::new();
+
+/// 启动时调用一次，注册需要解析 PROXY protocol 的监听端口
+/// 空集合 = 完全禁用（所有连接零开销）
+pub fn set_proxy_protocol_ports(ports: std::collections::HashSet<u16>) {
+    let _ = PROXY_PROTOCOL_PORTS.set(ports);
+}
+
+/// 检查指定端口是否需要解析 PROXY protocol（service 层内部调用）
+#[inline(always)]
+pub(crate) fn is_proxy_protocol_port(port: u16) -> bool {
+    PROXY_PROTOCOL_PORTS
+        .get()
+        .map_or(false, |set| set.contains(&port))
+}

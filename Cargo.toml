@@ -32,7 +32,7 @@ name        = "sweety"
 version     = "0.1.0"
 edition     = "2021"
 description = "高性能、单文件部署、多站点 Web 服务器"
-license     = "MIT"
+license     = "Apache-2.0"
 authors     = ["Sweety Contributors"]
 
 [[bin]]

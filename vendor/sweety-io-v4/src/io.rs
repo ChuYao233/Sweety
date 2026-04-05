@@ -49,6 +49,12 @@ pub trait AsyncIo: io::Read + io::Write + Unpin {
     /// 用于 TCP_CORK（等价 Nginx tcp_nopush）
     #[inline(always)]
     fn raw_fd(&self) -> i32 { 0 }
+
+    /// 返回用于 sendfile(2) 的 socket fd。
+    /// 裸 TCP/Unix socket 返回 Some(fd)，TLS 等封装类型返回 None。
+    /// 编译期单态化后零运行时开销，比 nginx 的运行时指针判断性能更高。
+    #[inline(always)]
+    fn sendfile_fd(&self) -> Option<i32> { None }
 }
 
 /// object safe version of [AsyncIo] trait.

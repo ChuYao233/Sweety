@@ -58,6 +58,13 @@ macro_rules! default_aio_impl {
                 use ::std::os::unix::io::AsRawFd;
                 self.0.as_raw_fd()
             }
+
+            #[cfg(target_os = "linux")]
+            #[inline(always)]
+            fn sendfile_fd(&self) -> Option<i32> {
+                use ::std::os::unix::io::AsRawFd;
+                Some(self.0.as_raw_fd())
+            }
         }
 
         impl ::std::io::Read for $ty {

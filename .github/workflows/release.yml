@@ -12,6 +12,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: sweety
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 permissions:
   contents: write
@@ -73,21 +74,6 @@ jobs:
           - target: riscv64gc-unknown-linux-gnu
             os: ubuntu-24.04
             artifact: sweety-linux-riscv64-gnu
-            cross: true
-
-          - target: loongarch64-unknown-linux-gnu
-            os: ubuntu-24.04
-            artifact: sweety-linux-loongarch64-gnu
-            cross: true
-
-          - target: mips64-unknown-linux-gnuabi64
-            os: ubuntu-24.04
-            artifact: sweety-linux-mips64-gnu
-            cross: true
-
-          - target: mips64el-unknown-linux-gnuabi64
-            os: ubuntu-24.04
-            artifact: sweety-linux-mips64el-gnu
             cross: true
 
           # ═══════════════════════════════════════════

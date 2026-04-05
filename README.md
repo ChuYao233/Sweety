@@ -22,7 +22,7 @@ The underlying HTTP stack is forked from [xitca-web](https://github.com/HFQR/xit
 
 - 🌐 **HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC)** — all protocols served from a single process
 - 🔒 **TLS** — pure Rust via Rustls, zero OpenSSL dependency; multi-cert SNI with automatic selection
-- 📜 **ACME Auto-Certificates** — HTTP-01 + DNS-01, supports Let's Encrypt / ZeroSSL / Buypass; wildcard certs; self-signed placeholder on startup, hot-reload on issuance (Caddy-style)
+- 📜 **ACME Auto-Certificates** — HTTP-01 + DNS-01, supports Let's Encrypt / ZeroSSL / LiteSSL; wildcard certs; self-signed placeholder on startup, hot-reload on issuance (Caddy-style)
 - 🔌 **WebSocket** — H1 Upgrade (RFC 6455) + H2 extended CONNECT (RFC 8441) full passthrough
 
 ### Request Handling

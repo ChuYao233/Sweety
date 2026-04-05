@@ -13,7 +13,7 @@ Sweety 是用 Rust 编写的高性能多站点 Web 服务器，目标是兼顾 *
 
 ### TLS
 - 手动证书（cert/key 文件）
-- **ACME 自动证书**：Let's Encrypt / ZeroSSL / Buypass / LiteSSL，支持 HTTP-01 与 DNS-01 验证
+- **ACME 自动证书**：Let's Encrypt / ZeroSSL / LiteSSL，支持 HTTP-01 与 DNS-01 验证
 - 多证书（SNI 路由，同端口多域名不同证书）
 - HSTS、TLS 版本/密码套件控制
 

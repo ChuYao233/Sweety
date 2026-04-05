@@ -13,7 +13,7 @@
 - HTTP/1.1 + HTTP/2 + HTTP/3（QUIC）同一进程同时监听 (`9447c8f`)
 - WebSocket H1 Upgrade（RFC 6455）+ H2 extended CONNECT（RFC 8441）全透传 (`c67fbc1`, `afb1763`, `60dc92a`)
 - TLS：rustls 纯 Rust，多证书 SNI 自动路由，TLS session cache（65536 entries）
-- ACME HTTP-01 自动证书（Let's Encrypt / ZeroSSL / Buypass / LiteSSL）
+- ACME HTTP-01 自动证书（Let's Encrypt / ZeroSSL / LiteSSL）
 - ACME DNS-01 通配符证书（Cloudflare / 阿里云 / Shell 自定义）(`69224f0`)
 - ACME SAN 多域名证书：单站点多 `server_name` 自动签发一张 SAN 证书 (`906d6b3`)
 - ACME 即时续期 API：`POST /api/certs/acme/renew`，后台异步执行，失败不影响当前证书 (`906d6b3`)

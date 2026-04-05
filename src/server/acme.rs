@@ -21,8 +21,7 @@ use super::tls::SniResolver;
 const LETS_ENCRYPT_PROD:    &str = "https://acme-v02.api.letsencrypt.org/directory";
 const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
 const ZEROSSL:              &str = "https://acme.zerossl.com/v2/DV90";
-const BUYPASS:              &str = "https://api.buypass.com/acme/directory";
-const LITESSL:              &str = "https://acme.litessl.com/directory";
+const LITESSL:              &str = "https://acme.litessl.com/acme/v2/directory";
 
 /// 全局 HTTP-01 challenge token 存储（token → key_authorization）
 /// 由 ACME 申请流程写入，HTTP handler 读取并响应 Let's Encrypt 验证请求
@@ -208,7 +207,6 @@ async fn request_acme_cert(domains: &[String], email: &str, acme_provider: &str)
         "letsencrypt"         => LETS_ENCRYPT_PROD,
         "letsencrypt_staging" => LETS_ENCRYPT_STAGING,
         "zerossl"             => ZEROSSL,
-        "buypass"             => BUYPASS,
         "litessl"             => LITESSL,
         custom                => custom,
     };
@@ -363,7 +361,6 @@ async fn request_acme_cert_dns01(
         "letsencrypt"         => LETS_ENCRYPT_PROD,
         "letsencrypt_staging" => LETS_ENCRYPT_STAGING,
         "zerossl"             => ZEROSSL,
-        "buypass"             => BUYPASS,
         "litessl"             => LITESSL,
         custom                => custom,
     };

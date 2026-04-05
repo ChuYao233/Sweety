@@ -28,7 +28,7 @@ acme_email = "your@email.com"
 # Method 1: ACME auto-certificate
 acme             = true
 acme_email       = "your@email.com"
-acme_provider    = "letsencrypt"   # letsencrypt / zerossl / buypass / litessl / custom URL
+acme_provider    = "letsencrypt"   # letsencrypt / zerossl / litessl / custom URL
 acme_challenge   = "http01"        # http01 / dns01
 acme_renew_days_before = 30        # Auto-renew N days before expiry
 

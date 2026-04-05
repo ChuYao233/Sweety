@@ -13,7 +13,7 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 - HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC) served from a single process (`9447c8f`)
 - WebSocket H1 Upgrade (RFC 6455) + H2 extended CONNECT (RFC 8441) full passthrough (`c67fbc1`, `afb1763`, `60dc92a`)
 - TLS: rustls pure Rust, multi-cert SNI auto-routing, TLS session cache (65536 entries)
-- ACME HTTP-01 auto-certificates (Let's Encrypt / ZeroSSL / Buypass / LiteSSL)
+- ACME HTTP-01 auto-certificates (Let's Encrypt / ZeroSSL / LiteSSL)
 - ACME DNS-01 wildcard certificates (Cloudflare / Aliyun / Shell custom) (`69224f0`)
 - ACME SAN multi-domain certificates: multiple `server_name` entries auto-issue a single SAN cert (`906d6b3`)
 - ACME instant renewal API: `POST /api/certs/acme/renew`, async background execution, failure keeps current cert (`906d6b3`)

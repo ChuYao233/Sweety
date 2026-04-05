@@ -28,7 +28,7 @@ acme_email = "your@email.com"
 # 方式 1：ACME 自动证书
 acme             = true
 acme_email       = "your@email.com"
-acme_provider    = "letsencrypt"   # letsencrypt / zerossl / buypass / litessl / 自定义 URL
+acme_provider    = "letsencrypt"   # letsencrypt / zerossl / litessl / 自定义 URL
 acme_challenge   = "http01"        # http01 / dns01
 acme_renew_days_before = 30        # 到期前 N 天自动续期
 

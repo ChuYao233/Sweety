@@ -22,7 +22,7 @@
 
 - 🌐 **HTTP/1.1 + HTTP/2 + HTTP/3（QUIC）** — 同一进程同时提供所有协议
 - 🔒 **TLS** — 纯 Rust Rustls 实现，零 OpenSSL 依赖；多证书 SNI 自动选择最优
-- 📜 **ACME 自动证书** — HTTP-01 + DNS-01，支持 Let's Encrypt / ZeroSSL / Buypass；通配符证书；自签名占位启动，申请成功后热重载（对标 Caddy）
+- 📜 **ACME 自动证书** — HTTP-01 + DNS-01，支持 Let's Encrypt / ZeroSSL / LiteSSL；通配符证书；自签名占位启动，申请成功后热重载（对标 Caddy）
 - 🔌 **WebSocket** — H1 Upgrade（RFC 6455）+ H2 extended CONNECT（RFC 8441）全透传
 
 ### 请求处理

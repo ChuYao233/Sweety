@@ -13,7 +13,7 @@ Sweety is a high-performance, multi-site web server written in Rust, aiming to c
 
 ### TLS
 - Manual certificates (cert/key files)
-- **ACME automatic certificates**: Let's Encrypt / ZeroSSL / Buypass / LiteSSL, supports HTTP-01 and DNS-01 validation
+- **ACME automatic certificates**: Let's Encrypt / ZeroSSL / LiteSSL, supports HTTP-01 and DNS-01 validation
 - Multi-certificate (SNI routing, different certificates for different domains on the same port)
 - HSTS, TLS version/cipher suite control
 

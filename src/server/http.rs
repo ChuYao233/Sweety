@@ -147,6 +147,17 @@ impl SweetyServer {
             .map(|(port, _, _)| port)
             .collect();
 
+        // 设置 H3 最大并发连接数（取第一个启用 H3 站点的 http3.max_handlers，0 = 自动）
+        {
+            let max_handlers = cfg.sites.iter()
+                .filter_map(|s| s.tls.as_ref())
+                .filter(|tls| tls.protocols.iter().any(|p| p == "h3"))
+                .map(|tls| tls.http3.max_handlers)
+                .next()
+                .unwrap_or(0);
+            sweety_web::set_h3_max_connections(max_handlers);
+        }
+
         // 收集需要解析 PROXY protocol 的端口（站点级 proxy_protocol=true 的所有 listen/listen_tls 端口）
         // 注册到 vendor 全局，非 PP 端口零开销
         {

@@ -381,6 +381,17 @@ fn apply_config(ctx: &AdminContext, new_cfg: AppConfig) -> Result<(), String> {
     for site_cfg in &new_cfg.sites {
         ctx.registry.upsert_site(site_cfg);
     }
+    // 热更新 H3 最大并发连接数
+    {
+        let max_handlers = new_cfg.sites.iter()
+            .filter_map(|s| s.tls.as_ref())
+            .filter(|tls| tls.protocols.iter().any(|p| p == "h3"))
+            .map(|tls| tls.http3.max_handlers)
+            .next()
+            .unwrap_or(0);
+        sweety_web::set_h3_max_connections(max_handlers);
+    }
+
     ctx.cfg.store(Arc::new(new_cfg));
     Ok(())
 }

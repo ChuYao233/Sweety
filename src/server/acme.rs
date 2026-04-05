@@ -219,7 +219,9 @@ async fn request_acme_cert(domains: &[String], email: &str, acme_provider: &str)
         .with_context(|| format!("创建 ACME 缓存目录失败: {}", cache_dir.display()))?;
 
     // 尝试加载缓存的账号凭据，否则新建账号
-    let creds_path = cache_dir.join(format!("{}.json", email.replace('@', "_").replace('.', "_")));
+    // 按 provider + email 区分缓存，切换 provider 后不会误用旧账号
+    let provider_key = acme_provider.replace('/', "_").replace(':', "_");
+    let creds_path = cache_dir.join(format!("{}_{}.json", provider_key, email.replace('@', "_").replace('.', "_")));
     let account = if creds_path.exists() {
         let json = std::fs::read_to_string(&creds_path)
             .with_context(|| format!("读取 ACME 账号缓存失败: {}", creds_path.display()))?;
@@ -372,7 +374,9 @@ async fn request_acme_cert_dns01(
         .with_context(|| format!("创建 ACME 缓存目录失败: {}", cache_dir.display()))?;
 
     // 加载或创建 ACME 账号
-    let creds_path = cache_dir.join(format!("{}.json", email.replace('@', "_").replace('.', "_")));
+    // 按 provider + email 区分缓存，切换 provider 后不会误用旧账号
+    let provider_key = acme_provider.replace('/', "_").replace(':', "_");
+    let creds_path = cache_dir.join(format!("{}_{}.json", provider_key, email.replace('@', "_").replace('.', "_")));
     let account = if creds_path.exists() {
         let json = std::fs::read_to_string(&creds_path)?;
         let creds: AccountCredentials = serde_json::from_str(&json)?;

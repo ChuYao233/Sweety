@@ -383,7 +383,7 @@ fn apply_transport_config(
 /// HTTP/3 QUIC 握手要求 TLS ALPN 必须包含 "h3"，
 /// quinn::ServerConfig::with_single_cert 不自动设置 ALPN，
 /// 必须先构建 rustls::ServerConfig 并注入 alpn_protocols，再转为 quinn::ServerConfig。
-fn build_quinn_config_from_pem(cert_path: &Path, key_path: &Path, enable_0rtt: bool) -> Result<sweety_io::net::QuicConfig> {
+pub(super) fn build_quinn_config_from_pem(cert_path: &Path, key_path: &Path, enable_0rtt: bool) -> Result<sweety_io::net::QuicConfig> {
     let cert_bytes = std::fs::read(cert_path)
         .with_context(|| format!("读取证书失败: {}", cert_path.display()))?;
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> =

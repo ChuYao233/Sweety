@@ -585,13 +585,14 @@ pub(super) fn cert_needs_renewal(cert_path: &Path, renew_days_before: u64) -> bo
     days_left < renew_days_before as i64
 }
 
-/// ACME 续期成功后将新证书热重载到所有 SniResolver，不重启服务器
+/// ACME 续期成功后将新证书热重载到所有 SniResolver 和 QUIC endpoint，不重启服务器
 pub(super) fn reload_acme_cert_in_resolvers(
     cert_path: &Path,
     key_path: &Path,
     server_names: &[String],
     resolvers: &HashMap<u16, Arc<SniResolver>>,
 ) {
+    // 1) 更新 TLS SniResolver（H1/H2）
     match crate::server::tls::load_certified_key_from_path(cert_path, key_path) {
         Ok(ck) => {
             let keys = vec![ck];
@@ -600,7 +601,21 @@ pub(super) fn reload_acme_cert_in_resolvers(
             }
             info!("ACME 证书已热重载到 {} 个 TLS 端口", resolvers.len());
         }
-        Err(e) => error!("ACME 证书热重载失败: {}", e),
+        Err(e) => error!("ACME TLS 证书热重载失败: {}", e),
+    }
+
+    // 2) 更新 QUIC endpoint（H3）—— 原子级别，只影响新连接
+    let endpoints = sweety_io::net::quic_endpoints();
+    if !endpoints.is_empty() {
+        match crate::server::tls::build_quinn_config_from_pem(cert_path, key_path, false) {
+            Ok(quic_cfg) => {
+                for ep in &endpoints {
+                    ep.set_server_config(Some(quic_cfg.clone()));
+                }
+                info!("ACME 证书已热重载到 {} 个 QUIC endpoint", endpoints.len());
+            }
+            Err(e) => error!("ACME QUIC 证书热重载失败: {}", e),
+        }
     }
 }
 

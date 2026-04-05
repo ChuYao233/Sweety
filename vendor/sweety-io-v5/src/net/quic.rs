@@ -1,10 +1,25 @@
 use core::net::SocketAddr;
 
 use std::io;
+use std::sync::Mutex;
 
 use quinn::{Endpoint, Incoming, ServerConfig};
 
 use super::Stream;
+
+// ── 全局 QUIC endpoint 注册（证书热重载用） ──────────────────
+// Endpoint 是 Clone + Send + Sync，clone 只增引用计数
+static QUIC_ENDPOINTS: std::sync::LazyLock<Mutex<Vec<Endpoint>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// 获取所有已注册的 QUIC endpoint 的 clone（用于证书热重载）
+pub fn quic_endpoints() -> Vec<Endpoint> {
+    QUIC_ENDPOINTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn register_endpoint(ep: &Endpoint) {
+    QUIC_ENDPOINTS.lock().unwrap_or_else(|e| e.into_inner()).push(ep.clone());
+}
 
 pub type QuicConnecting = Incoming;
 
@@ -71,9 +86,6 @@ impl QuicListenerBuilder {
 
         #[cfg(unix)]
         {
-            // 手动创建 UDP socket 并设置 SO_REUSEPORT
-            // 使每个 worker 都能独立绑定同一端口，内核按四元组分发数据包
-            // 效果等价于 Nginx worker_processes + reuseport on UDP
             let socket = socket2::Socket::new(
                 socket2::Domain::for_address(addr),
                 socket2::Type::DGRAM,
@@ -82,7 +94,6 @@ impl QuicListenerBuilder {
             socket.set_reuse_address(true)?;
             socket.set_reuse_port(true)?;
             socket.set_nonblocking(true)?;
-            // 显式设置大缓冲区，避免沿用 rmem_default(256KB) 导致高并发握手时 kernel 丢包
             let _ = socket.set_recv_buffer_size(16 * 1024 * 1024);
             let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
             socket.bind(&addr.into())?;
@@ -96,11 +107,16 @@ impl QuicListenerBuilder {
                 std_udp,
                 runtime,
             )?;
+            // 注册 endpoint 用于证书热重载
+            register_endpoint(&endpoint);
             return Ok(QuicListener { endpoint });
         }
 
         #[cfg(not(unix))]
-        Endpoint::server(config, addr).map(|endpoint| QuicListener { endpoint })
+        Endpoint::server(config, addr).map(|endpoint| {
+            register_endpoint(&endpoint);
+            QuicListener { endpoint }
+        })
     }
 }
 

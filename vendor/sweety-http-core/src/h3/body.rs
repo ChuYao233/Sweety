@@ -26,11 +26,6 @@ impl RequestBody {
     pub(in crate::h3) fn new(rx: RequestStream<RecvStream, Bytes>) -> Self {
         Self(Some(rx))
     }
-
-    /// 创建空 body（rx 已在外部异步 drain 并 drop）
-    pub(in crate::h3) fn empty() -> Self {
-        Self(None)
-    }
 }
 
 impl Drop for RequestBody {

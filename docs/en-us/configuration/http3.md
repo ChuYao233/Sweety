@@ -24,6 +24,9 @@ protocols = ["h2", "http/1.1"]   # Exclude h3
 
 ```toml
 [sites.tls.http3]
+# ─── Connection-Level Rate Limiting ──────────────────────────────
+max_handlers = 0                     # Max concurrent QUIC connections (0 = auto-detect, supports hot-reload)
+
 # ─── Concurrency Control ─────────────────────────────────────────
 max_concurrent_bidi_streams = 200    # Max concurrent bidirectional streams per connection (default 200)
 max_concurrent_uni_streams  = 100    # Max concurrent unidirectional streams per connection (default 100)
@@ -44,19 +47,30 @@ initial_rtt_ms   = 333     # Initial RTT estimate (ms, quinn default)
 max_ack_delay_ms = 25      # Max ACK delay (ms, RFC 9000 default)
 ```
 
-## Global Concurrency Control
+## Connection-Level Memory Limiting
 
-The global max concurrent H3 handler count is configured in `[global]`, not at the site level:
+`max_handlers` controls the global max concurrent QUIC connections, preventing OOM during high-concurrency large file transfers:
 
 ```toml
-[global]
-# Global max concurrent H3 handlers (0 = auto, 80% available memory / 2MB)
+[sites.tls.http3]
+# Max concurrent QUIC connections (0 = auto-detect)
+# Auto formula: available_memory * 80% / 16MB / num_workers
 # Each QUIC connection buffers up to send_window bytes; this limit prevents OOM
 # Excess connections are queued, not rejected
-h3_max_handlers = 0
+# Supports hot-reload: takes effect immediately after Admin API config reload
+max_handlers = 0
 ```
 
-> For benchmarking, set a higher value manually (e.g. `h3_max_handlers = 5000`) to avoid overly conservative auto-calculation.
+| Available Memory | Auto Value (2 cores) | Auto Value (4 cores) |
+|-----------------|---------------------|---------------------|
+| 512MB           | ~12                 | ~6                  |
+| 1GB             | ~25                 | ~12                 |
+| 2GB             | ~51                 | ~25                 |
+| 8GB             | ~204                | ~102                |
+
+> **Nginx has no equivalent configuration** and will also OOM in the same scenario. Sweety's `max_handlers` provides finer-grained H3 memory control than `worker_connections`.
+>
+> For benchmarking, set a higher value manually (e.g. `max_handlers = 200`) to avoid overly conservative auto-calculation.
 
 ## Tuning Recommendations
 

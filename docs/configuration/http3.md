@@ -24,6 +24,9 @@ protocols = ["h2", "http/1.1"]   # 不含 h3
 
 ```toml
 [sites.tls.http3]
+# ─── 连接级限流 ──────────────────────────────────────────────────
+max_handlers = 0                     # 最大并发 QUIC 连接数（0 = 自动检测，支持热更新）
+
 # ─── 并发控制 ────────────────────────────────────────────────────
 max_concurrent_bidi_streams = 200    # 单连接最大并发双向流（默认 200）
 max_concurrent_uni_streams  = 100    # 单连接最大并发单向流（默认 100）
@@ -44,19 +47,30 @@ initial_rtt_ms   = 333     # 初始 RTT 估算（毫秒，quinn 默认值）
 max_ack_delay_ms = 25      # 最大 ACK 延迟（毫秒，RFC 9000 默认值）
 ```
 
-## 全局并发控制
+## 连接级内存限流
 
-HTTP/3 的全局最大并发 handler 数在 `[global]` 中配置，而非站点级别：
+`max_handlers` 控制全局最大并发 QUIC 连接数，防止高并发大文件传输时 OOM：
 
 ```toml
-[global]
-# 全局最大并发 H3 handler 数（0 = 自动，按系统可用内存 80% / 2MB 计算）
-# 每个 QUIC 连接最多缓冲 send_window 字节，此限制防止 OOM
+[sites.tls.http3]
+# 最大并发 QUIC 连接数（0 = 自动检测）
+# 自动计算公式：可用内存 × 80% / 16MB / worker 线程数
+# 每个 QUIC 连接缓冲最多 send_window 字节，此限制防止内存爆炸
 # 超出时新连接排队等待，不会被拒绝
-h3_max_handlers = 0
+# 支持热更新：通过 Admin API 重载配置后立即生效
+max_handlers = 0
 ```
 
-> 压测场景建议手动设置一个较高的值（如 `h3_max_handlers = 5000`），避免自动计算过于保守。
+| 可用内存 | 自动值（2 核） | 自动值（4 核） |
+|---------|--------------|---------------|
+| 512MB   | ~12          | ~6            |
+| 1GB     | ~25          | ~12           |
+| 2GB     | ~51          | ~25           |
+| 8GB     | ~204         | ~102          |
+
+> **Nginx 没有等价配置项**，同场景也会 OOM。Sweety 的 `max_handlers` 提供比 `worker_connections` 更精细的 H3 内存控制。
+>
+> 压测场景建议手动设置较高的值（如 `max_handlers = 200`），避免自动计算过于保守。
 
 ## 调优建议
 

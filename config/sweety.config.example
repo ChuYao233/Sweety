@@ -200,6 +200,13 @@ protocols = ["h3", "h2", "http/1.1"]
 
 # ─── HTTP/3 QUIC Transport Tuning ────────────────────────────────────────────
 [sites.tls.http3]
+# Max concurrent QUIC connections (0 = auto-detect based on available memory)
+# Auto formula: available_memory * 80% / 16MB / num_workers
+# Each QUIC connection buffers up to send_window bytes; this limit prevents OOM
+# Excess connections are queued, not rejected. Supports hot-reload.
+# Examples: 1GB RAM → ~51, 2GB → ~102, set manually for benchmarks
+max_handlers = 0
+
 # Max concurrent bidirectional streams per connection
 max_concurrent_bidi_streams = 200
 

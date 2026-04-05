@@ -8,6 +8,7 @@ use std::task::Wake;
 use ::h3::server::RequestStream;
 use futures_core::stream::Stream;
 use h3_quinn::RecvStream;
+use tracing::trace;
 
 use crate::{
     bytes::{Buf, Bytes},
@@ -25,6 +26,11 @@ impl RequestBody {
     pub(in crate::h3) fn new(rx: RequestStream<RecvStream, Bytes>) -> Self {
         Self(Some(rx))
     }
+
+    /// 创建空 body（rx 已在外部异步 drain 并 drop）
+    pub(in crate::h3) fn empty() -> Self {
+        Self(None)
+    }
 }
 
 impl Drop for RequestBody {
@@ -34,7 +40,10 @@ impl Drop for RequestBody {
             fn wake(self: Arc<Self>) {}
         }
 
-        let Some(mut rx) = self.0.take() else { return; };
+        let Some(mut rx) = self.0.take() else {
+            // rx 已通过 empty() 或外部 drain 后清除，无需处理
+            return;
+        };
         let waker: std::task::Waker = Arc::new(NoopWake).into();
         let mut cx = Context::from_waker(&waker);
 
@@ -44,12 +53,18 @@ impl Drop for RequestBody {
                 Poll::Ready(Ok(Some(_))) => continue,
                 Poll::Ready(Ok(None)) => {
                     // 已到 EOF，正常 drop 回收 stream 额度
+                    trace!("h3 RequestBody drop: 同步 drain 到 EOF");
                     return;
                 }
-                Poll::Ready(Err(_)) | Poll::Pending => {
-                    // 正常 drop：对 GET（无 body）客户端已 FIN，STOP_SENDING 是 no-op；
-                    // 对 POST（有未读 body），STOP_SENDING 是正确的协议行为。
-                    // 注意：不能用 mem::forget，否则 quinn connection Arc 引用永不归零，导致 OOM。
+                Poll::Ready(Err(_)) => {
+                    trace!("h3 RequestBody drop: 同步 drain 遇到错误，直接 drop rx");
+                    drop(rx);
+                    return;
+                }
+                Poll::Pending => {
+                    // 未读完 body 就被 drop（POST 未消费完 body）
+                    // 对 POST（有未读 body），drop rx 会触发 STOP_SENDING
+                    trace!("h3 RequestBody drop: poll_recv_data Pending，直接 drop rx（可能导致流状态残留）");
                     drop(rx);
                     return;
                 }

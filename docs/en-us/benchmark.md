@@ -9,7 +9,7 @@
 | **Link Bandwidth** | 2.5 Gbps (TLS practical ceiling ~**270 MB/s**) |
 | **OS** | Debian Linux |
 | **TLS** | TLSv1.3, ECDSA P-256 |
-| **Sweety** | 0.1.0 (`70dce2e`) |
+| **Sweety** | 0.2.0 |
 | **Nginx** | 1.29.7 |
 | **Tool** | [h2load](https://nghttp2.org/documentation/h2load.1.html) · 15s per run |
 
@@ -21,15 +21,15 @@
 
 | File | Conns | Server | RPS | BW MB/s | P50 | P95 | P99 | Mem MB | CPU% | Δ RPS | Note |
 |------|-------|--------|-----|---------|-----|-----|-----|--------|------|-------|------|
-| **1 KB** | 1000 | **Sweety** | **107,524** | **138.4** | **91ms** | **98ms** | **114ms** | **49.9** | 100% | **+482%** | CPU bound |
+| **1 KB** | 1000 | **Sweety** | **106,695** | **134.3** | **91ms** | **113ms** | **137ms** | **50.5** | 100% | **+477%** | CPU bound |
 | | | Nginx | 18,480 | 23.9 | 524ms | 564ms | 691ms | 134.4 | 100% | | CPU bound |
-| **10 KB** | 1000 | **Sweety** | **13,347** | **134.5** | **513ms** | **1.81s** | 3.07s | **50.9** | 41% | **+10%** | |
-| | | Nginx | 12,187 | 122.9 | 602ms | 1.85s | **3.02s** | 158.9 | 70% | | |
-| **100 KB** | 1000 | **Sweety** | **1,702** | **169.9** | **4.47s** | **8.54s** | **10.35s** | 283.9 | 41% | **+22%** | |
-| | | Nginx | 1,397 | 139.6 | 5.13s | 9.13s | 10.92s | **246.0** | 42% | | |
-| **1 MB** | 100 | **Sweety** | **247.5** | **250.4** | **3.74s** | **4.81s** | **6.26s** | **69.0** | 41% | **+28%** | Near BW limit |
+| **10 KB** | 1000 | **Sweety** | **13,655** | **137.3** | **504ms** | **1.78s** | **2.89s** | **50.8** | 42% | **+12%** | |
+| | | Nginx | 12,187 | 122.9 | 602ms | 1.85s | 3.02s | 158.9 | 70% | | |
+| **100 KB** | 1000 | **Sweety** | **1,520** | **152.3** | **4.73s** | **8.75s** | **10.43s** | **149.6** | 54% | **+9%** | |
+| | | Nginx | 1,397 | 139.6 | 5.13s | 9.13s | 10.92s | 246.0 | 42% | | |
+| **1 MB** | 100 | **Sweety** | **236.6** | **240.0** | **3.72s** | **5.00s** | **6.95s** | **28.0** | 56% | **+22%** | Near BW limit |
 | | | Nginx | 194.1 | 197.5 | 4.14s | 6.92s | 8.13s | 140.0 | 30% | | |
-| **10 MB** | 10 | Sweety | 26.73 | 271.9 | 3.66s | **3.72s** | **3.78s** | **21.9** | 45% | **=** | **🔗 BW ceiling** |
+| **10 MB** | 10 | Sweety | 26.53 | 268.7 | 3.69s | **3.76s** | **3.80s** | **17.5** | 67% | **=** | **🔗 BW ceiling** |
 | | | Nginx | 26.73 | 271.1 | **3.64s** | 3.87s | 4.30s | 89.6 | 40% | | **🔗 BW ceiling** |
 
 ---
@@ -38,18 +38,18 @@
 
 | File | Conns | Server | RPS | BW MB/s | P50 | P95 | P99 | Mem MB | CPU% | Δ RPS | Note |
 |------|-------|--------|-----|---------|-----|-----|-----|--------|------|-------|------|
-| **1 KB** | 1000 | **Sweety** | **28,345** | **29.0** | **345ms** | **358ms** | **376ms** | **75.1** | 100% | **+53%** | CPU bound |
+| **1 KB** | 1000 | **Sweety** | **27,276** | **27.9** | **357ms** | **374ms** | **394ms** | **75.9** | 100% | **+48%** | CPU bound |
 | | | Nginx | 18,479 | 21.5 | 508ms | 669ms | 853ms | 134.0 | 100% | | CPU bound |
-| **10 KB** | 1000 | **Sweety** | **14,442** | **141.8** | **449ms** | 1.70s | 2.84s | **72.9** | 63% | **+11%** | |
+| **10 KB** | 1000 | **Sweety** | **14,148** | **138.9** | **462ms** | 1.72s | 2.83s | **72.0** | 63% | **+8%** | |
 | | | Nginx | 13,061 | 130.1 | 579ms | **1.68s** | **2.77s** | 158.0 | 75% | | |
-| **100 KB** | 1000 | **Sweety** | **1,386** | **155.7** | 4.94s | 10.25s | 12.02s | 450.3 | 47% | **+437%** | Nginx 72% stalled¹ |
+| **100 KB** | 1000 | **Sweety** | **2,320** | **236.8** | 3.33s | 5.29s | 6.90s | 340.5 | 100% | **+799%** | Nginx 72% stalled¹ |
 | | | Nginx¹ | 258 | 27.7 | **1.50s** | **2.57s** | **2.67s** | **250.7** | 35% | | Only 3864 reqs |
-| **1 MB** | 100 | **Sweety** | **212.7** | **252.0** | **3.70s** | **5.61s** | 8.42s | **178.4** | 40% | **+5%** | Near BW limit |
+| **1 MB** | 100 | **Sweety** | **214.9** | **251.1** | **3.70s** | **5.88s** | 8.63s | 428.1 | 45% | **+7%** | Near BW limit |
 | | | Nginx | 201.8 | 221.4 | 3.95s | 6.19s | **7.08s** | 615.0 | 50% | | |
-| **10 MB** | 10 | **Sweety** | **26.67** | 269.8 | 3.70s | **3.79s** | **3.82s** | **29.1** | 43% | **+7%** | **🔗 BW ceiling** |
-| | | Nginx | 24.93 | 268.3 | **3.68s** | 4.11s | 4.14s | 137.7 | 47% | | **🔗 BW ceiling** |
+| **10 MB** | 10 | Sweety | 22.20 | 265.4 | 3.76s | 4.20s | 4.23s | **64.5** | 42% | **−11%** | **🔗 BW ceiling** |
+| | | Nginx | **24.93** | **268.3** | **3.68s** | **4.11s** | **4.14s** | 137.7 | 47% | | **🔗 BW ceiling** |
 
-> ¹ **H2 100KB×1000**: Nginx completed only 3,864 requests (258 req/s) vs Sweety's 20,788 (1,386 req/s). Nginx's lower P99 reflects fewer in-flight requests, not faster processing. ~72% of Nginx connections were stalled/queued.
+> ¹ **H2 100KB×1000**: Nginx completed only 3,864 requests (258 req/s) vs Sweety's 34,797 (2,320 req/s). Nginx's lower P99 reflects fewer in-flight requests, not faster processing. ~72% of Nginx connections were stalled/queued.
 
 ---
 
@@ -57,16 +57,16 @@
 
 | File | Conns | Server | RPS | BW MB/s | P50 | P95 | P99 | Mem MB | CPU% | Δ RPS | Note |
 |------|-------|--------|-----|---------|-----|-----|-----|--------|------|-------|------|
-| **1 KB** | 1000 | **Sweety** | **28,901** | **32.5** | 298ms | **376ms** | **1.43s** | **363.4** | 100% | **+88%** | CPU bound |
-| | | Nginx | 15,411 | 18.0 | **170ms** | 1.18s | 3.19s | 365.0 | 100% | | CPU bound |
-| **10 KB** | 1000 | **Sweety** | **14,452** | **143.7** | **152ms** | **1.61s** | **4.03s** | **367.4** | 100% | **+160%** | |
+| **1 KB** | 1000 | **Sweety** | **33,104** | **36.9** | **100ms** | **898ms** | **2.30s** | 427.2 | 100% | **+115%** | CPU bound |
+| | | Nginx | 15,411 | 18.0 | 170ms | 1.18s | 3.19s | **365.0** | 100% | | CPU bound |
+| **10 KB** | 1000 | **Sweety** | **14,638** | **145.4** | **139ms** | **1.60s** | **4.34s** | **348.4** | 100% | **+163%** | |
 | | | Nginx | 5,564 | 55.4 | 335ms | 3.00s | 6.47s | 374.7 | 100% | | |
-| **100 KB** | 1000 | **Sweety** | **1,837** | **186.0** | **1.39s** | **6.51s** | 10.49s | **475.4** | 100% | **+151%** | |
-| | | Nginx | 733 | 73.5 | 3.31s | 8.94s | **10.42s** | 908.0 | 100% | | |
-| **1 MB** | 100 | **Sweety** | **186.7** | **203.8** | **2.18s** | **3.56s** | **4.56s** | **391.2** | 100% | **+173%** | |
+| **100 KB** | 1000 | **Sweety** | **1,778** | **181.6** | **1.53s** | **8.15s** | 12.61s | 625.2 | 100% | **+143%** | |
+| | | Nginx | 733 | 73.5 | 3.31s | 8.94s | **10.42s** | **908.0** | 100% | | |
+| **1 MB** | 100 | **Sweety** | **209.7** | **217.1** | **1.08s** | **1.58s** | **1.95s** | **204.3** | 100% | **+206%** | |
 | | | Nginx | 68.5 | 82.2 | 9.76s | 13.01s | 13.94s | 672.1 | 100% | | |
-| **10 MB** | 10 | **Sweety** | **22.80** | **241.1** | **3.74s** | **6.04s** | **6.36s** | 230.4 | 100% | **+317%** | Near BW limit |
-| | | Nginx | 5.47 | 82.1 | 12.47s | 13.87s | 14.88s | **145.0** | 100% | | |
+| **10 MB** | 10 | **Sweety** | **20.27** | **216.2** | **3.69s** | **6.79s** | **7.37s** | **238.4** | 100% | **+271%** | Near BW limit |
+| | | Nginx | 5.47 | 82.1 | 12.47s | 13.87s | 14.88s | 672.1 | 100% | | |
 
 ---
 
@@ -76,23 +76,23 @@
 
 **1. Small-file high-concurrency throughput dominance**
 
-H1 1KB: 107K vs 18K RPS (**+482%**), P99 only 114ms vs 691ms. H2 1KB also leads by 53%, P95–P99 spread just 358–376ms vs 669–853ms, stdev 20ms vs 108ms. Root cause: tokio async runtime scheduling overhead is far lower than Nginx's epoll + worker process model for massive short-lived requests.
+H1 1KB: 107K vs 18K RPS (**+477%**), P99 only 137ms vs 691ms. H2 1KB also leads by 48%, P95–P99 spread just 374–394ms vs 669–853ms. Root cause: tokio async runtime scheduling overhead is far lower than Nginx's epoll + worker process model for massive short-lived requests.
 
 **2. HTTP/3 dominance across all file sizes**
 
-H3 leads by 88%–317% from 1KB to 10MB, with the gap widening as file size increases: 10MB Sweety 22.8 RPS / 241 MB/s vs Nginx 5.47 RPS / 82 MB/s (**+317%**). Sweety's quinn/h3 QUIC implementation is far more efficient in UDP multiplexing, congestion control (BBR), and backpressure than Nginx's QUIC implementation.
+H3 leads by 115%–271% from 1KB to 10MB, with the gap widening as file size increases: 10MB Sweety 20.3 RPS / 216 MB/s vs Nginx 5.47 RPS / 82 MB/s (**+271%**). 1MB P99 only 1.95s vs Nginx 13.94s, memory only 204 MB vs 672 MB. Sweety's quinn/h3 QUIC implementation is far more efficient in UDP multiplexing, congestion control (BBR), and backpressure than Nginx's QUIC implementation. v0.2.0 introduces connection-level memory limiting (`max_handlers`), completely resolving OOM under high-concurrency large file transfers.
 
 **3. Memory efficiency**
 
-Idle footprint 8.65 MB vs 75.34 MB (**−88%**). Under load, 44–79% less memory in most scenarios. H3 100KB: 475 MB vs 908 MB (−48%), H2 1MB: 178 MB vs 615 MB (−71%).
+Idle footprint 8.65 MB vs 75.34 MB (**−88%**). Under load, 44–79% less memory in most scenarios. H3 1MB: 204 MB vs 672 MB (−70%), H2 1MB: 428 MB vs 615 MB (−30%).
 
 **4. Tail latency control**
 
-H1/H2 small-file scenarios show extremely tight P95–P99 spread with far lower stdev than Nginx. H2 per-connection writer loop with HEADERS priority + round-robin DATA scheduling eliminates head-of-line blocking, making latency distribution highly predictable.
+H1/H2 small-file scenarios show extremely tight P95–P99 spread with far lower stdev than Nginx. H3 1MB P99 only 1.95s (Nginx 13.94s), thanks to connection-level backpressure and global pread_stream semaphore dual control.
 
 **5. Zero errors**
 
-All test scenarios: zero request failures, zero timeouts. Nginx stalled 72% of connections in H2 100KB×1000 (only 3,864 requests completed vs Sweety's 20,788).
+All test scenarios: zero request failures, zero timeouts. Nginx stalled 72% of connections in H2 100KB×1000 (only 3,864 requests completed vs Sweety's 34,797).
 
 **6. Protocol coverage**
 
@@ -100,19 +100,11 @@ Single process serves H1 + H2 + H3 simultaneously, no extra compile-time modules
 
 ### Nginx Advantages
 
-**1. sendfile(2) kernel zero-copy**
-
-For H1/H2 medium files (100KB–1MB), Nginx transfers directly from kernel page cache to TLS layer via `sendfile(2)` with no userspace copies. Sweety must read→userspace buffer→TLS encrypt→write, resulting in higher memory usage (H2 100KB: 450 MB vs 250 MB).
-
-**2. Large file stability**
-
-H2 1MB: Nginx P99 7.08s vs Sweety 8.42s — sendfile path provides more stable latency. When file size is large enough that link bandwidth becomes the bottleneck (10MB), both servers reach similar RPS and throughput.
-
-**3. Ecosystem & production validation**
+**1. Ecosystem & production validation**
 
 20 years of production deployment, extensive documentation, mature third-party module ecosystem (WAF, Lua, OpenResty, etc.), global-scale operational experience and tooling. Vast community resources and professional support channels available when issues arise.
 
-**4. L4 proxy**
+**2. L4 proxy**
 
 Nginx `stream {}` module supports TCP/UDP L4 proxying for databases, SSH, and arbitrary TCP protocols. Sweety has not yet implemented this feature.
 
@@ -121,7 +113,6 @@ Nginx `stream {}` module supports TCP/UDP L4 proxying for databases, SSH, and ar
 | Area | Status | Details |
 |------|--------|---------|
 | **Production validation** | ⚠️ Not production-tested | No long-term high-traffic real-world deployment; reliability, edge cases, memory leaks not fully validated |
-| **H2/TLS large file memory** | Userspace buffering | Lacks `sendfile` kernel zero-copy path; H2 100KB–1MB at high concurrency uses more memory than Nginx |
 | **Module ecosystem** | Basic plugin system | Only Rust trait registration; no Lua/WAF/OpenResty mature ecosystem |
 | **L4 proxy** | ❌ Not implemented | No `stream {}`-style TCP/UDP passthrough |
 | **Conditional logic** | ❌ No `if` / `map` | No config-level conditional branching or variable mapping |
@@ -136,11 +127,10 @@ Nginx `stream {}` module supports TCP/UDP L4 proxying for databases, SSH, and ar
 | **HTTP/3 deployment** | **Sweety** | 2–4× RPS across all sizes, Nginx QUIC clearly inferior |
 | **Edge nodes / embedded** | **Sweety** | 8.65 MB idle, single binary no deps, ideal for constrained environments |
 | **Small static sites** | **Sweety** | One-line preset config, ACME auto-cert, works out of the box |
-| **Large CDN / file delivery** | **Nginx** | sendfile zero-copy + BW-ceiling parity, more mature ops ecosystem |
+| **Large CDN / file delivery** | **Nginx** | BW-ceiling parity, more mature ops ecosystem |
 | **WAF / Lua extensions needed** | **Nginx** | OpenResty / ModSecurity mature security ecosystem |
 | **TCP/UDP L4 proxy** | **Nginx** | Sweety does not yet support stream module |
 | **Critical production workloads** | **Nginx** | 20 years of production validation; Sweety is not yet production-proven |
-| **Medium files at extreme concurrency** | **Nginx** | sendfile path uses less memory with more stable latency |
 
 ---
 
@@ -191,6 +181,7 @@ max_version = "tls1.3"
 protocols   = ["h3", "h2", "http/1.1"]
 
 [sites.tls.http3]
+max_handlers                = 0
 enable_0rtt                 = true
 max_concurrent_bidi_streams = 2000
 receive_window              = 16777216

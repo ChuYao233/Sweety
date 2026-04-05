@@ -142,4 +142,4 @@ cache_control = "public, max-age=86400, s-maxage=604800"
 - Small files (< 512KB) are automatically memory-cached — no disk I/O on hot requests
 - Supports `Range` requests (video/audio resume)
 - Automatic `gzip`/`brotli` compression negotiation (based on `Accept-Encoding`)
-- Large files (> 512KB) use `sendfile` zero-copy transfer
+- Large files (> 512KB) use `pread` streaming to avoid loading entirely into memory

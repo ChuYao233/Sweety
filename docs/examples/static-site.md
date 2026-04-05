@@ -142,4 +142,4 @@ cache_control = "public, max-age=86400, s-maxage=604800"
 - 小文件（< 512KB）自动内存缓存，热请求无磁盘 I/O
 - 支持 `Range` 请求（视频/音频断点续传）
 - 自动协商 `gzip`/`brotli` 压缩（基于 `Accept-Encoding`）
-- 大文件（> 512KB）使用 `sendfile` 零拷贝传输
+- 大文件（> 512KB）使用 `pread` 流式传输，避免一次性加载到内存

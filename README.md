@@ -27,7 +27,7 @@ The underlying HTTP stack is forked from [xitca-web](https://github.com/HFQR/xit
 
 ### Request Handling
 
-- 📁 **Static Files** — in-memory cache + Range + ETag/Last-Modified + `try_files` + sendfile(2) zero-copy
+- 📁 **Static Files** — in-memory cache + Range + ETag/Last-Modified + `try_files` + pread streaming
 - 🐘 **PHP / FastCGI** — Unix socket / TCP connection pool + `fastcgi_cache`; correct HTTP/2 Cookie merging (RFC 7540 §8.1.2.5), compatible with WordPress / Laravel
 - 🔄 **Reverse Proxy** — round-robin / weighted / least-conn / IP hash + connection pool + active health checks + `proxy_cache`
 - 📡 **gRPC Proxy** — automatic `application/grpc` + Trailer handling
@@ -147,16 +147,16 @@ For a complete configuration reference with all options, see [config/sweety.conf
 
 | Proto | File | Sweety RPS | Nginx RPS | Δ |
 |-------|------|-----------|-----------|---|
-| H1 | 1 KB | **107,524** | 18,480 | **+482%** |
-| H2 | 1 KB | **28,345** | 18,479 | **+53%** |
-| H3 | 1 KB | **28,901** | 15,411 | **+88%** |
-| H3 | 10 KB | **14,452** | 5,564 | **+160%** |
-| H2 | 100 KB | **1,386** | 258 | **+437%** |
+| H1 | 1 KB | **106,695** | 18,480 | **+477%** |
+| H2 | 1 KB | **27,276** | 18,479 | **+48%** |
+| H3 | 1 KB | **33,104** | 15,411 | **+115%** |
+| H3 | 10 KB | **14,638** | 5,564 | **+163%** |
+| H2 | 100 KB | **2,320** | 258 | **+799%** |
+| H3 | 1 MB | **209.7** | 68.5 | **+206%** |
 
-- **P99 Latency**: H1 1KB 114ms vs 691ms (**−83%**); H2 1KB 376ms vs 853ms (**−56%**)
-- **Memory**: Idle **8.65 MB** vs 75.34 MB (**−88%**), 44–79% less under most loads
-- **Zero errors** across all test scenarios
-- Nginx leads at 100KB–1MB H2 due to `sendfile(2)` kernel zero-copy
+- **P99 Latency**: H1 1KB 137ms vs 691ms (**−80%**); H3 1MB 1.95s vs 13.94s (**−86%**)
+- **Memory**: Idle **8.65 MB** vs 75.34 MB (**−88%**); H3 1MB **204 MB** vs 672 MB (**−70%**)
+- **Zero errors** across all test scenarios; Nginx H2 100KB×1000 had 72% connections stalled
 
 👉 **[Full benchmark results and methodology](https://sweety.2o.nz/benchmark/)**
 

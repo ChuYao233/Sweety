@@ -33,19 +33,9 @@ jobs:
             artifact: sweety-linux-amd64-musl
             cross: false
 
-          - target: i686-unknown-linux-musl
-            os: ubuntu-24.04
-            artifact: sweety-linux-i686-musl
-            cross: true
-
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04
             artifact: sweety-linux-aarch64-musl
-            cross: true
-
-          - target: armv7-unknown-linux-musleabihf
-            os: ubuntu-24.04
-            artifact: sweety-linux-armv7-musl
             cross: true
 
           # ═══════════════════════════════════════════

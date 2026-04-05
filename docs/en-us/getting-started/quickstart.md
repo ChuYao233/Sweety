@@ -21,14 +21,15 @@ listen_tls  = [443]
 root        = "/var/www/wordpress"
 preset      = "wordpress"
 php_fastcgi = "/run/php/php8.2-fpm.sock"
-acme_email  = "your@email.com"
 ```
 
-These 8 lines are equivalent to 50+ lines of Nginx config, automatically providing:
-- HTTP → HTTPS 301 redirect
-- Let's Encrypt automatic certificate issuance and renewal
+These 7 lines are equivalent to 50+ lines of Nginx config, automatically providing:
+- HTTP → HTTPS 301 redirect (`force_https` enabled by default, no explicit config needed)
+- Let's Encrypt automatic certificate issuance and renewal (no email required)
 - Optimal WordPress location routing rules (static files served directly, PHP forwarding, security filtering)
 - HTTP/1.1 + HTTP/2 + HTTP/3 full protocol support
+
+> 💡 `force_https` defaults to `true`. To allow plain HTTP access, explicitly set `force_https = false`.
 
 ### 3. Validate Config
 
@@ -58,7 +59,6 @@ listen      = [80]
 listen_tls  = [443]
 root        = "/var/www/blog"
 preset      = "static"
-acme_email  = "your@email.com"
 ```
 
 ---
@@ -71,7 +71,6 @@ name        = "api"
 server_name = ["api.example.com"]
 listen      = [80]
 listen_tls  = [443]
-acme_email  = "your@email.com"
 
 [[sites.upstreams]]
 name  = "backend"
@@ -97,7 +96,6 @@ listen      = [80]
 listen_tls  = [443]
 root        = "/var/www/site1"
 preset      = "static"
-acme_email  = "your@email.com"
 
 [[sites]]
 name        = "site2"
@@ -107,7 +105,6 @@ listen_tls  = [443]
 root        = "/var/www/wordpress"
 preset      = "wordpress"
 php_fastcgi = "/run/php/php8.2-fpm.sock"
-acme_email  = "your@email.com"
 ```
 
 Multiple sites share the same port — Sweety automatically routes via SNI (TLS) and `Host` header (HTTP).

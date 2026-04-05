@@ -48,6 +48,8 @@ pub struct SiteInfo {
     pub hsts: Option<HstsConfig>,
     /// 预构建的 HSTS HeaderValue（启动时生成，请求时 clone 只增引用计数，零堆分配）
     pub hsts_header_value: Option<sweety_web::http::header::HeaderValue>,
+    /// 是否启用 ACME 自动证书（用于判断 force_https/HSTS 是否需要等待证书就绪）
+    pub acme: bool,
     /// 是否作为 fallback 站点
     pub fallback: bool,
     /// 站点 TLS 端口列表（force_https 跳转时使用）
@@ -124,6 +126,7 @@ impl SiteInfo {
             fastcgi: cfg.fastcgi.clone(),
             hsts: cfg.hsts.clone(),
             hsts_header_value,
+            acme: cfg.tls.as_ref().map_or(false, |t| t.acme),
             fallback: cfg.fallback,
             websocket: cfg.websocket,
             gzip: cfg.gzip,
@@ -394,12 +397,12 @@ mod tests {
             }],
             rewrites: vec![],
             rate_limit: None,
-            hsts: None,
+            hsts: Some(crate::config::model::HstsConfig::default()),
             fallback: false,
             gzip: None,
             gzip_comp_level: None,
             websocket: true,
-            force_https: false,
+            force_https: true,
             error_pages: std::collections::HashMap::new(),
             proxy_cache: None,
         }

@@ -21,14 +21,15 @@ listen_tls  = [443]
 root        = "/var/www/wordpress"
 preset      = "wordpress"
 php_fastcgi = "/run/php/php8.2-fpm.sock"
-acme_email  = "your@email.com"
 ```
 
-这 8 行配置等价于 50+ 行 Nginx 配置，自动实现：
-- HTTP → HTTPS 301 跳转
-- Let's Encrypt 证书自动申请与续期
+这 7 行配置等价于 50+ 行 Nginx 配置，自动实现：
+- HTTP → HTTPS 301 跳转（`force_https` 默认开启，无需显式配置）
+- Let's Encrypt 证书自动申请与续期（无需填写邮箱）
 - WordPress 最优 location 路由规则（静态文件直出、PHP 转发、安全过滤）
 - HTTP/1.1 + HTTP/2 + HTTP/3 全协议支持
+
+> 💡 `force_https` 默认为 `true`，如需允许纯 HTTP 访问，请显式设置 `force_https = false`。
 
 ### 3. 校验配置
 
@@ -58,7 +59,6 @@ listen      = [80]
 listen_tls  = [443]
 root        = "/var/www/blog"
 preset      = "static"
-acme_email  = "your@email.com"
 ```
 
 ---
@@ -71,7 +71,6 @@ name        = "api"
 server_name = ["api.example.com"]
 listen      = [80]
 listen_tls  = [443]
-acme_email  = "your@email.com"
 
 [[sites.upstreams]]
 name  = "backend"
@@ -97,7 +96,6 @@ listen      = [80]
 listen_tls  = [443]
 root        = "/var/www/site1"
 preset      = "static"
-acme_email  = "your@email.com"
 
 [[sites]]
 name        = "site2"
@@ -107,7 +105,6 @@ listen_tls  = [443]
 root        = "/var/www/wordpress"
 preset      = "wordpress"
 php_fastcgi = "/run/php/php8.2-fpm.sock"
-acme_email  = "your@email.com"
 ```
 
 多个站点共享同一端口，Sweety 通过 SNI（TLS）和 `Host` 头（HTTP）自动路由。

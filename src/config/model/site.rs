@@ -89,8 +89,8 @@ pub struct SiteConfig {
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
 
-    /// HSTS 配置（仅对 HTTPS 端口生效）
-    #[serde(default)]
+    /// HSTS 配置（仅对 HTTPS 端口生效，默认开启 max-age=31536000）
+    #[serde(default = "default_hsts")]
     pub hsts: Option<HstsConfig>,
 
     /// 是否作为 fallback 站点
@@ -109,8 +109,8 @@ pub struct SiteConfig {
     #[serde(default = "default_true")]
     pub websocket: bool,
 
-    /// 是否强制 HTTP 跳转到 HTTPS
-    #[serde(default)]
+    /// 是否强制 HTTP 跳转到 HTTPS（默认 true，对标 Caddy）
+    #[serde(default = "default_true")]
     pub force_https: bool,
 
     /// 是否在该站点的监听端口上启用 PROXY protocol 解析
@@ -168,6 +168,7 @@ pub struct SiteConfig {
 }
 
 fn default_hsts_max_age() -> u64 { 31_536_000 }
+fn default_hsts() -> Option<HstsConfig> { Some(HstsConfig::default()) }
 
 /// HSTS（HTTP Strict Transport Security）配置
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -107,8 +107,9 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         }
     };
 
-    // force_https 重定向
-    if site.force_https && !is_https {
+    // force_https 重定向（启用 ACME 但尚无有效证书时跳过，避免阻塞首次申请）
+    let acme_cert_ready = !site.acme || crate::server::tls::ACME_CERTS_READY.contains(&site.name);
+    if site.force_https && !is_https && acme_cert_ready {
         let tls_port = if site.listen_tls.contains(&443) { 443 }
                        else { site.listen_tls.first().copied().unwrap_or(443) };
         let host_for_redirect = if tls_port == 443 { host.to_string() }
@@ -343,8 +344,8 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         }
     }
 
-    // 注入 HSTS 响应头
-    if site.hsts_header_value.is_some() && is_https {
+    // 注入 HSTS 响应头（启用 ACME 但尚无有效证书时跳过）
+    if site.hsts_header_value.is_some() && is_https && acme_cert_ready {
         if let Some(hsts_val) = &site.hsts_header_value {
             resp.headers_mut().insert(
                 sweety_web::http::header::HeaderName::from_static("strict-transport-security"),

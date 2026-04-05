@@ -445,6 +445,8 @@ fn build_quinn_config_self_signed(domain: &str) -> Result<sweety_io::net::QuicCo
 
 // ACME_HTTP01_TOKENS re-export：供 http.rs 中 challenge handler 使用，无需改调用方
 pub use super::acme::ACME_HTTP01_TOKENS;
+// ACME_CERTS_READY re-export：供 router.rs 判断 force_https / HSTS 是否生效
+pub use super::acme::ACME_CERTS_READY;
 
 // ─────────────────────────────────────────────
 // SNI 多证书 Resolver

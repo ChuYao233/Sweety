@@ -29,7 +29,7 @@ quinn        = { version = "0.11", default-features = false, features = ["rustls
 
 [package]
 name        = "sweety"
-version     = "0.2.1"
+version     = "0.2.2"
 edition     = "2021"
 description = "高性能、单文件部署、多站点 Web 服务器"
 license     = "Apache-2.0"
@@ -79,8 +79,8 @@ rustls-pemfile  = "2"
 tokio-rustls    = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 # TLS 客户端根证书（反向代理证书验证）
 webpki-roots    = "0.26"
-# ACME 自动证书（HTTP-01，instant-acme）
-instant-acme   = "0.7"
+# ACME 自动证书（HTTP-01/DNS-01，instant-acme）
+instant-acme   = { version = "0.8", features = ["hyper-rustls"] }
 # WebSocket 协议库（sweety-web websocket feature 已引入此 crate）
 http-ws        = { version = "0.3", features = ["stream"] }
 # http 基础类型（WebSocket handler 需要）

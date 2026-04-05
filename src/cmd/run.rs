@@ -56,8 +56,10 @@ pub fn cmd_run(config: &PathBuf) {
     raise_nofile_limit();
 
     let cfg = load_cfg_or_exit(config);
+    // quinn_udp GSO 探测失败是无害的一次性日志，自动压制
+    let base_filter = format!("{},quinn_udp=error", cfg.global.log_level);
     let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.global.log_level));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&base_filter));
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     let (reload_filter, reload_handle) = tracing_subscriber::reload::Layer::new(log_filter);
     tracing_subscriber::registry()

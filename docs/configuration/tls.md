@@ -9,15 +9,16 @@ server_name = ["example.com"]
 listen      = [80]
 listen_tls  = [443]
 root        = "/var/www/html"
-acme_email  = "your@email.com"   # 一行开启 ACME 自动 HTTPS
 ```
+
+只要配置了 `listen_tls`，Sweety 自动启用 ACME 申请证书（对标 Caddy）。`acme_email` 可选，未填则自动生成随机邮箱。`force_https` 默认为 `true`，HTTP 请求自动 301 跳转到 HTTPS。
 
 等价完整写法：
 
 ```toml
 [sites.tls]
 acme       = true
-acme_email = "your@email.com"
+# acme_email = "your@email.com"   # 可选，用于接收证书到期提醒
 ```
 
 ## 完整 TLS 配置
@@ -27,10 +28,11 @@ acme_email = "your@email.com"
 # ─── 证书来源（三选一） ──────────────────────────────────────────
 # 方式 1：ACME 自动证书
 acme             = true
-acme_email       = "your@email.com"
+acme_email       = "your@email.com"   # 可选，未填则自动生成随机邮箱
 acme_provider    = "letsencrypt"   # letsencrypt / zerossl / litessl / 自定义 URL
 acme_challenge   = "http01"        # http01 / dns01
 acme_renew_days_before = 30        # 到期前 N 天自动续期
+# ZeroSSL / LiteSSL 的 EAB 凭据自动获取，无需手动配置
 
 # 方式 2：手动单证书
 cert = "/etc/ssl/example.com.crt"
@@ -79,8 +81,8 @@ listen      = [80]
 listen_tls  = [443]
 
 [sites.tls]
-acme       = true
-acme_email = "admin@example.com"
+acme = true
+# acme_email = "admin@example.com"   # 可选
 # → 自动签发一张包含 3 个域名的 SAN 证书
 ```
 
@@ -111,7 +113,7 @@ DNS-01 验证可申请 `*.example.com` 通配符证书：
 ```toml
 [sites.tls]
 acme           = true
-acme_email     = "your@email.com"
+# acme_email   = "your@email.com"   # 可选
 acme_challenge = "dns01"
 
 # Cloudflare DNS

@@ -9,15 +9,16 @@ server_name = ["example.com"]
 listen      = [80]
 listen_tls  = [443]
 root        = "/var/www/html"
-acme_email  = "your@email.com"   # One line to enable ACME auto HTTPS
 ```
+
+Just configure `listen_tls` and Sweety automatically enables ACME (Caddy-style). `acme_email` is optional — a random email is generated if omitted.
 
 Equivalent full syntax:
 
 ```toml
 [sites.tls]
 acme       = true
-acme_email = "your@email.com"
+# acme_email = "your@email.com"   # Optional, for expiry notifications
 ```
 
 ## Full TLS Configuration
@@ -27,10 +28,11 @@ acme_email = "your@email.com"
 # ─── Certificate Source (choose one) ─────────────────────────────
 # Method 1: ACME auto-certificate
 acme             = true
-acme_email       = "your@email.com"
+acme_email       = "your@email.com"   # Optional, random email if omitted
 acme_provider    = "letsencrypt"   # letsencrypt / zerossl / litessl / custom URL
 acme_challenge   = "http01"        # http01 / dns01
 acme_renew_days_before = 30        # Auto-renew N days before expiry
+# ZeroSSL / LiteSSL EAB credentials are fetched automatically
 
 # Method 2: Manual single certificate
 cert = "/etc/ssl/example.com.crt"
@@ -79,8 +81,8 @@ listen      = [80]
 listen_tls  = [443]
 
 [sites.tls]
-acme       = true
-acme_email = "admin@example.com"
+acme = true
+# acme_email = "admin@example.com"   # Optional
 # → Automatically issues one SAN certificate for all 3 domains
 ```
 
@@ -111,7 +113,7 @@ DNS-01 validation can issue `*.example.com` wildcard certificates:
 ```toml
 [sites.tls]
 acme           = true
-acme_email     = "your@email.com"
+# acme_email   = "your@email.com"   # Optional
 acme_challenge = "dns01"
 
 # Cloudflare DNS

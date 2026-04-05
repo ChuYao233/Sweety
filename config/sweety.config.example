@@ -132,7 +132,8 @@ index = ["index.html", "index.htm"]
 # access_log_format = "combined"
 # error_log  = "/var/log/sweety/site_error.log"
 
-# Force HTTP -> HTTPS redirect
+# Force HTTP -> HTTPS redirect (default: true)
+# Set to false to allow plain HTTP access
 force_https = true
 
 # Site-level gzip override (omit to inherit from global)
@@ -169,8 +170,9 @@ key  = "/etc/ssl/private/example.com.key"
 # covering ALL domains automatically (e.g. example.com + www.example.com in one cert).
 # Certificate file is named after the first non-wildcard domain.
 # acme = true
-# acme_email = "admin@example.com"
+# acme_email = "admin@example.com"   # Optional, random email if omitted
 # acme_provider = "letsencrypt"    # letsencrypt / zerossl / litessl / custom URL
+# ZeroSSL / LiteSSL EAB credentials are fetched automatically
 # acme_challenge = "http01"        # http01 / dns01
 # acme_renew_days_before = 30
 # Instant renewal via Admin API: POST /api/certs/acme/renew[?site=name]
@@ -393,8 +395,8 @@ preset = "wordpress"
 # Shorthand: auto-configures FastCGI (Unix socket or host:port)
 php_fastcgi = "/run/php/php8.2-fpm.sock"
 
-# Shorthand: auto-enables ACME with Let's Encrypt
-acme_email = "admin@example.com"
+# Shorthand: auto-enables ACME with Let's Encrypt (email optional)
+# acme_email = "admin@example.com"
 
 # Or use full FastCGI config block instead of php_fastcgi shorthand:
 # [sites.fastcgi]

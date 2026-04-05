@@ -36,8 +36,6 @@ pub struct HttpServiceConfig<
     /// 达到后发 GOAWAY 优雅关闭，强制客户端重建连接重新分散到各 worker
     /// 对标 Nginx keepalive_requests
     pub(crate) h2_max_requests_per_conn: usize,
-    /// HTTP/3 全局最大并发 handler 数（0 = 自动检测，按系统内存 80% 计算）
-    pub(crate) h3_max_handlers: usize,
 }
 
 impl Default for HttpServiceConfig {
@@ -63,7 +61,6 @@ impl HttpServiceConfig {
             h2_max_concurrent_reset_streams: 200,
             h2_max_frame_size: 65535,
             h2_max_requests_per_conn: 1000,
-            h3_max_handlers: 0,
         }
     }
 }
@@ -168,11 +165,6 @@ impl<const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE_BUF_LIM
         self
     }
 
-    /// HTTP/3 全局最大并发 handler 数（0 = 自动，按系统总内存 80% / 2MB 计算）
-    pub fn h3_max_handlers(mut self, n: usize) -> Self {
-        self.h3_max_handlers = n;
-        self
-    }
 
     /// Enable peek into connection to figure out it's protocol regardless the outcome
     /// of alpn negotiation.
@@ -204,7 +196,6 @@ impl<const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE_BUF_LIM
             h2_max_concurrent_reset_streams: self.h2_max_concurrent_reset_streams,
             h2_max_frame_size: self.h2_max_frame_size,
             h2_max_requests_per_conn: self.h2_max_requests_per_conn,
-            h3_max_handlers: self.h3_max_handlers,
         }
     }
 }

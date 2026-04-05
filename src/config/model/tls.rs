@@ -12,7 +12,7 @@ fn default_protocols() -> Vec<String> { vec!["h3".into(), "h2".into(), "http/1.1
 fn default_h3_max_concurrent_bidi_streams() -> u32 { 200 }
 fn default_h3_max_concurrent_uni_streams() -> u32 { 100 }
 fn default_h3_idle_timeout_ms() -> u64 { 30_000 }
-fn default_h3_keep_alive_interval_ms() -> u64 { 10_000 }
+fn default_h3_keep_alive_interval_ms() -> u64 { 0 }
 fn default_h3_receive_window() -> u64 { 8 * 1024 * 1024 }
 fn default_h3_stream_receive_window() -> u64 { 2 * 1024 * 1024 }
 fn default_h3_send_window() -> u64 { 8 * 1024 * 1024 }

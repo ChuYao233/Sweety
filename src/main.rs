@@ -7,6 +7,18 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// jemalloc 内存回收策略
+///
+/// - `background_thread:true`  — 启用后台线程主动触发 decay（不依赖 malloc/free 调用）
+/// - `dirty_decay_ms:1000`     — 1 秒后归还 dirty pages 给 OS（默认 10s，太慢）
+/// - `muzzy_decay_ms:1000`     — 1 秒后归还 muzzy pages 给 OS
+
+#[cfg(all(not(windows), feature = "jemalloc"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+
 mod cli;
 mod cmd;
 mod util;

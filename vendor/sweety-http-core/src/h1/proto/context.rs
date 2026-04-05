@@ -111,9 +111,11 @@ impl<'a, D, const HEADER_LIMIT: usize> Context<'a, D, HEADER_LIMIT> {
     }
 
     /// Reset Context's state to partial default state.
+    /// IS_TLS 是连接级别属性，不随请求重置
     #[inline]
     pub fn reset(&mut self) {
-        self.state = ContextState::new();
+        let keep = self.state.0 & ContextState::IS_TLS;
+        self.state = ContextState(keep);
     }
 
     /// Set Context's state to EXPECT header received.

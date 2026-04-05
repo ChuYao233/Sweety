@@ -103,7 +103,10 @@ pub async fn handle_sweety(
     // WebSocket 升级请求需要保留 Upgrade/Sec-WebSocket-* 头，否则上游不能完成握手
     // 对标 Nginx: proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";
     let client_ip_str_ref = client_ip_str.as_str();
-    let scheme_str = ctx.req().uri().scheme_str().unwrap_or("http");
+    // HTTP/1.1 URI 只有路径，无 scheme；优先用连接级 TLS 状态判断
+    let scheme_str = if ctx.req().body().is_tls() { "https" } else {
+        ctx.req().uri().scheme_str().unwrap_or("http")
+    };
     let header_count = ctx.req().headers().len();
     let mut client_headers: Vec<(String, String)> = Vec::with_capacity(header_count + 4);
     client_headers.extend(

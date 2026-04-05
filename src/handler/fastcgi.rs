@@ -187,7 +187,7 @@ pub async fn handle_sweety(
     params.extend([
         // RFC 3875 必须参数
         ("GATEWAY_INTERFACE".into(), "CGI/1.1".into()),
-        ("SERVER_SOFTWARE".into(),   "Sweety/0.1".into()),
+        ("SERVER_SOFTWARE".into(),   concat!("Sweety/", env!("CARGO_PKG_VERSION")).into()),
         ("SERVER_PROTOCOL".into(),   "HTTP/1.1".into()),
         ("SERVER_NAME".into(),       server_name.to_owned()),
         ("SERVER_PORT".into(),       server_port.to_owned()),

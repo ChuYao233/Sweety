@@ -237,25 +237,22 @@ where
                 SelectOutput::B(Ok(i)) => match i {},
             };
 
-            // 在 parts 被 encode_head 消耗前，提取 SendFileInfo（Linux 非 TLS）
+            // 在 parts 被 encode_head 消耗前，提取 SendFileInfo
             #[cfg(target_os = "linux")]
-            let send_file_info: Option<crate::sendfile_ext::SendFileInfo> = if !self.ctx.is_tls() {
-                parts.extensions.get::<crate::sendfile_ext::SendFileInfo>().cloned()
-            } else {
-                None
-            };
+            let send_file_info: Option<crate::sendfile_ext::SendFileInfo> =
+                parts.extensions.get::<crate::sendfile_ext::SendFileInfo>().cloned();
 
             let encoder = &mut self.encode_head(parts, &body)?;
             let mut body = pin!(body);
 
-            // sendfile(2) 快路径：drain 头部到 socket，然后内核零拷贝传文件
+            // sendfile(2) 快路径：通过 sendfile_fd() 编译期 dispatch
+            // 裸 TCP socket 返回 Some(fd)，TLS 等封装类型返回 None（编译期单态化，零开销）
             #[cfg(target_os = "linux")]
             let did_sendfile = 'sf: {
                 let Some(sf) = send_file_info else { break 'sf false; };
-                let sock_fd = self.io.io.raw_fd();
-                if sock_fd == 0 { break 'sf false; }
+                let Some(sock_fd) = self.io.io.sendfile_fd() else { break 'sf false; };
                 self.io.drain_write().await?;
-                crate::sendfile_ext::sendfile_to_io(self.io.io, &sf.fd, sf.offset, sf.len).await?;
+                crate::sendfile_ext::sendfile_to_io(self.io.io, sock_fd, &sf.fd, sf.offset, sf.len).await?;
                 true
             };
             #[cfg(not(target_os = "linux"))]
@@ -268,7 +265,6 @@ where
                     match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
                         Some(Ok(bytes)) => {
                             encoder.encode(bytes, &mut self.io.write_buf);
-                            // write_buf 超过 LIMIT 时立即 drain（像 H2 等窗口后发送一样）
                             if !self.io.write_buf.want_write_buf() {
                                 self.io.drain_write().await?;
                             }

@@ -21,6 +21,7 @@ pub struct SendFileInfo {
 #[allow(unsafe_code)]
 pub async fn sendfile_to_io<St: sweety_io_compat::io::AsyncIo>(
     io: &mut St,
+    sock_fd: i32,
     file: &std::sync::Arc<std::fs::File>,
     offset: u64,
     len: u64,
@@ -29,7 +30,6 @@ pub async fn sendfile_to_io<St: sweety_io_compat::io::AsyncIo>(
     use sweety_io_compat::io::Interest;
 
     let file_fd = file.as_raw_fd();
-    let sock_fd = io.raw_fd();
     let mut off = offset as libc::off_t;
     let mut rem = len as usize;
 

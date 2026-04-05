@@ -71,14 +71,16 @@ where
             Self::Tls(_) => debug!(target = target, ?self, "tls handshake failed"),
             // H3 连接被客户端正常关闭（如基准测试到期、浏览器关闭标签页）只记 debug
             #[cfg(feature = "http3")]
-            Self::H3(super::h3::Error::H3(e))
-                if e.get_error_level() == ::h3::error::ErrorLevel::ConnectionError =>
-            {
+            Self::H3(super::h3::Error::H3(_)) => {
                 debug!(target = target, ?self, "h3 connection closed by peer")
             }
             #[cfg(feature = "http3")]
             Self::H3(super::h3::Error::Connection(_)) => {
                 debug!(target = target, ?self, "h3 connection closed by peer")
+            }
+            #[cfg(feature = "http3")]
+            Self::H3(super::h3::Error::Stream(_)) => {
+                debug!(target = target, ?self, "h3 stream error")
             }
             // 其他真正的服务错误记 error
             _ => error!(target = target, ?self),

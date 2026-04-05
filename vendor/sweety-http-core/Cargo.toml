@@ -105,11 +105,11 @@ version = "0.4"
 optional = true
 
 [dependencies.h3]
-version = "0.0.7"
+version = "0.0.8"
 optional = true
 
 [dependencies.h3-quinn]
-version = "0.0.9"
+version = "0.0.10"
 optional = true
 
 [dependencies.http]

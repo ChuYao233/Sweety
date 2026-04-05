@@ -1,8 +1,6 @@
 ﻿use core::{fmt, marker::PhantomData, pin::pin};
 use std::sync::Arc;
 
-#[cfg(feature = "http3")]
-use tokio::sync::Semaphore;
 
 use futures_core::Stream;
 use sweety_io_compat::{
@@ -37,8 +35,6 @@ pub struct HttpService<
     pub(crate) tls_acceptor: A,
     /// 当前 service 绑定的是否为 TLS 端口（由 builder 在构建时写入）
     pub(crate) is_tls: bool,
-    #[cfg(feature = "http3")]
-    pub(crate) conn_sem: Arc<Semaphore>,
     _body: PhantomData<(St, ReqB)>,
 }
 
@@ -51,21 +47,12 @@ impl<St, S, ReqB, A, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, con
         tls_acceptor: A,
         is_tls: bool,
     ) -> Self {
-        #[cfg(feature = "http3")]
-        let conn_sem = {
-            let max = config.h3_max_handlers;
-            let max = if max == 0 { super::h3::detect_max_h3_handlers() } else { max };
-            tracing::debug!("H3 连接级信号量初始化: max_conns_per_worker={}", max);
-            Arc::new(Semaphore::new(max))
-        };
         Self {
             config,
             date: DateTimeService::new(),
             service: Arc::new(service),
             tls_acceptor,
             is_tls,
-            #[cfg(feature = "http3")]
-            conn_sem,
             _body: PhantomData,
         }
     }
@@ -110,21 +97,10 @@ where
         match io {
             #[cfg(feature = "http3")]
             ServerStream::Udp(io, addr) => {
-                // 连接级限流：持有 permit 直到连接关闭
-                let avail = self.conn_sem.available_permits();
-                tracing::debug!("H3 连接等待 permit: available={}", avail);
-                let _conn_permit = match self.conn_sem.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()),
-                };
-                let avail = self.conn_sem.available_permits();
-                tracing::debug!("H3 连接获得 permit: remaining={}", avail);
-                let res = super::h3::Dispatcher::new(io, addr, Arc::clone(&self.service), self.date.get_rc())
+                super::h3::Dispatcher::new(io, addr, Arc::clone(&self.service), self.date.get_rc())
                     .run()
                     .await
-                    .map_err(From::from);
-                tracing::debug!("H3 连接结束，释放 permit");
-                res
+                    .map_err(From::from)
             }
             ServerStream::Tcp(io, _addr) => {
                 let mut io = TcpStream::from_std(io).expect("TODO: handle io error");

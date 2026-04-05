@@ -155,11 +155,6 @@ where
         self
     }
 
-    /// HTTP/3 全局最大并发 handler 数（0 = 自动，按系统可用内存 80% / 2MB 计算）
-    pub fn h3_max_handlers(mut self, n: usize) -> Self {
-        self.config = self.config.h3_max_handlers(n);
-        self
-    }
 
     /// Change max size for request head.
     ///

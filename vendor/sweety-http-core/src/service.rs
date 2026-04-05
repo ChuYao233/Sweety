@@ -1,6 +1,85 @@
 ﻿use core::{fmt, marker::PhantomData, pin::pin};
 use std::sync::Arc;
 
+#[cfg(feature = "http3")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// H3 连接限流：原子计数器 + 原子限制值，支持热更新
+/// 每个 QUIC 连接实际占用约 2-4MB（含 quinn buffer、协议栈状态）
+#[cfg(feature = "http3")]
+static H3_CONN_LIMIT: AtomicUsize = AtomicUsize::new(0); // 0 = 未初始化，首次使用时自动检测
+#[cfg(feature = "http3")]
+static H3_CONN_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "http3")]
+static H3_CONN_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+/// 设置/热更新 H3 最大并发连接数（0 = 自动检测）
+/// 可在运行时任意时刻调用，立即生效（原子写入）
+#[cfg(feature = "http3")]
+pub fn set_h3_max_connections(max: usize) {
+    let max = if max == 0 {
+        super::h3::service::detect_max_h3_handlers()
+    } else {
+        max
+    };
+    let old = H3_CONN_LIMIT.swap(max, Ordering::SeqCst);
+    if old != max {
+        tracing::info!("H3 最大并发连接数: {} → {}", old, max);
+        // 限制增大时唤醒所有等待的连接
+        if max > old {
+            if let Some(n) = H3_CONN_NOTIFY.get() {
+                n.notify_waiters();
+            }
+        }
+    }
+}
+
+/// 获取当前 H3 连接限制（惰性初始化）
+#[cfg(feature = "http3")]
+fn h3_conn_limit() -> usize {
+    let v = H3_CONN_LIMIT.load(Ordering::Relaxed);
+    if v != 0 { return v; }
+    // 首次调用：自动检测并设置
+    let max = super::h3::service::detect_max_h3_handlers();
+    // CAS 防止竞争：只有第一个线程写入成功
+    match H3_CONN_LIMIT.compare_exchange(0, max, Ordering::SeqCst, Ordering::Relaxed) {
+        Ok(_) => {
+            tracing::info!("H3 最大并发连接数（自动检测）: {}", max);
+            max
+        }
+        Err(current) => current, // 其他线程先写入了
+    }
+}
+
+/// 尝试获取 H3 连接 permit，超过限制时异步等待
+#[cfg(feature = "http3")]
+async fn h3_conn_acquire() {
+    let notify = H3_CONN_NOTIFY.get_or_init(|| tokio::sync::Notify::new());
+    loop {
+        let limit = h3_conn_limit();
+        let active = H3_CONN_ACTIVE.load(Ordering::Relaxed);
+        if active < limit {
+            // CAS 尝试占槽
+            if H3_CONN_ACTIVE.compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return;
+            }
+            // CAS 失败，重试
+            continue;
+        }
+        // 满了，等待通知
+        notify.notified().await;
+    }
+}
+
+/// 释放 H3 连接 permit
+#[cfg(feature = "http3")]
+fn h3_conn_release() {
+    H3_CONN_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+    if let Some(n) = H3_CONN_NOTIFY.get() {
+        n.notify_one();
+    }
+}
+
 
 use futures_core::Stream;
 use sweety_io_compat::{
@@ -97,10 +176,14 @@ where
         match io {
             #[cfg(feature = "http3")]
             ServerStream::Udp(io, addr) => {
-                super::h3::Dispatcher::new(io, addr, Arc::clone(&self.service), self.date.get_rc())
+                // 连接级限流：原子计数器，支持热更新
+                h3_conn_acquire().await;
+                let result = super::h3::Dispatcher::new(io, addr, Arc::clone(&self.service), self.date.get_rc())
                     .run()
                     .await
-                    .map_err(From::from)
+                    .map_err(From::from);
+                h3_conn_release();
+                result
             }
             ServerStream::Tcp(io, _addr) => {
                 let mut io = TcpStream::from_std(io).expect("TODO: handle io error");

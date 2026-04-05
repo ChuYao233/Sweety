@@ -74,6 +74,9 @@ pub use self::{
 #[cfg(feature = "runtime")]
 pub use self::builder::HttpServiceBuilder;
 
+#[cfg(feature = "http3")]
+pub use self::service::set_h3_max_connections;
+
 // TODO: enable this conflict feature check.
 // temporary compile error for conflicted feature combination.
 // #[cfg(not(feature = "http1"))]

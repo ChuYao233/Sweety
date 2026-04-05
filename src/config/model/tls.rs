@@ -12,7 +12,7 @@ fn default_protocols() -> Vec<String> { vec!["h3".into(), "h2".into(), "http/1.1
 fn default_h3_max_concurrent_bidi_streams() -> u32 { 200 }
 fn default_h3_max_concurrent_uni_streams() -> u32 { 100 }
 fn default_h3_idle_timeout_ms() -> u64 { 30_000 }
-fn default_h3_keep_alive_interval_ms() -> u64 { 0 }
+fn default_h3_keep_alive_interval_ms() -> u64 { 10_000 }
 fn default_h3_receive_window() -> u64 { 8 * 1024 * 1024 }
 fn default_h3_stream_receive_window() -> u64 { 2 * 1024 * 1024 }
 fn default_h3_send_window() -> u64 { 8 * 1024 * 1024 }
@@ -79,6 +79,10 @@ pub struct TlsConfig {
 /// HTTP/3 QUIC 传输层调优配置
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Http3Config {
+    /// H3 最大并发连接数（0 = 自动检测，根据可用内存计算）
+    #[serde(default)]
+    pub max_handlers: usize,
+
     /// 单连接最大并发双向流数（默认 200）
     #[serde(default = "default_h3_max_concurrent_bidi_streams")]
     pub max_concurrent_bidi_streams: u32,
@@ -95,7 +99,7 @@ pub struct Http3Config {
     #[serde(default = "default_h3_keep_alive_interval_ms")]
     pub keep_alive_interval_ms: u64,
 
-    /// 连接级接收窗口（字节，默认 8MB）
+    /// 连接级接收窗口（字节，默认 2MB）
     #[serde(default = "default_h3_receive_window")]
     pub receive_window: u64,
 
@@ -127,6 +131,7 @@ pub struct Http3Config {
 impl Default for Http3Config {
     fn default() -> Self {
         Self {
+            max_handlers: 0,
             max_concurrent_bidi_streams: default_h3_max_concurrent_bidi_streams(),
             max_concurrent_uni_streams:  default_h3_max_concurrent_uni_streams(),
             idle_timeout_ms:             default_h3_idle_timeout_ms(),

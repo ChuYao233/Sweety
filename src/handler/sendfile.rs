@@ -20,6 +20,35 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures_util::Stream;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
+
+/// 进程级全局信号量：限制同时在途的 pread chunk 总数
+/// 防止高并发（1000流 × 1MB）时把所有数据堆进内存
+/// 初始化：avail × 70% / 256KB，范围 [64, 4096]
+static PREAD_SEM: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+
+fn pread_semaphore() -> &'static Arc<Semaphore> {
+    PREAD_SEM.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        let permits = {
+            let avail = std::fs::read_to_string("/proc/meminfo").ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("MemAvailable:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|v| v.parse::<u64>().ok())
+                })
+                .unwrap_or(512 * 1024); // kB
+            let safe = (avail as usize).saturating_mul(1024) * 70 / 100;
+            // 每个 permit 代表一个并发 stream（最差情况每 stream 读一整个文件进内存）
+            // 按 1MB/permit 计算，内存上限 = permits × 1MB，范围 [32, 2048]
+            (safe / (1024 * 1024)).clamp(32, 2048)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let permits = 256usize;
+        Arc::new(Semaphore::new(permits))
+    })
+}
 
 /// 大文件流式传输块大小（32 KiB）
 /// 与 H2 max_send_buffer_size(32KB) 对齐，一个 chunk 刚好填满一个流的发送缓冲
@@ -299,27 +328,37 @@ pub fn pread_stream(
 ) -> impl Stream<Item = IoResult<Bytes>> + Send + 'static {
     let chunk_size = if len <= 64 * 1024 {
         64 * 1024usize       // 小文件：一次读完
+    } else if len <= 4 * 1024 * 1024 {
+        256 * 1024           // 中等文件：256KB chunk
     } else {
-        STREAM_CHUNK         // 中/大文件：64KB chunk，与 H2 PIPELINE_WINDOW 对齐
+        256 * 1024           // 大文件：256KB chunk，减少 spawn_blocking 调度频率
     };
 
     async_stream::stream! {
+        // 进程级全局信号量：stream 启动时占槽，整个 stream 持有，结束时释放
+        // 限制同时运行的 pread_stream 总数，防止高并发 OOM
+        let _stream_permit = pread_semaphore().acquire().await.expect("semaphore closed");
+
         let mut off = offset;
         let mut remaining = len;
 
         while remaining > 0 {
             let to_read = (remaining as usize).min(chunk_size);
-            // H2 flow control 背压保证每次只读一小块（STREAM_CHUNK=32KB）
-            // page cache 命中 < 1μs，直接同步 pread，消除 spawn_blocking 的 context switch 开销
-            match pread_exact(&file, off, to_read) {
-                Ok(bytes) => {
+            let f = file.clone();
+            let result = tokio::task::spawn_blocking(move || pread_exact(&f, off, to_read)).await;
+            match result {
+                Ok(Ok(bytes)) => {
                     let n = bytes.len() as u64;
                     if n == 0 { break; }
                     off += n;
                     remaining = remaining.saturating_sub(n);
                     yield Ok(bytes);
                 }
-                Err(e) => { yield Err(e); return; }
+                Ok(Err(e)) => { yield Err(e); return; }
+                Err(e) => {
+                    yield Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                    return;
+                }
             }
         }
     }

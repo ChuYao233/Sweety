@@ -371,7 +371,7 @@ fn apply_transport_config(
     // BBR 拥塞控制 + 大初始窗口
     {
         let mut bbr = quinn::congestion::BbrConfig::default();
-        bbr.initial_window(1024 * 1024);
+        bbr.initial_window(128 * 1024);
         tc.congestion_controller_factory(std::sync::Arc::new(bbr));
     }
 

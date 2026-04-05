@@ -4,7 +4,7 @@ mod body;
 mod builder;
 mod error;
 mod proto;
-mod service;
+pub(crate) mod service;
 
 pub(crate) use self::proto::Dispatcher;
 

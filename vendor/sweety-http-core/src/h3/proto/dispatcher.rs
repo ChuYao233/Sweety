@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use sweety_io_compat::net::QuicStream;
 use sweety_service::Service;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use crate::{
     bytes::{Bytes, BytesMut},
@@ -163,29 +163,8 @@ where
     use crate::body::BodySize;
 
     let (req, stream) = resolver.resolve_request().await?;
-    let (mut tx, mut rx): (_, RequestStream<QuinnRecvStream, Bytes>) = stream.split();
-
-    // 关键修复：先异步 drain rx 到 EOF，确保 h3 流接收端状态被正确清理
-    // 对 GET/HEAD 请求，客户端已发 FIN，这里通常立即返回 None
-    // 对 POST 等请求，需要读完或 stop_sending 才能释放流状态
-    let body = if req.method() == crate::http::Method::GET
-        || req.method() == crate::http::Method::HEAD
-    {
-        // GET/HEAD 无 body：异步 drain，确保收到 FIN
-        loop {
-            match rx.recv_data().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => break,    // EOF - 正常
-                Err(_) => break,      // 错误也 break
-            }
-        }
-        drop(rx);
-        trace!(addr = %addr, method = %req.method(), "h3 rx 已异步 drain 到 EOF");
-        RequestBody::empty()
-    } else {
-        // POST/PUT 等有 body：走原有逻辑，由 service 读取
-        RequestBody::new(rx)
-    };
+    let (mut tx, rx): (_, RequestStream<QuinnRecvStream, Bytes>) = stream.split();
+    let body = RequestBody::new(rx);
 
     let http_req = req.map(|_| {
         RequestExt::from_parts(ReqB::from(body), Extension::new(addr, true))
@@ -235,9 +214,8 @@ where
                         if !buf.is_empty() {
                             tx.send_data(buf.freeze()).await?;
                         }
-                        if let Err(e) = tx.finish().await {
-                            trace!(addr = %addr, error = %e, "h3 tx.finish 错误（小 body 快路）");
-                        }
+                        // fire-and-forget：不等客户端 ACK FIN（~26ms delayed ACK），立即返回
+                        tokio::task::spawn_local(async move { let _ = tx.finish().await; });
                         return Ok(());
                     }
                     Poll::Pending => break,
@@ -255,41 +233,23 @@ where
                     tx.send_data(bytes).await?;
                 }
             }
-            if let Err(e) = tx.finish().await {
-                trace!(addr = %addr, error = %e, "h3 tx.finish 错误（流式尾部）");
-            }
+            // fire-and-forget：不等客户端 ACK FIN
+            tokio::task::spawn_local(async move { let _ = tx.finish().await; });
             return Ok(());
         }
     }
 
-    // H3 body 快路：先同步 poll，只有 Pending 时才 await，减少每 chunk 一次调度往返
+    // 大文件：每次 await 一个 chunk，发送后继续下一块
+    // spawn_blocking 的线程池调度间隙自然让 quinn 消费发送缓冲
+    // send_data await 本身在 quinn send_window 耗尽时会阻塞，形成真正背压
     let mut body = pin!(res_body);
-    let waker = futures_util::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    loop {
-        match body.as_mut().poll_next(&mut cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                if !bytes.is_empty() {
-                    tx.send_data(bytes).await?;
-                }
-            }
-            Poll::Ready(Some(Err(e))) => return Err(Error::Body(e)),
-            Poll::Ready(None) => break,
-            Poll::Pending => {
-                match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-                    Some(Ok(bytes)) => {
-                        if !bytes.is_empty() {
-                            tx.send_data(bytes).await?;
-                        }
-                    }
-                    Some(Err(e)) => return Err(Error::Body(e)),
-                    None => break,
-                }
-            }
+    while let Some(res) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+        let bytes = res.map_err(Error::Body)?;
+        if !bytes.is_empty() {
+            tx.send_data(bytes).await?;
         }
     }
-    if let Err(e) = tx.finish().await {
-        trace!(addr = %addr, error = %e, "h3 tx.finish 错误（大 body）");
-    }
+    // fire-and-forget：不等客户端 ACK FIN
+    tokio::task::spawn_local(async move { let _ = tx.finish().await; });
     Ok(())
 }

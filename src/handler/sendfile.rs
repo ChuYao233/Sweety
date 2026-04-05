@@ -309,22 +309,17 @@ pub fn pread_stream(
 
         while remaining > 0 {
             let to_read = (remaining as usize).min(chunk_size);
-            let f = file.clone();
-            // pread(2)：在指定 offset 读，共享 fd 无竞争，不修改文件指针
-            let result = tokio::task::spawn_blocking(move || pread_exact(&f, off, to_read)).await;
-            match result {
-                Ok(Ok(bytes)) => {
+            // H2 flow control 背压保证每次只读一小块（STREAM_CHUNK=32KB）
+            // page cache 命中 < 1μs，直接同步 pread，消除 spawn_blocking 的 context switch 开销
+            match pread_exact(&file, off, to_read) {
+                Ok(bytes) => {
                     let n = bytes.len() as u64;
                     if n == 0 { break; }
                     off += n;
                     remaining = remaining.saturating_sub(n);
                     yield Ok(bytes);
                 }
-                Ok(Err(e)) => { yield Err(e); return; }
-                Err(e) => {
-                    yield Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-                    return;
-                }
+                Err(e) => { yield Err(e); return; }
             }
         }
     }

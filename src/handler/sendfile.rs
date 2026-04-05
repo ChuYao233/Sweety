@@ -6,14 +6,14 @@
 //! |-----------------|-------------------------------|-----------------------------|
 //! | HTTP/1.1 Linux  | `sendfile(2)` 系统调用         | 内核直传，零用户态拷贝        |
 //! | HTTP/1.1 macOS  | `sendfile(2)` BSD 变体        | 同上                         |
-//! | HTTP/2 任意平台  | bounded channel (cap=2) 背压  | H2 framer 拉一块读一块       |
+//! | HTTP/2 任意平台  | pread(2) + H2 流控背压        | 按 send window 按需读取       |
 //! | Windows fallback| `tokio::fs` 分块读取           | 无 sendfile，安全分块        |
 //!
-//! ## 背压原理
-//! H2 不能用 sendfile（需封帧），改用容量为 2 的 channel：
-//! - 生产者 task 每次发一个 256KB chunk，发满就 await（等消费者取走）
-//! - 消费者（H2 framer）每次拉一个 chunk 才解除生产者阻塞
-//! - 内存占用恒定 ≤ 2 × 256KB = 512KB，无论文件多大
+//! ## 背压原理（Nginx 风格消费者驱动）
+//! H2 不能用 sendfile（需封帧 + TLS 加密），改为按 H2 send window 按需 pread：
+//! - 只有 send window 有容量时才从磁盘读取下一个 32KB chunk
+//! - 窗口满时暂停读取，等 WINDOW_UPDATE 后继续
+//! - 每流最大在途内存 = chunk(32KB) + h2 buffer(32KB) = 64KB
 
 use std::io::Result as IoResult;
 use std::sync::Arc;
@@ -21,9 +21,10 @@ use bytes::Bytes;
 use futures_util::Stream;
 use tokio::io::AsyncReadExt;
 
-/// 大文件流式传输块大小（256 KiB）
-/// h2 crate 内部按 max_frame_size(16KB) 自动拆帧，这里给大块减少调度开销
-pub const STREAM_CHUNK: usize = 256 * 1024;
+/// 大文件流式传输块大小（32 KiB）
+/// 与 H2 max_send_buffer_size(32KB) 对齐，一个 chunk 刚好填满一个流的发送缓冲
+/// 高并发保证：10000流 × 32KB = 320MB（vs 旧 256KB × 10000 = 2.5GB）
+pub const STREAM_CHUNK: usize = 32 * 1024;
 
 /// 小文件直接读取阈值（256 KiB）
 /// 小于此阈值时一次 read_to_end，避免 spawn + channel 开销
@@ -298,10 +299,8 @@ pub fn pread_stream(
 ) -> impl Stream<Item = IoResult<Bytes>> + Send + 'static {
     let chunk_size = if len <= 64 * 1024 {
         64 * 1024usize       // 小文件：一次读完
-    } else if len <= 4 * 1024 * 1024 {
-        256 * 1024           // 中等文件：256KB chunk
     } else {
-        STREAM_CHUNK         // 大文件：256KB chunk
+        STREAM_CHUNK         // 中/大文件：64KB chunk，与 H2 PIPELINE_WINDOW 对齐
     };
 
     async_stream::stream! {

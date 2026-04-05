@@ -68,8 +68,9 @@ where
                 .max_header_list_size(32768)
                 // RST 洪水防护（从配置读取）
                 .max_concurrent_reset_streams(self.config.h2_max_concurrent_reset_streams)
-                // 发送缓冲：1MB（平衡吞吐与内存，100 并发 × 1MB = 100MB 上限）
-                .max_send_buffer_size(1024 * 1024);
+                // 发送缓冲：32KB/流（Nginx 风格严格限制每流在途内存）
+                // 高并发保证：10000流 × 32KB = 320MB 上限，配合消费者驱动读取避免 OOM
+                .max_send_buffer_size(32 * 1024);
             b.handshake(PollIoAdapter(tls_stream))
         }
         .timeout(timer.as_mut())

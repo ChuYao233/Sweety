@@ -211,16 +211,16 @@ impl Future for H2PingPong<'_> {
     }
 }
 
-// 小/中等文件内联阈值：≤ 1MB（单次 collect 后整块发送，消除流控等待和多次调度开销）
-// 100KB~1MB 中等文件走流水线路径会被流控窗口多次截断，内联发送可消除这部分延迟
-// 超过 1MB 的大文件才走流水线 stream，避免一次性占用过多内存
-const SMALL_BODY_INLINE: usize = 1024 * 1024;
-// mmap stream 每块大小（与 sendfile.rs 的 STREAM_CHUNK 对齐）
-const CHUNK_SIZE: usize = 256 * 1024;
-// 大文件流水线窗口：允许提前读入并排队发送的最大字节数
-// 等于 max_send_buffer_size(1MB)，超过此量才等 poll_capacity 背压
-// 这样读文件和网络发送完全重叠，消除串行 RTT 等待
-const PIPELINE_WINDOW: usize = 1024 * 1024;
+// 小文件内联阈值：≤ 32KB 的小文件 collect 后整块发送，消除流控等待和多次调度开销
+// > 32KB 的中/大文件走消费者驱动的流式路径，按 H2 send window 容量按需读取
+// 避免高并发时一次性占用过多内存（10000流×1MB=10GB → 10000流×32KB=320MB）
+const SMALL_BODY_INLINE: usize = 32 * 1024;
+// pread stream 每块大小（与 sendfile.rs 的 STREAM_CHUNK 对齐）
+const CHUNK_SIZE: usize = 32 * 1024;
+// 大文件流水线窗口：每流 reserve_capacity 的量
+// 配合 max_send_buffer_size(32KB)，控制每流在 h2 内部缓冲上限
+// Nginx 风格：小窗口 + 消费者驱动，高并发时自动回压（10000流×16KB=160MB）
+const PIPELINE_WINDOW: usize = 16 * 1024;
 
 /// Linux TCP_CORK：攒满再发，等价 Nginx tcp_nopush
 /// 在 send_response 前 CORK，最后一帧 send_data 后 UNCORK
@@ -293,8 +293,8 @@ where
         return Ok(keep_alive);
     }
 
-    // 小/中等文件内联快路：collect 全部 body 后整块发送
-    // ≤ 1MB：单块 Bytes（pread_exact）同步 Ready，零 await；多 chunk stream（256KB×N）async collect
+    // 小文件内联快路：collect 全部 body 后整块发送
+    // ≤ 32KB：单块 Bytes（pread_exact）同步 Ready，零 await
     // 消除 H2 流控等待：整块 send_data 比分块流式减少多次 poll_capacity 调度往返
     if let BodySize::Sized(n) = body_size {
         if n as usize <= SMALL_BODY_INLINE {
@@ -399,12 +399,15 @@ where
         }
     }
 
-    // 大文件/流式：流水线发送
+    // 大文件/流式：消费者驱动发送（Nginx 风格）
     //
-    // 原理：reserve_capacity(PIPELINE_WINDOW) 预申请大窗口，h2 crate 持有发送队列
-    //   capacity() > 0 时直接发，无需 await（零延迟）
-    //   capacity() == 0 时 poll_capacity 等下一个 WINDOW_UPDATE，期间 tokio 调度其他任务
-    //   读文件（mmap 纯内存）与网络发送完全重叠，消除串行 RTT 等待
+    // 核心原则：只有 H2 send window 有容量时才从磁盘读取下一块数据
+    //   ① 先检查 capacity，无容量则等 WINDOW_UPDATE（不读磁盘，零内存增长）
+    //   ② 有容量后才 poll_next 读取一块（pread 从 kernel page cache，几乎立即 Ready）
+    //   ③ 按 capacity 分块发送，remaining 清空后再回 ①
+    //
+    // 内存保证：每流最多 1 个 chunk(32KB) + h2 buffer(32KB) = 64KB
+    //   10,000 并发流 × 64KB = 640MB（vs 旧方案 10GB+）
     set_tcp_cork(raw_fd, true);
     let mut stream = match respond.send_response(res, false) {
         Ok(s) => s,
@@ -412,11 +415,20 @@ where
     };
     let mut body = pin!(body);
 
-    // 预申请大窗口：让 h2 crate 立即开始追踪，尽早触发对端 WINDOW_UPDATE
+    // 预申请窗口：让 h2 crate 开始追踪流控需求
     stream.reserve_capacity(PIPELINE_WINDOW);
 
     loop {
-        // 读一块数据（文件：mmap 纯内存几乎立即 Ready；WebSocket：BiDirStream 异步轮诮）
+        // ① 先确保有发送容量，没有就等 WINDOW_UPDATE（不读磁盘）
+        if stream.capacity() == 0 {
+            set_tcp_cork(raw_fd, false);
+            match poll_fn(|cx| stream.poll_capacity(cx)).await {
+                Some(Ok(_)) => { set_tcp_cork(raw_fd, true); }
+                _ => return Ok(keep_alive),
+            }
+        }
+
+        // ② 有容量了，读一块数据（文件：pread kernel page cache 几乎立即 Ready）
         let chunk = match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
             None | Some(Err(_)) => break,
             // 空 chunk 跳过，不当做 EOF：WebSocket 空帧、流控屏障等场景下可能吸入 0 字节，
@@ -425,30 +437,23 @@ where
             Some(Ok(c)) => c,
         };
 
+        // ③ 按 capacity 分块发送
         let mut remaining = chunk;
 
         loop {
             let cap = stream.capacity();
             if cap > 0 {
-                // 有窗口：同步发送，不 await
                 let n = cmp::min(cap, remaining.len());
                 let to_send = remaining.split_to(n);
                 let _ = stream.send_data(to_send, false);
-                // 维持 reserve 请求，让 h2 crate 持续追踪窗口需求
                 stream.reserve_capacity(PIPELINE_WINDOW);
                 if remaining.is_empty() { break; }
             } else {
-                // 窗口耗尽：先 UNCORK flush 已攒的数据，再等 WINDOW_UPDATE
+                // 窗口耗尽：UNCORK flush 已攒数据，等 WINDOW_UPDATE
                 set_tcp_cork(raw_fd, false);
                 match poll_fn(|cx| stream.poll_capacity(cx)).await {
-                    Some(Ok(_)) => {
-                        // 有新窗口，重新 CORK 继续发送
-                        set_tcp_cork(raw_fd, true);
-                    }
-                    _ => {
-                        // 连接/流已关闭（RST 或 GOAWAY）
-                        return Ok(keep_alive);
-                    }
+                    Some(Ok(_)) => { set_tcp_cork(raw_fd, true); }
+                    _ => return Ok(keep_alive),
                 }
             }
         }

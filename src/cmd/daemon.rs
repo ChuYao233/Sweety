@@ -91,20 +91,42 @@ pub fn cmd_stop(pid_file: &PathBuf) {
 
     #[cfg(unix)]
     {
-        let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        if ret == 0 {
-            let _ = std::fs::remove_file(pid_file);
-            println!("Sweety stopped (PID {})", pid);
-        } else {
+        let pid_t = pid as libc::pid_t;
+        let ret = unsafe { libc::kill(pid_t, libc::SIGTERM) };
+        if ret != 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::ESRCH) {
                 eprintln!("[WARN] 进程 {} 不存在，可能已停止", pid);
                 let _ = std::fs::remove_file(pid_file);
+                return;
             } else {
                 eprintln!("[ERROR] 发送 SIGTERM 失败: {}", err);
                 std::process::exit(1);
             }
         }
+
+        // 等待进程退出（最多 5 秒）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // kill(pid, 0) 仅检测进程是否存在，不发送信号
+            let alive = unsafe { libc::kill(pid_t, 0) } == 0;
+            if !alive {
+                let _ = std::fs::remove_file(pid_file);
+                println!("Sweety stopped (PID {})", pid);
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+
+        // SIGTERM 超时，升级为 SIGKILL
+        eprintln!("[WARN] 进程 {} 未响应 SIGTERM（5s），发送 SIGKILL", pid);
+        unsafe { libc::kill(pid_t, libc::SIGKILL); }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = std::fs::remove_file(pid_file);
+        println!("Sweety killed (PID {})", pid);
     }
 
     #[cfg(windows)]

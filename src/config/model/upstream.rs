@@ -74,6 +74,11 @@ pub struct UpstreamConfig {
     #[serde(default)]
     pub retry_timeout: u64,
 
+    /// 重试条件（等价 Nginx proxy_next_upstream）
+    /// 默认 ["error", "timeout"]；设为 ["off"] 关闭所有重试
+    #[serde(default)]
+    pub proxy_next_upstream: Vec<crate::handler::reverse_proxy::retry::NextUpstreamCondition>,
+
     /// 断路器配置
     #[serde(default)]
     pub circuit_breaker: Option<CircuitBreakerConfig>,

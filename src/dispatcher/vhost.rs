@@ -66,6 +66,8 @@ pub struct SiteInfo {
     pub fastcgi: Option<FastCgiConfig>,
     /// 反代响应缓存配置
     pub proxy_cache: Option<crate::config::model::ProxyCacheConfig>,
+    /// 预编译的 real_ip 配置（启动时编译，运行时零分配）
+    pub real_ip: Option<crate::middleware::real_ip::CompiledRealIp>,
     /// 访问日志写入器（直接持有，避免每请求 HashMap 查找）
     pub access_logger: Option<Arc<AccessLogger>>,
     /// 反代响应缓存（直接持有，避免每请求 HashMap 查找）
@@ -135,6 +137,7 @@ impl SiteInfo {
             listen_tls: cfg.listen_tls.clone(),
             error_pages: cfg.error_pages.clone(),
             proxy_cache: cfg.proxy_cache.clone(),
+            real_ip: cfg.real_ip.as_ref().and_then(crate::middleware::real_ip::CompiledRealIp::compile),
             // 延迟注入：由 SweetyServer::run 在构建时填充
             access_logger: None,
             proxy_cache_arc: None,

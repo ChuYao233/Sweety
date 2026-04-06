@@ -15,6 +15,7 @@ pub mod lb;
 pub mod pool;
 pub mod proxy_protocol;
 pub mod response;
+pub mod retry;
 pub mod tls_client;
 pub mod upstream_h2;
 pub mod ws_proxy;
@@ -220,7 +221,10 @@ pub async fn handle_sweety(
         let cache_ref = proxy_cache.as_ref().map(|c| (c, &cache_key));
         // retry 循环：上游级别重试（节点故障），conn::forward_request 内部处理 idle 连接重试
         // body 流只能消耗一次，上游级别重试只在首次（body 尚未消费）时有效
-        let max_attempts = 1 + pool.retry as usize;
+        let flags = pool.next_upstream_flags;
+        let max_attempts = if flags.is_off() { 1 } else { 1 + pool.retry as usize };
+        // 非幂等方法（POST/PATCH）默认不重试，除非配置了 non_idempotent
+        let method_allows_retry = retry::is_idempotent(method) || flags.allows_non_idempotent();
         let mut last_err = String::new();
         let mut resp_opt: Option<sweety_web::http::WebResponse> = None;
         let mut body_for_retry = Some(request_body);
@@ -261,6 +265,15 @@ pub async fn handle_sweety(
 
             match result {
                 Ok(r) => {
+                    // 检查响应状态码是否匹配重试条件（如 http_502/503/504）
+                    let status = r.status().as_u16();
+                    if attempt + 1 < max_attempts && method_allows_retry && flags.matches_status(status) {
+                        node.record_failure();
+                        last_err = format!("HTTP {}", status);
+                        error!("反向代理上游返回 {} (attempt {}/{}) → {}，触发 next_upstream 重试",
+                            status, attempt + 1, max_attempts, node.addr.as_str());
+                        continue 'retry;
+                    }
                     node.record_success();
                     resp_opt = Some(r);
                     break 'retry;
@@ -268,7 +281,12 @@ pub async fn handle_sweety(
                 Err(e) => {
                     node.record_failure();
                     last_err = format!("{}", e);
-                    error!("反向代理转发失败 (attempt {}/{}) → {}: {}", attempt + 1, max_attempts, node.addr.as_str(), e);
+                    // 检查错误类型是否匹配重试条件
+                    let should_retry = method_allows_retry && retry::should_retry_error(&e, flags);
+                    error!("反向代理转发失败 (attempt {}/{}) → {}: {}{}",
+                        attempt + 1, max_attempts, node.addr.as_str(), e,
+                        if should_retry && attempt + 1 < max_attempts { "，将重试" } else { "" });
+                    if !should_retry { break 'retry; }
                 }
             }
         }
@@ -288,6 +306,15 @@ pub async fn handle_sweety(
             HeaderName::from_static("x-cache"),
             HeaderValue::from_static("MISS"),
         );
+    }
+
+    // proxy_hide_headers：移除上游响应中的指定头（等价 Nginx proxy_hide_header）
+    if !location.proxy_hide_headers.is_empty() {
+        for name in &location.proxy_hide_headers {
+            if let Ok(hdr) = sweety_web::http::header::HeaderName::from_bytes(name.as_bytes()) {
+                resp.headers_mut().remove(&hdr);
+            }
+        }
     }
 
     // apply_extra_headers：向客户端响应注入自定义头（等价 Nginx add_header）

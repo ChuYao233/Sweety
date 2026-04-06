@@ -154,6 +154,8 @@ pub struct UpstreamPool {
     pub retry: u32,
     /// 重试等待时间（秒）
     pub retry_timeout: u64,
+    /// 重试条件 bitflags（启动时编译，运行时零开销）
+    pub next_upstream_flags: super::retry::NextUpstreamFlags,
 }
 
 impl UpstreamPool {
@@ -173,6 +175,7 @@ impl UpstreamPool {
             write_timeout: cfg.write_timeout,
             retry: cfg.retry,
             retry_timeout: cfg.retry_timeout,
+            next_upstream_flags: super::retry::compile_flags(&cfg.proxy_next_upstream),
         }
     }
 
@@ -320,6 +323,7 @@ mod tests {
             write_timeout: 60,
             retry: 0,
             retry_timeout: 0,
+            next_upstream_flags: super::retry::NextUpstreamFlags::DEFAULT,
         }
     }
 

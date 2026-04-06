@@ -307,6 +307,22 @@ name  = "Access-Control-Allow-Origin"
 value = "*"
 ```
 
+### 隐藏上游响应头（proxy_hide_headers）
+
+等价 Nginx `proxy_hide_header`，从上游响应中移除指定头，防止敏感信息泄露。
+
+```toml
+[[sites.locations]]
+path     = "/"
+handler  = "reverse_proxy"
+upstream = "backend"
+
+# 隐藏上游暴露的技术栈信息
+proxy_hide_headers = ["X-Powered-By", "X-AspNet-Version", "Server"]
+```
+
+> `proxy_hide_headers` 在 `add_headers` 之前执行——先移除不需要的上游头，再注入自定义头。
+
 ### 支持的变量
 
 | 变量 | 说明 |
@@ -361,9 +377,35 @@ retry_timeout = 1    # 每次重试前等待 1 秒
 | `retry` | 0 | 失败重试次数（0 = 不重试） |
 | `retry_timeout` | 0 | 重试前等待秒数（0 = 立即重试） |
 
+### 重试条件（proxy_next_upstream）
+
+等价 Nginx `proxy_next_upstream`，细粒度控制哪些错误触发上游重试。默认只在 `error`（连接错误）和 `timeout`（超时）时重试。
+
+```toml
+[[sites.upstreams]]
+name                 = "backend"
+retry                = 2
+proxy_next_upstream  = ["error", "timeout", "http_502", "http_503"]
+```
+
+| 条件 | 说明 |
+|------|------|
+| `error` | 连接拒绝 / 重置 / TLS 握手失败 / IO 错误 |
+| `timeout` | 连接 / 读取 / 写入超时 |
+| `http_502` | 上游返回 502 Bad Gateway |
+| `http_503` | 上游返回 503 Service Unavailable |
+| `http_504` | 上游返回 504 Gateway Timeout |
+| `http_429` | 上游返回 429 Too Many Requests |
+| `non_idempotent` | 允许对 POST/PATCH 等非幂等方法重试（默认仅幂等方法重试） |
+| `invalid_header` | 上游响应头解析失败 |
+| `off` | 关闭所有重试（即使配置了 `retry > 0`） |
+
+> 默认（不配置时）等价 `["error", "timeout"]`，与 Nginx 默认行为一致。
+
 ### 重试限制
 
 - **请求体只能消耗一次**：如果请求体（POST/PUT）已经开始发送给上游，则无法重试。Sweety 仅在请求体未消费时重试。
+- **非幂等方法默认不重试**：POST/PATCH/DELETE 请求默认不触发重试，除非配置了 `non_idempotent`。
 - **GET / HEAD / OPTIONS** 等无 body 请求始终可重试。
 - 大文件上传（流式 body）一旦开始发送即不可重试。
 

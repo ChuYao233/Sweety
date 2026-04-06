@@ -307,6 +307,22 @@ name  = "Access-Control-Allow-Origin"
 value = "*"
 ```
 
+### Hide Upstream Response Headers (proxy_hide_headers)
+
+Equivalent to Nginx `proxy_hide_header`. Remove specified headers from upstream responses to prevent sensitive information leakage.
+
+```toml
+[[sites.locations]]
+path     = "/"
+handler  = "reverse_proxy"
+upstream = "backend"
+
+# Hide upstream tech stack information
+proxy_hide_headers = ["X-Powered-By", "X-AspNet-Version", "Server"]
+```
+
+> `proxy_hide_headers` executes before `add_headers` — first remove unwanted upstream headers, then inject custom headers.
+
 ### Supported Variables
 
 | Variable | Description |
@@ -361,9 +377,35 @@ retry_timeout = 1    # Wait 1 second before each retry
 | `retry` | 0 | Number of retries on failure (0 = no retry) |
 | `retry_timeout` | 0 | Seconds to wait before retrying (0 = immediate) |
 
+### Retry Conditions (proxy_next_upstream)
+
+Equivalent to Nginx `proxy_next_upstream`. Fine-grained control over which errors trigger upstream retries. By default, retries only on `error` (connection errors) and `timeout`.
+
+```toml
+[[sites.upstreams]]
+name                 = "backend"
+retry                = 2
+proxy_next_upstream  = ["error", "timeout", "http_502", "http_503"]
+```
+
+| Condition | Description |
+|-----------|-------------|
+| `error` | Connection refused / reset / TLS handshake failure / IO error |
+| `timeout` | Connect / read / write timeout |
+| `http_502` | Upstream returned 502 Bad Gateway |
+| `http_503` | Upstream returned 503 Service Unavailable |
+| `http_504` | Upstream returned 504 Gateway Timeout |
+| `http_429` | Upstream returned 429 Too Many Requests |
+| `non_idempotent` | Allow retries for POST/PATCH and other non-idempotent methods (default: idempotent only) |
+| `invalid_header` | Upstream response header parse failure |
+| `off` | Disable all retries (even if `retry > 0`) |
+
+> Default (when not configured) is equivalent to `["error", "timeout"]`, consistent with Nginx default behavior.
+
 ### Retry Limitations
 
 - **Request body can only be consumed once**: If the request body (POST/PUT) has already started sending to upstream, retries are impossible. Sweety only retries when the body has not been consumed.
+- **Non-idempotent methods are not retried by default**: POST/PATCH/DELETE requests do not trigger retries unless `non_idempotent` is configured.
 - **GET / HEAD / OPTIONS** and other body-less requests can always be retried.
 - Large file uploads (streaming body) cannot be retried once sending begins.
 

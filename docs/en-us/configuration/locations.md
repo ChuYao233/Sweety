@@ -162,6 +162,86 @@ name  = "Access-Control-Allow-Methods"
 value = "GET, POST, PUT, DELETE, OPTIONS"
 ```
 
+## IP Access Control (access_rules)
+
+Equivalent to Nginx `allow` / `deny` directives. Rules are matched in order against the client IP; the first match determines the result. Supports exact IP, CIDR ranges, and the `all` wildcard.
+
+### Syntax
+
+```toml
+[[sites.locations]]
+path    = "/admin"
+handler = "reverse_proxy"
+upstream = "backend"
+
+# Only allow internal network access to admin panel
+[[sites.locations.access_rules]]
+action = "allow"
+source = "10.0.0.0/8"
+
+[[sites.locations.access_rules]]
+action = "allow"
+source = "172.16.0.0/12"
+
+[[sites.locations.access_rules]]
+action = "allow"
+source = "192.168.0.0/16"
+
+[[sites.locations.access_rules]]
+action = "deny"
+source = "all"
+```
+
+### Rule Reference
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `action` | (required) | `allow` or `deny` |
+| `source` | (required) | IP address, CIDR range, or `all` (matches everything) |
+| `priority` | `0` | Priority (0-1024, lower value = higher priority) |
+
+- Rules are sorted by `priority` ascending then matched top-to-bottom, **first match wins**
+- Same-priority rules preserve their order in the config file
+- No rules or no match **defaults to allow** (consistent with Nginx)
+- Denied requests return **403 Forbidden**
+- Supports IPv4 and IPv6
+- Rules are pre-compiled to CIDR matchers at startup, zero allocation at runtime
+
+### Typical Usage
+
+```toml
+# Whitelist mode: allow specific IPs, deny the rest
+[[sites.locations.access_rules]]
+action = "allow"
+source = "1.2.3.4"
+
+[[sites.locations.access_rules]]
+action = "deny"
+source = "all"
+
+# Blacklist mode: deny specific IPs, allow the rest
+[[sites.locations.access_rules]]
+action = "deny"
+source = "5.6.7.8"
+
+[[sites.locations.access_rules]]
+action = "allow"
+source = "all"
+
+# Priority mode: deny all at priority 10, allow internal at priority 0 (matched first)
+[[sites.locations.access_rules]]
+action   = "deny"
+source   = "all"
+priority = 10
+
+[[sites.locations.access_rules]]
+action   = "allow"
+source   = "10.0.0.0/8"
+priority = 0           # Higher priority, internal IPs match this rule first
+```
+
+> When `real_ip` is configured on the site, access control uses the extracted real client IP, not the connection IP.
+
 ## Rewrite Rules
 
 `rewrite` rules perform regex matching and replacement on request paths, equivalent to Nginx's `rewrite` directive. Rules are evaluated in array order; after a match, the `flag` determines subsequent behavior.

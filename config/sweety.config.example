@@ -242,6 +242,13 @@ initial_rtt_ms = 333
 # Max ACK delay (ms, 25 = RFC 9000 default)
 max_ack_delay_ms = 25
 
+# ─── Real IP (extract real client IP behind CDN/LB) ─────────────────────────
+# Equivalent to Nginx: set_real_ip_from + real_ip_header + real_ip_recursive
+# [sites.real_ip]
+# set_real_ip_from = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+# real_ip_header   = "X-Forwarded-For"   # or "X-Real-IP"
+# recursive        = true                # skip all trusted IPs from right
+
 # ─── HSTS ────────────────────────────────────────────────────────────────────
 [sites.hsts]
 max_age = 31536000              # 1 year
@@ -302,6 +309,11 @@ write_timeout   = 60
 retry         = 2
 retry_timeout = 0               # seconds (0 = immediate)
 
+# Retry conditions (equivalent to Nginx proxy_next_upstream)
+# Available: error / timeout / http_502 / http_503 / http_504 / http_429 / non_idempotent / invalid_header / off
+# Default (empty): ["error", "timeout"]
+# proxy_next_upstream = ["error", "timeout", "http_502", "http_503"]
+
 # ─── Upstream Nodes ───────────────────────────────────────────────────────────
 [[sites.upstreams.nodes]]
 addr   = "127.0.0.1:8080"
@@ -357,6 +369,28 @@ value = "$host"
 # proxy_cookie_domain   = ".internal.example.com"
 # proxy_redirect_from   = "http://internal:8080/"
 # proxy_redirect_to     = "https://api.example.com/"
+
+# Hide upstream response headers (equivalent to Nginx proxy_hide_header)
+# proxy_hide_headers = ["X-Powered-By", "X-AspNet-Version"]
+
+# IP access control (equivalent to Nginx allow/deny)
+# Rules are sorted by priority (lower = higher priority), then first match wins.
+# Same-priority rules keep their config order. Default priority = 0.
+#
+# [[sites.locations.access_rules]]
+# action   = "allow"
+# source   = "10.0.0.0/8"
+# priority = 0              # default, highest priority
+#
+# [[sites.locations.access_rules]]
+# action   = "allow"
+# source   = "172.16.0.0/12"
+# priority = 0
+#
+# [[sites.locations.access_rules]]
+# action   = "deny"
+# source   = "all"
+# priority = 10             # lower priority, evaluated after allow rules
 
 # Proxy buffering (disable for SSE/streaming)
 # proxy_buffering = false

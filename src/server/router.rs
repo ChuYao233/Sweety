@@ -107,6 +107,17 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         }
     };
 
+    // real_ip：从受信代理请求头提取真实客户端 IP（等价 Nginx set_real_ip_from）
+    let conn_ip = ctx.req().body().socket_addr().ip();
+    let effective_client_ip: std::net::IpAddr = if let Some(ref rip) = site.real_ip {
+        let header_val = ctx.req().headers()
+            .get(rip.header_name())
+            .and_then(|v| v.to_str().ok());
+        rip.extract_real_ip(&conn_ip, header_val).unwrap_or(conn_ip)
+    } else {
+        conn_ip
+    };
+
     // force_https 重定向（启用 ACME 但尚无有效证书时跳过，避免阻塞首次申请）
     let acme_cert_ready = !site.acme || crate::server::tls::ACME_CERTS_READY.contains(&site.name);
     if site.force_https && !is_https && acme_cert_ready {
@@ -212,9 +223,19 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         None
     };
 
+    // IP 访问控制（等价 Nginx allow/deny，规则已在启动时预编译）
+    if !compiled_loc.access_rules.is_empty() {
+        if crate::middleware::access_control::check_access(&compiled_loc.access_rules, &effective_client_ip)
+            == crate::middleware::access_control::AccessAction::Deny
+        {
+            state.metrics.record_status(403);
+            return make_error_resp(StatusCode::FORBIDDEN);
+        }
+    }
+
     // auth_request 前置鉴权
     if let Some(ref auth_url) = location.auth_request {
-        let client_ip_for_auth = ctx.req().body().socket_addr().ip().to_string();
+        let client_ip_for_auth = effective_client_ip.to_string();
         match crate::handler::auth_request::check(
             auth_url,
             ctx.req().headers(),
@@ -240,7 +261,7 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
-        let client_ip_str2 = ctx.req().body().socket_addr().ip().to_string();
+        let client_ip_str2 = effective_client_ip.to_string();
         let preq = crate::handler::plugin::PluginRequest {
             method:    method_str,
             path:      effective_path,
@@ -297,7 +318,7 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
             crate::handler::grpc::handle_sweety(ctx, &site, &location).await
         }
         HandlerType::Plugin(ref plugin_name) => {
-            let handler_ip = ctx.req().body().socket_addr().ip().to_string();
+            let handler_ip = effective_client_ip.to_string();
             let hctx = crate::handler::plugin::HandlerContext {
                 method:        ctx.req().method().as_str(),
                 path:          effective_path,
@@ -396,7 +417,7 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
     if let Some(logger) = &site.access_logger {
         let duration_ms = req_start.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
         logger.send(AccessLogEntry {
-            client_ip: ctx.req().body().socket_addr().ip().to_string(),
+            client_ip: effective_client_ip.to_string(),
             method:    ctx.req().method().as_str().to_string(),
             uri:       request_uri.to_string(),
             http_version: match ctx.req().version() {

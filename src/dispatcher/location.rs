@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicUsize;
 use regex::Regex;
 
 use crate::config::model::LocationConfig;
+use crate::middleware::access_control::CompiledAccessRule;
 
 /// Location 类型（在构建时一次解析，请求时直接匹配不再扫描字符串）
 #[derive(Debug, Clone)]
@@ -36,6 +37,8 @@ pub struct CompiledLocation {
     pub conn_count: Arc<AtomicUsize>,
     /// per-location 并发连接上限（从 config.limit_conn 拷贝过来，错误时不再访问 config）
     pub limit_conn: usize,
+    /// 预编译的 IP 访问控制规则（启动时编译，运行时零分配）
+    pub access_rules: Vec<CompiledAccessRule>,
 }
 
 impl Clone for CompiledLocation {
@@ -46,6 +49,7 @@ impl Clone for CompiledLocation {
             regex: self.regex.clone(),
             conn_count: Arc::clone(&self.conn_count),
             limit_conn: self.limit_conn,
+            access_rules: self.access_rules.clone(),
         }
     }
 }
@@ -78,7 +82,8 @@ impl CompiledLocation {
             (LocationKind::Prefix, None)
         };
         let limit_conn = cfg.limit_conn;
-        Self { config: cfg, kind, regex, conn_count: Arc::new(AtomicUsize::new(0)), limit_conn }
+        let access_rules = crate::middleware::access_control::compile_rules(&cfg.access_rules);
+        Self { config: cfg, kind, regex, conn_count: Arc::new(AtomicUsize::new(0)), limit_conn, access_rules }
     }
 }
 

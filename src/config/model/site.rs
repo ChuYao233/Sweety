@@ -113,6 +113,10 @@ pub struct SiteConfig {
     #[serde(default = "default_true")]
     pub force_https: bool,
 
+    /// Real IP 配置（等价 Nginx set_real_ip_from + real_ip_header）
+    #[serde(default)]
+    pub real_ip: Option<crate::middleware::real_ip::RealIpConfig>,
+
     /// 是否在该站点的监听端口上启用 PROXY protocol 解析
     /// 启用后，Sweety 会从入站连接的第一个数据包解析 PROXY protocol v1/v2 头，
     /// 提取真实客户端 IP（适用于 CDN/LB → Sweety 场景）

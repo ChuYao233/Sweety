@@ -162,6 +162,86 @@ name  = "Access-Control-Allow-Methods"
 value = "GET, POST, PUT, DELETE, OPTIONS"
 ```
 
+## IP 访问控制（access_rules）
+
+等价 Nginx `allow` / `deny` 指令，按顺序匹配客户端 IP，首条命中即返回结果。支持精确 IP、CIDR 网段和 `all` 通配符。
+
+### 配置语法
+
+```toml
+[[sites.locations]]
+path    = "/admin"
+handler = "reverse_proxy"
+upstream = "backend"
+
+# 仅允许内网访问管理后台
+[[sites.locations.access_rules]]
+action = "allow"
+source = "10.0.0.0/8"
+
+[[sites.locations.access_rules]]
+action = "allow"
+source = "172.16.0.0/12"
+
+[[sites.locations.access_rules]]
+action = "allow"
+source = "192.168.0.0/16"
+
+[[sites.locations.access_rules]]
+action = "deny"
+source = "all"
+```
+
+### 规则说明
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `action` | （必填） | `allow`（允许）或 `deny`（拒绝） |
+| `source` | （必填） | IP 地址、CIDR 网段或 `all`（匹配所有） |
+| `priority` | `0` | 优先级（0-1024，数值越小优先级越高） |
+
+- 规则按 `priority` 升序排序后从上到下匹配，**首条命中即停止**
+- 同优先级规则保持配置文件中的顺序
+- 无规则或无命中时**默认允许**（与 Nginx 行为一致）
+- 被拒绝的请求返回 **403 Forbidden**
+- 支持 IPv4 和 IPv6
+- 规则在启动时预编译为 CIDR 匹配器，运行时零分配
+
+### 典型用法
+
+```toml
+# 白名单模式：只允许指定 IP，拒绝其余
+[[sites.locations.access_rules]]
+action = "allow"
+source = "1.2.3.4"
+
+[[sites.locations.access_rules]]
+action = "deny"
+source = "all"
+
+# 黑名单模式：拒绝指定 IP，允许其余
+[[sites.locations.access_rules]]
+action = "deny"
+source = "5.6.7.8"
+
+[[sites.locations.access_rules]]
+action = "allow"
+source = "all"
+
+# 优先级模式：deny all 优先级 10，allow 内网优先级 0（先匹配）
+[[sites.locations.access_rules]]
+action   = "deny"
+source   = "all"
+priority = 10
+
+[[sites.locations.access_rules]]
+action   = "allow"
+source   = "10.0.0.0/8"
+priority = 0           # 优先级更高，内网 IP 会先匹配到这条规则
+```
+
+> 若站点配置了 `real_ip`，访问控制使用的是提取后的真实客户端 IP，而非连接 IP。
+
 ## Rewrite / 伪静态
 
 `rewrite` 规则对请求路径进行正则匹配和替换，等价 Nginx 的 `rewrite` 指令。规则按数组顺序依次执行，匹配后根据 `flag` 决定后续行为。

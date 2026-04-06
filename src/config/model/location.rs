@@ -68,6 +68,14 @@ pub struct LocationConfig {
     #[serde(default)]
     pub add_headers: Vec<HeaderOverride>,
 
+    /// 隐藏上游响应头（等价 Nginx proxy_hide_header）
+    #[serde(default)]
+    pub proxy_hide_headers: Vec<String>,
+
+    /// IP 访问控制规则（等价 Nginx allow/deny，按顺序匹配）
+    #[serde(default)]
+    pub access_rules: Vec<crate::middleware::access_control::AccessRule>,
+
     /// 按扩展名正则设置缓存规则
     #[serde(default)]
     pub cache_rules: Vec<CacheRule>,
@@ -129,6 +137,8 @@ impl Default for LocationConfig {
             proxy_redirect_to: None,
             proxy_set_headers: vec![],
             add_headers: vec![],
+            proxy_hide_headers: vec![],
+            access_rules: vec![],
             cache_rules: vec![],
             return_url: None,
             return_body: None,

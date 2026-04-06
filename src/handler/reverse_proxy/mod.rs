@@ -183,6 +183,8 @@ pub async fn handle_sweety(
 
     // ── 转发请求 ───────────────────────────────────────────
     node.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // current_node 在重试时会切换，用 Arc clone 追踪当前节点（active_connections 配对管理）
+    let mut current_node = node.clone();
 
     // WS/WSS 请求走专用的零拷贝反代路径
     let mut resp = if is_ws {
@@ -236,15 +238,21 @@ pub async fn handle_sweety(
                 if pool.retry_timeout > 0 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(pool.retry_timeout)).await;
                 }
+                // 切换到新节点：修复原代码 pick() 结果直接丢弃的 bug
                 if let Some(new_node) = pool.pick(Some(&client_ip_str)) {
-                    tracing::debug!("反向代理第 {} 次重试，节点: {}", attempt, new_node.addr.as_str());
+                    tracing::debug!("反向代理第 {} 次重试，切换节点: {} → {}",
+                        attempt, current_node.addr.as_str(), new_node.addr.as_str());
+                    // 归还旧节点活跃计数，申请新节点活跃计数
+                    current_node.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    new_node.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    current_node = new_node;
                 }
             }
 
             let result = conn::forward_request(
                 &ctx.state().conn_pool,
-                &node.addr, method, path, upstream_host,
-                node.tls, &node.tls_sni, node.tls_insecure,
+                &current_node.addr, method, path, upstream_host,
+                current_node.tls, &current_node.tls_sni, current_node.tls_insecure,
                 &client_headers, client_ip_str_ref,
                 body_for_retry.take().unwrap_or_default(),
                 strip_cookie_secure, proxy_cookie_domain,
@@ -259,7 +267,7 @@ pub async fn handle_sweety(
                 pool.read_timeout,
                 pool.write_timeout,
                 location.proxy_buffering,
-                node.send_proxy_protocol,
+                current_node.send_proxy_protocol,
                 Some(*ctx.req().body().socket_addr()),
             ).await;
 
@@ -268,23 +276,23 @@ pub async fn handle_sweety(
                     // 检查响应状态码是否匹配重试条件（如 http_502/503/504）
                     let status = r.status().as_u16();
                     if attempt + 1 < max_attempts && method_allows_retry && flags.matches_status(status) {
-                        node.record_failure();
+                        current_node.record_failure();
                         last_err = format!("HTTP {}", status);
                         error!("反向代理上游返回 {} (attempt {}/{}) → {}，触发 next_upstream 重试",
-                            status, attempt + 1, max_attempts, node.addr.as_str());
+                            status, attempt + 1, max_attempts, current_node.addr.as_str());
                         continue 'retry;
                     }
-                    node.record_success();
+                    current_node.record_success();
                     resp_opt = Some(r);
                     break 'retry;
                 }
                 Err(e) => {
-                    node.record_failure();
+                    current_node.record_failure();
                     last_err = format!("{}", e);
                     // 检查错误类型是否匹配重试条件
                     let should_retry = method_allows_retry && retry::should_retry_error(&e, flags);
                     error!("反向代理转发失败 (attempt {}/{}) → {}: {}{}",
-                        attempt + 1, max_attempts, node.addr.as_str(), e,
+                        attempt + 1, max_attempts, current_node.addr.as_str(), e,
                         if should_retry && attempt + 1 < max_attempts { "，将重试" } else { "" });
                     if !should_retry { break 'retry; }
                 }
@@ -292,11 +300,11 @@ pub async fn handle_sweety(
         }
 
         resp_opt.unwrap_or_else(|| {
-            response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败: {}", node.addr.as_str(), last_err))
+            response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败: {}", current_node.addr.as_str(), last_err))
         })
     };
 
-    node.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    current_node.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
     // 缓存写入已在 conn::forward_request 里完成（在 body 完整时导入）
     // 这里只需设置 X-Cache: MISS 头

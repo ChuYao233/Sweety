@@ -438,6 +438,11 @@ async fn send_recv_pooled(
                 return Err((ProxyError::ConnReset { addr: String::new() }.into(), has_body));
             }
             Ok(Err(e)) => return Err((ProxyError::from_io("", e, IoContext::Read).into(), has_body)),
+            // EOF（read_line 返回 Ok(0)）：keepalive 连接被对端关闭，status_line 为空
+            // 视为 ConnReset，让 forward_request 的 attempt==1 重试新建连接
+            Ok(Ok(_)) if status_line.is_empty() => {
+                return Err((ProxyError::ConnReset { addr: String::new() }.into(), false));
+            }
             Ok(Ok(_)) => {}
         }
         let code = parse_status_code(&status_line);

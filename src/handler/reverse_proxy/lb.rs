@@ -107,9 +107,18 @@ impl NodeState {
     }
 
     /// 记录一次成功（含断路器）
+    ///
+    /// 同时恢复健康状态：上游恢复后首次成功请求自动标记节点为健康，
+    /// 避免节点被永久标记 unhealthy 导致持续 502。
     #[inline(always)]
     pub fn record_success(&self) {
-        self.fail_count.store(0, Ordering::Relaxed);
+        // 先检查再写入，避免无谓的 atomic store（热路径优化）
+        if self.fail_count.load(Ordering::Relaxed) > 0 {
+            self.fail_count.store(0, Ordering::Relaxed);
+        }
+        if !self.is_healthy() {
+            self.mark_healthy();
+        }
         if let Some(cb) = &self.circuit_breaker {
             cb.record_success();
         }
@@ -185,9 +194,17 @@ impl UpstreamPool {
         if avail_count == 0 {
             // 全部断路 → 降级：允许选健康节点（让断路器进入 HalfOpen 探测）
             let healthy_count = self.nodes.iter().filter(|n| n.is_healthy()).count();
-            if healthy_count == 0 { return None; }
-            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_count;
-            return self.nodes.iter().filter(|n| n.is_healthy()).nth(idx).cloned();
+            if healthy_count > 0 {
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_count;
+                return self.nodes.iter().filter(|n| n.is_healthy()).nth(idx).cloned();
+            }
+            // 全部 unhealthy → 降级：尝试任意节点（与 Nginx 行为一致）
+            // 上游可能已恢复，给请求一次到达上游的机会，成功后 record_success 会恢复健康状态
+            if !self.nodes.is_empty() {
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.nodes.len();
+                return Some(self.nodes[idx].clone());
+            }
+            return None;
         }
 
         match self.strategy {

@@ -98,14 +98,21 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 
 | Feature | Nginx Equivalent | Description |
 |---------|-----------------|-------------|
+| `proxy_next_upstream` | `proxy_next_upstream` | Fine-grained retry conditions: error / timeout / http_502 / http_503 / http_504 / non_idempotent |
+| `proxy_hide_header` | `proxy_hide_header` | Hide upstream response headers (X-Powered-By / Server, etc.), complements `add_headers` |
+| IP access control | `allow` / `deny` | IP / CIDR whitelist/blacklist, location-level |
+| `limit_req` | `limit_req` | Request rate limiting: token bucket + burst buffer + nodelay mode, anti-CC |
+| `real_ip` | `set_real_ip_from` | Extract real client IP from X-Forwarded-For behind multi-layer proxies |
+| `error_page` | `error_page` | Custom error pages (404 / 502 / 503, etc.), supports internal redirect |
+| Graceful shutdown | — | Wait for active connections to complete before exit, essential for rolling deployments |
 | TCP/UDP L4 proxy | `stream {}` module | Raw byte forwarding, no protocol parsing, supports database/SSH/any TCP proxy |
-| `mirror` request mirroring | `mirror` directive | Async traffic duplication to mirror upstream (canary testing / shadow traffic) |
-| Admin WebSocket real-time push | — | Admin API real-time event push (upstream status changes, cert renewal notifications, etc.) |
 
 ### Medium Priority
 
 | Feature | Nginx Equivalent | Description |
 |---------|-----------------|-------------|
+| `mirror` request mirroring | `mirror` directive | Async traffic duplication to mirror upstream (canary testing / shadow traffic) |
+| Rewrite filesystem conditions | `if (-f ...)` | `!-f` / `-d` conditions with actual filesystem checks (currently TODO placeholder) |
 | `if` conditional blocks | Nginx `if` | Config-level conditional logic (careful implementation, Nginx if semantics are complex) |
 | `geo` module | `geo` | IP range-based variable/routing |
 | Large file Range slice cache | `proxy_cache` + `slice` | Cache large files by Range slices, reduce origin fetches |
@@ -147,4 +154,4 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 
 ---
 
-*Last updated: 2026-04-05*
+*Last updated: 2026-04-06*

@@ -98,14 +98,21 @@
 
 | 功能 | 对应 Nginx | 说明 |
 |------|-----------|------|
+| `proxy_next_upstream` | `proxy_next_upstream` | 重试条件细粒度控制：error / timeout / http_502 / http_503 / http_504 / non_idempotent |
+| `proxy_hide_header` | `proxy_hide_header` | 隐藏上游响应头（X-Powered-By / Server 等），与 `add_headers` 互补 |
+| IP 访问控制 | `allow` / `deny` | IP / CIDR 白名单黑名单，location 级别生效 |
+| `limit_req` | `limit_req` | 请求速率限制：令牌桶 + burst 缓冲 + nodelay 模式，防 CC 攻击 |
+| `real_ip` | `set_real_ip_from` | 多层代理下从 X-Forwarded-For 提取真实客户端 IP |
+| `error_page` | `error_page` | 自定义错误页面（404 / 502 / 503 等），支持内部重定向 |
+| Graceful shutdown | — | 优雅关闭：等待活跃连接处理完毕再退出，滚动部署必备 |
 | TCP/UDP 四层代理 | `stream {}` 模块 | 纯字节转发，无协议解析，支持数据库/SSH/任意 TCP 代理 |
-| `mirror` 请求镜像 | `mirror` 指令 | 流量异步复制到镜像上游（灰度测试 / 影子流量） |
-| Admin WebSocket 实时推送 | — | 管理 API 实时事件推送（上游状态变化、证书续期通知等） |
 
 ### 中优先级
 
 | 功能 | 对应 Nginx | 说明 |
 |------|-----------|------|
+| `mirror` 请求镜像 | `mirror` 指令 | 流量异步复制到镜像上游（灰度测试 / 影子流量） |
+| Rewrite 文件系统条件 | `if (-f ...)` | `!-f` / `-d` 条件实际检查文件系统（当前为 TODO 占位） |
 | `if` 条件块 | Nginx `if` | 配置层条件逻辑（谨慎实现，Nginx if 语义复杂） |
 | `geo` 模块 | `geo` | 基于 IP 段的变量/路由分发 |
 | 大文件 Range 分片缓存 | `proxy_cache` + `slice` | 大文件按 Range 分片缓存，减少上游回源 |
@@ -147,4 +154,4 @@
 
 ---
 
-*最后更新：2026-04-05*
+*最后更新：2026-04-06*

@@ -22,9 +22,20 @@ fastcgi_connect_timeout = 5    # 连接超时（秒）
 fastcgi_read_timeout    = 60   # 读取超时（秒）
 
 # ─── 压缩 ───────────────────────────────────────────────────────
-gzip            = false  # 全局启用 gzip
+# 推荐：使用 [global.compress] 独立控制三种算法（见下方字段说明）
+# 旧字段（向后兼容）：
+gzip            = false  # 全局启用 gzip（旧字段，优先级低于 [global.compress]）
 gzip_min_length = 1      # 最小压缩大小（KB）
-gzip_comp_level = 5      # 压缩等级 1-9
+gzip_comp_level = 6      # 压缩等级 1-9
+
+[global.compress]
+gzip         = true    # 启用 gzip（默认 true）
+gzip_level   = 6       # 1-9，默认 6（均衡）
+brotli       = true    # 启用 brotli（默认 true）
+brotli_level = 4       # 0-11，默认 4（速度/压缩率均衡）
+zstd         = true    # 启用 zstd（默认 true）
+zstd_level   = 3       # 1-22，默认 3（极速）
+min_length   = 1       # 触发压缩的最小文件大小（KB）
 
 # ─── HTTP/2 ─────────────────────────────────────────────────────
 h2_max_concurrent_streams       = 128   # 单连接最大并发流
@@ -67,6 +78,44 @@ prometheus_path    = "/metrics"    # 挂载在 admin_listen 上
 | `client_max_body_size` | `50` MB | 超出返回 `413`，等价 `nginx client_max_body_size` |
 | `client_header_buffer_size` | `32` KB | 请求头缓冲区 |
 | `client_body_buffer_size` | `512` KB | 请求体缓冲区 |
+
+### 压缩
+
+Sweety **原生支持三种压缩算法**，默认全部开启，按客户端 `Accept-Encoding` 自动选择最优编码：
+
+| 算法 | 响应头值 | 特点 |
+|------|----------|------|
+| **Brotli** | `br` | 压缩率最高，现代浏览器首选 |
+| **zstd** | `zstd` | 解压速度极快，适合 API 场景 |
+| **gzip** | `gzip` | 兼容性最好，所有客户端通用 |
+
+**优先级**：`br > zstd > gzip`（客户端声明支持哪些，选最高优先级且有预压缩缓存的）
+
+所有算法均对 ≤ 1 MB 的可压缩文本文件做**预压缩内存缓存**，命中时零 CPU 开销直接返回。
+
+#### `[global.compress]` 字段
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `gzip` | `true` | 是否启用 gzip |
+| `gzip_level` | `6` | 压缩等级 1-9，6 为均衡点（Nginx 默认也是 6）|
+| `brotli` | `true` | 是否启用 brotli |
+| `brotli_level` | `4` | 压缩等级 0-11，4 兼顾速度与压缩率 |
+| `zstd` | `true` | 是否启用 zstd |
+| `zstd_level` | `3` | 压缩等级 1-22，3 为极速默认值 |
+| `min_length` | `1` | 触发压缩的最小文件大小（KB）|
+
+站点级可通过 `[sites.compress]` 覆盖任意字段，未设置的字段继承全局，详见 [站点配置 → 压缩](sites.md#压缩)。
+
+#### 旧字段（向后兼容）
+
+以下字段仍受支持，优先级低于 `[global.compress]`：
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `gzip` | `false` | 全局启用 gzip，等价 `nginx gzip on` |
+| `gzip_min_length` | `1` KB | 等价 `nginx gzip_min_length` |
+| `gzip_comp_level` | `6` | 压缩等级 1-9 |
 
 ### HTTP/2
 

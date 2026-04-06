@@ -1,9 +1,10 @@
 //! 静态文件处理器
 //!
-//! # 压缩策略
-//! - **Brotli**：当客户端支持 `br` 时优先使用，压缩率比 gzip 高 20-30%
-//! - **gzip**：客户端不支持 br 时的降级选项
-//! - **都仅对 ≤ 4MB 小文件做内存压缩，大文件直接流式传输**
+//! # 压缩策略（优先级 br > zstd > gzip）
+//! - **Brotli**：客户端支持 `br` 时优先，压缩率最高
+//! - **zstd**：客户端支持 `zstd` 时次选，解压速度最快
+//! - **gzip**：通用降级选项，兼容性最好
+//! - 三者均仅对 ≤ 1MB 小文件做内存预压缩，大文件直接流式传输
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -40,8 +41,27 @@ use cache::{
     fd_cache_get_or_open_arc, make_cache_key_from_path,
     GZIP_MAX_INLINE, FILE_CACHE_MAX_BYTES,
 };
-use compress::{stream_file_response_pread, gzip_compress, brotli_compress};
+use compress::{stream_file_response_pread, gzip_compress, brotli_compress, zstd_compress};
 use range::parse_range;
+
+/// 根据 Accept-Encoding 头和缓存条目选出最优编码
+/// 优先级：br > zstd > gzip > 原始
+#[inline]
+fn pick_encoding<'a>(
+    accept_enc: &str,
+    entry: &'a FileCacheEntry,
+) -> (&'a Bytes, Option<&'static str>) {
+    if accept_enc.contains("br") {
+        if let Some(b) = &entry.br { return (b, Some("br")); }
+    }
+    if accept_enc.contains("zstd") {
+        if let Some(b) = &entry.zst { return (b, Some("zstd")); }
+    }
+    if accept_enc.contains("gzip") {
+        if let Some(b) = &entry.gz { return (b, Some("gzip")); }
+    }
+    (&entry.data, None)
+}
 
 
 /// 处理静态文件请求（sweety-web WebContext 版本）
@@ -127,30 +147,16 @@ pub async fn handle_sweety(
                 // Range 解析失败（超出范围等），回落到下方常规路径
             }
 
-            // 选择最优编码：br > gz > 原始
+            // 选择最优编码（br > zstd > gzip > 原始），复用缓存中预压缩结果
             let accept_enc = req_headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or("");
-            let (body_bytes, enc) = if accept_enc.contains("br") {
-                if let Some(br) = &entry.br {
-                    (br.clone(), Some("br"))
-                } else {
-                    (entry.data.clone(), None)
-                }
-            } else if accept_enc.contains("gzip") {
-                if let Some(gz) = &entry.gz {
-                    (gz.clone(), Some("gzip"))
-                } else {
-                    (entry.data.clone(), None)
-                }
-            } else {
-                (entry.data.clone(), None)
-            };
+            let (body_bytes, enc) = pick_encoding(accept_enc, &entry);
+            let body_bytes = body_bytes.clone();
 
             // 直接插入预构建的头，零 from_str 分配
             let mut resp = WebResponse::new(ResponseBody::from(body_bytes.clone()));
             let h = resp.headers_mut();
             h.insert(CONTENT_TYPE,   entry.hv_content_type.clone());
             h.insert(ACCEPT_RANGES,  HeaderValue::from_static("bytes"));
-            // 压缩后 Content-Length 需重新计算
             if enc.is_some() {
                 if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_bytes.len())) {
                     h.insert(CONTENT_LENGTH, v);
@@ -228,12 +234,17 @@ pub async fn handle_sweety(
             let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let mime = mime_type_for(ext);
 
-            // 写入缓存时预计算 gzip/brotli 压缩（仅对可压缩 mime 类型）
-            // 后续请求缓存命中时直接返回预压缩内容，无需重复读文件和压缩
+            // 读取有效压缩配置：站点覆盖全局；旧字段（gzip/gzip_comp_level）作为 fallback
             let global = &ctx.state().cfg.load().global;
-            let gzip_enabled = site.gzip.unwrap_or(global.gzip);
-            let min_bytes = (global.gzip_min_length as u64) * 1024;
-            let gzip_level = site.gzip_comp_level.unwrap_or(global.gzip_comp_level);
+            let eff = site.compress.resolve(&global.compress);
+            // 旧字段 fallback：若 compress.gzip 未显式开启，检查旧字段
+            let gz_enabled  = eff.gzip  || site.gzip.unwrap_or(global.gzip);
+            let gz_level    = if site.compress.gzip_level.is_some() { eff.gzip_level }
+                              else { site.gzip_comp_level.unwrap_or(eff.gzip_level) };
+            let br_enabled  = eff.brotli;
+            let zst_enabled = eff.zstd;
+            let min_bytes   = (eff.min_length as u64) * 1024;
+
             let already_compressed = matches!(ext,
                 "gz" | "br" | "zst" | "zip" | "png" | "jpg" | "jpeg"
                 | "gif" | "webp" | "avif" | "mp4" | "webm" | "woff" | "woff2"
@@ -248,19 +259,21 @@ pub async fn handle_sweety(
                 || mime == "application/rss+xml"
                 || mime == "application/atom+xml"
                 || mime == "image/svg+xml";
-            let should_precompress = gzip_enabled && !already_compressed && compressible_mime
+            let can_compress = !already_compressed && compressible_mime
                 && file_size >= min_bytes && file_size <= GZIP_MAX_INLINE;
 
-            let (gz_bytes, br_bytes) = if should_precompress {
+            // 并发预压缩：仅启用的算法才运行，未启用的直接跳过
+            let gz_bytes = if gz_enabled && can_compress {
                 let raw = bytes.clone();
-                let raw2 = bytes.clone();
-                let gz = tokio::task::spawn_blocking(move || gzip_compress(&raw, gzip_level))
-                    .await.ok().and_then(|r| r.ok());
-                let br = brotli_compress(&raw2).await.ok();
-                (gz, br)
-            } else {
-                (None, None)
-            };
+                tokio::task::spawn_blocking(move || gzip_compress(&raw, gz_level))
+                    .await.ok().and_then(|r| r.ok())
+            } else { None };
+            let br_bytes = if br_enabled && can_compress {
+                brotli_compress(&bytes, eff.brotli_level).await.ok()
+            } else { None };
+            let zst_bytes = if zst_enabled && can_compress {
+                zstd_compress(&bytes, eff.zstd_level).await.ok()
+            } else { None };
 
             let modified_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(modified_secs);
             let http_date = httpdate::fmt_http_date(modified_time);
@@ -270,6 +283,7 @@ pub async fn handle_sweety(
                 data:               bytes.clone(),
                 gz:                 gz_bytes,
                 br:                 br_bytes,
+                zst:                zst_bytes,
                 modified_secs,
                 hv_content_type:    HeaderValue::from_str(mime).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
                 hv_content_length:  HeaderValue::from_str(cl_buf.format(file_size)).unwrap_or_else(|_| HeaderValue::from_static("0")),
@@ -277,17 +291,11 @@ pub async fn handle_sweety(
                 hv_last_modified:   HeaderValue::from_str(&http_date).unwrap_or_else(|_| HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")),
                 hv_cache_control:   HeaderValue::from_str(cc).unwrap_or_else(|_| HeaderValue::from_static("public, max-age=3600")),
             };
-            // 获取请求的 Accept-Encoding，选择最优编码后写缓存并直接返回
+            // 选择最优编码写缓存并直接返回
             let accept_enc2 = req_headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or("");
-            let (resp_bytes, enc_hv) = if accept_enc2.contains("br") {
-                if let Some(b) = &entry.br { (b.clone(), Some(HeaderValue::from_static("br"))) }
-                else { (entry.data.clone(), None) }
-            } else if accept_enc2.contains("gzip") {
-                if let Some(g) = &entry.gz { (g.clone(), Some(HeaderValue::from_static("gzip"))) }
-                else { (entry.data.clone(), None) }
-            } else {
-                (entry.data.clone(), None)
-            };
+            let (resp_bytes_ref, enc_name) = pick_encoding(accept_enc2, &entry);
+            let resp_bytes = resp_bytes_ref.clone();
+            let enc_hv = enc_name.map(|n| HeaderValue::from_static(n));
             let hv_ct = entry.hv_content_type.clone();
             let hv_cl = entry.hv_content_length.clone();
             let hv_et = entry.hv_etag.clone();

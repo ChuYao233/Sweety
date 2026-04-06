@@ -27,8 +27,20 @@ error_log         = "/var/log/sweety/error.log"
 force_https = true      # HTTP → HTTPS 301 跳转
 websocket   = true      # 启用 WebSocket 支持（默认 true）
 fallback    = false     # 作为 fallback 站点（Host 不匹配时兜底）
-gzip        = true      # 站点级 gzip 覆盖（不设则继承 global.gzip）
-gzip_comp_level = 6     # 压缩等级 1-9
+
+# ─── 站点级压缩覆盖（不设则继承 [global.compress]） ──────────────
+[sites.compress]
+gzip         = true    # 覆盖全局 gzip 开关
+gzip_level   = 6       # 覆盖 gzip 等级 1-9
+brotli       = true    # 覆盖 brotli 开关
+brotli_level = 4       # 覆盖 brotli 等级 0-11
+zstd         = true    # 覆盖 zstd 开关
+zstd_level   = 3       # 覆盖 zstd 等级 1-22
+min_length   = 1       # 覆盖最小压缩大小（KB）
+
+# 旧字段（向后兼容，优先级低于 [sites.compress]）：
+# gzip            = true
+# gzip_comp_level = 6
 
 # ─── 开箱即用语法糖（以下三行等价大量配置） ──────────────────────
 preset      = "wordpress"               # 内置预设
@@ -79,8 +91,22 @@ burst     = 200
 |------|--------|------|
 | `force_https` | `false` | HTTP 访问 301 跳转到 HTTPS |
 | `websocket` | `true` | 允许 WebSocket 升级 |
-| `gzip` | 继承全局 | 覆盖 `global.gzip` |
-| `gzip_comp_level` | 继承全局 | 覆盖 `global.gzip_comp_level` |
+
+### 压缩
+
+通过 `[sites.compress]` 可对当前站点覆盖全局压缩配置的任意字段，未设置的字段继承 `[global.compress]`。
+
+| 字段 | 继承自 | 说明 |
+|------|--------|------|
+| `gzip` | `global.compress.gzip` | 覆盖 gzip 开关 |
+| `gzip_level` | `global.compress.gzip_level` | 覆盖 gzip 等级 1-9 |
+| `brotli` | `global.compress.brotli` | 覆盖 brotli 开关 |
+| `brotli_level` | `global.compress.brotli_level` | 覆盖 brotli 等级 0-11 |
+| `zstd` | `global.compress.zstd` | 覆盖 zstd 开关 |
+| `zstd_level` | `global.compress.zstd_level` | 覆盖 zstd 等级 1-22 |
+| `min_length` | `global.compress.min_length` | 覆盖最小压缩大小（KB）|
+
+旧字段 `gzip` / `gzip_comp_level` 仍受支持，优先级低于 `[sites.compress]`。
 
 ### 语法糖字段（Caddy 风格）
 

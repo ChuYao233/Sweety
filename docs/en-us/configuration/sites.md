@@ -27,8 +27,20 @@ error_log         = "/var/log/sweety/error.log"
 force_https = true      # HTTP → HTTPS 301 redirect
 websocket   = true      # Enable WebSocket support (default true)
 fallback    = false     # Fallback site (catch-all when Host doesn't match)
-gzip        = true      # Site-level gzip override (inherits global.gzip if unset)
-gzip_comp_level = 6     # Compression level 1-9
+
+# ─── Site-level compression override (inherits [global.compress] if unset) ──
+[sites.compress]
+gzip         = true    # Override global gzip switch
+gzip_level   = 6       # Override gzip level 1-9
+brotli       = true    # Override brotli switch
+brotli_level = 4       # Override brotli level 0-11
+zstd         = true    # Override zstd switch
+zstd_level   = 3       # Override zstd level 1-22
+min_length   = 1       # Override min file size in KB to compress
+
+# Legacy fields (still supported, lower priority than [sites.compress]):
+# gzip            = true
+# gzip_comp_level = 6
 
 # ─── Sugar Syntax (each line replaces extensive config) ───────────
 preset      = "wordpress"               # Built-in preset
@@ -79,8 +91,22 @@ burst     = 200
 |-------|---------|-------------|
 | `force_https` | `false` | 301 redirect HTTP to HTTPS |
 | `websocket` | `true` | Allow WebSocket upgrade |
-| `gzip` | Inherits global | Overrides `global.gzip` |
-| `gzip_comp_level` | Inherits global | Overrides `global.gzip_comp_level` |
+
+### Compression
+
+Use `[sites.compress]` to override any field of the global compression config for this site. Unset fields inherit from `[global.compress]`.
+
+| Field | Inherits from | Description |
+|-------|--------------|-------------|
+| `gzip` | `global.compress.gzip` | Override gzip switch |
+| `gzip_level` | `global.compress.gzip_level` | Override gzip level 1-9 |
+| `brotli` | `global.compress.brotli` | Override brotli switch |
+| `brotli_level` | `global.compress.brotli_level` | Override brotli level 0-11 |
+| `zstd` | `global.compress.zstd` | Override zstd switch |
+| `zstd_level` | `global.compress.zstd_level` | Override zstd level 1-22 |
+| `min_length` | `global.compress.min_length` | Override min file size in KB to compress |
+
+Legacy fields `gzip` / `gzip_comp_level` are still supported with lower priority than `[sites.compress]`.
 
 ### Sugar Syntax Fields (Caddy-style)
 

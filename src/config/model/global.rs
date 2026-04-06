@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
+use super::compress::CompressConfig;
+
 fn default_worker_connections() -> usize { 51200 }
 fn default_keepalive_timeout() -> u64 { 60 }
 fn default_fastcgi_connect_timeout() -> u64 { 5 }
@@ -59,17 +61,22 @@ pub struct GlobalConfig {
     #[serde(default = "default_client_body_buffer_size")]
     pub client_body_buffer_size: usize,
 
-    /// 是否全局开启 gzip 压缩
+    /// 是否全局开启 gzip 压缩（旧字段，向后兼容；推荐使用 [global.compress]）
     #[serde(default)]
     pub gzip: bool,
 
-    /// gzip 压缩最小文件大小（KB），小于此值不压缩（等价 Nginx gzip_min_length）
+    /// gzip 压缩最小文件大小（KB）（旧字段，向后兼容）
     #[serde(default = "default_gzip_min_length")]
     pub gzip_min_length: usize,
 
-    /// gzip 压缩等级 1-9（等价 Nginx gzip_comp_level）
+    /// gzip 压缩等级 1-9（旧字段，向后兼容）
     #[serde(default = "default_gzip_comp_level")]
     pub gzip_comp_level: u32,
+
+    /// 压缩配置（gzip / brotli / zstd，支持独立开关和压缩等级）
+    /// 此字段优先于顶层旧字段 gzip / gzip_comp_level / gzip_min_length
+    #[serde(default)]
+    pub compress: CompressConfig,
 
     /// 管理 API 监听地址，空字符串表示禁用
     #[serde(default)]
@@ -132,6 +139,7 @@ impl Default for GlobalConfig {
             gzip: false,
             gzip_min_length: default_gzip_min_length(),
             gzip_comp_level: default_gzip_comp_level(),
+            compress: CompressConfig::default(),
             admin_listen: String::new(),
             admin_token: String::new(),
             error_log: None,

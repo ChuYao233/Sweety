@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::config::model::{FastCgiConfig, HstsConfig, SiteConfig, TlsConfig, UpstreamConfig};
+use crate::config::model::{FastCgiConfig, HstsConfig, SiteCompressConfig, SiteConfig, TlsConfig, UpstreamConfig};
 use crate::dispatcher::location::CompiledLocation;
 use crate::dispatcher::rewrite::CompiledRewrite;
 use crate::handler::reverse_proxy::lb::UpstreamPool;
@@ -30,10 +30,12 @@ pub struct SiteInfo {
     pub force_https: bool,
     /// 是否启用 WebSocket 升级
     pub websocket: bool,
-    /// 站点级 gzip 开关覆盖（None = 继承全局）
+    /// 站点级 gzip 开关覆盖（None = 继承全局，旧字段向后兼容）
     pub gzip: Option<bool>,
-    /// 站点级 gzip 压缩等级覆盖
+    /// 站点级 gzip 压缩等级覆盖（旧字段向后兼容）
     pub gzip_comp_level: Option<u32>,
+    /// 站点级压缩配置覆盖（gzip / brotli / zstd）
+    pub compress: SiteCompressConfig,
     /// 站点根目录
     pub root: Option<std::path::PathBuf>,
     /// canonicalize 后的根目录（启动时预计算，请求时直接用）
@@ -133,6 +135,7 @@ impl SiteInfo {
             websocket: cfg.websocket,
             gzip: cfg.gzip,
             gzip_comp_level: cfg.gzip_comp_level,
+            compress: cfg.compress.clone(),
             force_https: cfg.force_https && !cfg.listen_tls.is_empty(),
             listen_tls: cfg.listen_tls.clone(),
             error_pages: cfg.error_pages.clone(),

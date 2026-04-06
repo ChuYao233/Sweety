@@ -9,12 +9,14 @@
 
 use serde::{Deserialize, Serialize};
 
+mod compress;
 mod global;
 mod location;
 mod site;
 mod tls;
 mod upstream;
 
+pub use compress::{CompressConfig, SiteCompressConfig};
 pub use global::GlobalConfig;
 pub use location::{
     CacheRule, HandlerType, HeaderOverride, LocationConfig, ProxyCacheConfig,

@@ -45,15 +45,23 @@ client_header_buffer_size = 32
 # Equivalent to Nginx: client_body_buffer_size
 client_body_buffer_size = 512
 
-# Enable gzip compression globally
-gzip = false
-
-# Min file size (KB) to apply gzip (smaller files skip compression)
-# Equivalent to Nginx: gzip_min_length
+# ─── Compression ──────────────────────────────────────────────────
+# New unified compression block (recommended). Supports gzip / brotli / zstd
+# independently. Site-level [sites.compress] overrides these defaults.
+#
+# [global.compress]
+# gzip         = true    # Enable gzip        (default: true)
+# gzip_level   = 6       # 1-9  (default: 6, balanced)
+# brotli       = true    # Enable brotli / br (default: true)
+# brotli_level = 4       # 0-11 (default: 4, fast+good ratio)
+# zstd         = true    # Enable zstd        (default: true)
+# zstd_level   = 3       # 1-22 (default: 3, fastest)
+# min_length   = 1       # Min file size in KB to compress (default: 1)
+#
+# Legacy fields (still supported, applied when [global.compress] is absent):
+# Equivalent to Nginx: gzip / gzip_comp_level / gzip_min_length
+gzip            = false
 gzip_min_length = 1
-
-# Gzip compression level (1-9)
-# Equivalent to Nginx: gzip_comp_level
 gzip_comp_level = 5
 
 # ─── Admin API ─────────────────────────────────────────────────────
@@ -136,7 +144,17 @@ index = ["index.html", "index.htm"]
 # Set to false to allow plain HTTP access
 force_https = true
 
-# Site-level gzip override (omit to inherit from global)
+# Site-level compression override (omit fields to inherit from [global.compress])
+# [sites.compress]
+# gzip         = true    # Override global gzip switch for this site
+# gzip_level   = 6       # Override gzip level (1-9)
+# brotli       = true    # Override brotli switch
+# brotli_level = 4       # Override brotli level (0-11)
+# zstd         = true    # Override zstd switch
+# zstd_level   = 3       # Override zstd level (1-22)
+# min_length   = 1       # Override min file size in KB to compress
+#
+# Legacy per-site fields (still supported):
 # gzip = true
 # gzip_comp_level = 5
 

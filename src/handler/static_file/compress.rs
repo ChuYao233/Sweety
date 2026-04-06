@@ -1,4 +1,4 @@
-//! 压缩（gzip / brotli）及 pread 流式传输辅助
+//! 压缩（gzip / brotli / zstd）及 pread 流式传输辅助
 
 use std::path::Path;
 use std::sync::Arc;
@@ -50,14 +50,29 @@ pub(super) fn gzip_compress(data: &[u8], level: u32) -> std::io::Result<bytes::B
     Ok(bytes::Bytes::from(encoder.finish()?))
 }
 
-/// Brotli 压缩（async-compression，spawn_blocking 避免阻塞 tokio 线程）
-pub(super) async fn brotli_compress(data: &[u8]) -> std::io::Result<bytes::Bytes> {
+/// Brotli 压缩（async-compression，level 0-11，默认 4）
+pub(super) async fn brotli_compress(data: &[u8], level: u32) -> std::io::Result<bytes::Bytes> {
     use async_compression::tokio::bufread::BrotliEncoder;
+    use async_compression::Level;
     use tokio::io::AsyncReadExt;
 
     let cursor = std::io::Cursor::new(data.to_vec());
     let reader = tokio::io::BufReader::new(cursor);
-    let mut encoder = BrotliEncoder::new(reader);
+    let mut encoder = BrotliEncoder::with_quality(reader, Level::Precise(level.min(11) as i32));
+    let mut out = Vec::with_capacity(data.len() / 3);
+    encoder.read_to_end(&mut out).await?;
+    Ok(bytes::Bytes::from(out))
+}
+
+/// zstd 压缩（async-compression，level 1-22，默认 3）
+pub(super) async fn zstd_compress(data: &[u8], level: u32) -> std::io::Result<bytes::Bytes> {
+    use async_compression::tokio::bufread::ZstdEncoder;
+    use async_compression::Level;
+    use tokio::io::AsyncReadExt;
+
+    let cursor = std::io::Cursor::new(data.to_vec());
+    let reader = tokio::io::BufReader::new(cursor);
+    let mut encoder = ZstdEncoder::with_quality(reader, Level::Precise(level.clamp(1, 22) as i32));
     let mut out = Vec::with_capacity(data.len() / 3);
     encoder.read_to_end(&mut out).await?;
     Ok(bytes::Bytes::from(out))

@@ -22,9 +22,20 @@ fastcgi_connect_timeout = 5    # Connect timeout (seconds)
 fastcgi_read_timeout    = 60   # Read timeout (seconds)
 
 # ─── Compression ─────────────────────────────────────────────────
+# Recommended: use [global.compress] to control all three algorithms
+# Legacy fields (still supported, lower priority than [global.compress]):
 gzip            = false  # Enable gzip globally
 gzip_min_length = 1      # Min compression size (KB)
-gzip_comp_level = 5      # Compression level 1-9
+gzip_comp_level = 6      # Compression level 1-9
+
+[global.compress]
+gzip         = true    # Enable gzip (default: true)
+gzip_level   = 6       # 1-9, default 6 (balanced)
+brotli       = true    # Enable brotli (default: true)
+brotli_level = 4       # 0-11, default 4 (speed/ratio balanced)
+zstd         = true    # Enable zstd (default: true)
+zstd_level   = 3       # 1-22, default 3 (fastest)
+min_length   = 1       # Min file size in KB to compress
 
 # ─── HTTP/2 ──────────────────────────────────────────────────────
 h2_max_concurrent_streams       = 128   # Max concurrent streams per connection
@@ -67,6 +78,44 @@ prometheus_path    = "/metrics"    # Mounted on admin_listen
 | `client_max_body_size` | `50` MB | Returns `413` when exceeded, equivalent to `nginx client_max_body_size` |
 | `client_header_buffer_size` | `32` KB | Request header buffer |
 | `client_body_buffer_size` | `512` KB | Request body buffer |
+
+### Compression
+
+Sweety **natively supports three compression algorithms**, all enabled by default. The best encoding is selected automatically based on the client's `Accept-Encoding` header:
+
+| Algorithm | Header value | Characteristics |
+|-----------|-------------|------------------|
+| **Brotli** | `br` | Highest compression ratio, preferred by modern browsers |
+| **zstd** | `zstd` | Fastest decompression, ideal for API responses |
+| **gzip** | `gzip` | Best compatibility, supported by all clients |
+
+**Priority**: `br > zstd > gzip` — the highest-priority algorithm the client declares support for, with a pre-compressed cache entry available, is chosen.
+
+All algorithms maintain a **pre-compressed in-memory cache** for compressible text files ≤ 1 MB. Cache hits return instantly with zero CPU overhead.
+
+#### `[global.compress]` fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `gzip` | `true` | Enable gzip |
+| `gzip_level` | `6` | Level 1-9, 6 is the balanced default (same as Nginx) |
+| `brotli` | `true` | Enable brotli |
+| `brotli_level` | `4` | Level 0-11, 4 balances speed and compression ratio |
+| `zstd` | `true` | Enable zstd |
+| `zstd_level` | `3` | Level 1-22, 3 is the fastest default |
+| `min_length` | `1` | Min file size in KB to trigger compression |
+
+Per-site overrides are available via `[sites.compress]` — unset fields inherit from global. See [Sites → Compression](sites.md#compression).
+
+#### Legacy fields (backward compatible)
+
+The following fields are still supported with lower priority than `[global.compress]`:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `gzip` | `false` | Enable gzip globally, equivalent to `nginx gzip on` |
+| `gzip_min_length` | `1` KB | Equivalent to `nginx gzip_min_length` |
+| `gzip_comp_level` | `6` | Compression level 1-9 |
 
 ### HTTP/2
 

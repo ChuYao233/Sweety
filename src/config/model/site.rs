@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
+    compress::SiteCompressConfig,
     FastCgiConfig, LocationConfig, ProxyCacheConfig,
     RateLimitConfig, RewriteRule, TlsConfig, UpstreamConfig,
 };
@@ -97,13 +98,17 @@ pub struct SiteConfig {
     #[serde(default)]
     pub fallback: bool,
 
-    /// 站点级 gzip 覆盖（不设则继承全局 global.gzip）
+    /// 站点级 gzip 覆盖（旧字段，向后兼容；推荐使用 [sites.compress]）
     #[serde(default)]
     pub gzip: Option<bool>,
 
-    /// 站点级 gzip 压缩等级覆盖
+    /// 站点级 gzip 压缩等级覆盖（旧字段，向后兼容）
     #[serde(default)]
     pub gzip_comp_level: Option<u32>,
+
+    /// 站点级压缩配置覆盖（gzip / brotli / zstd，优先于旧字段 gzip/gzip_comp_level）
+    #[serde(default)]
+    pub compress: SiteCompressConfig,
 
     /// 是否启用 WebSocket 支持
     #[serde(default = "default_true")]

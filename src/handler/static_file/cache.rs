@@ -28,6 +28,7 @@ pub(super) struct FileCacheEntry {
     pub(super) data:          Bytes,
     pub(super) gz:            Option<Bytes>,
     pub(super) br:            Option<Bytes>,
+    pub(super) zst:           Option<Bytes>,
     pub(super) modified_secs: u64,
     pub(super) hv_content_type:   HeaderValue,
     pub(super) hv_content_length: HeaderValue,
@@ -160,6 +161,7 @@ pub(super) fn cache_insert(key: Arc<str>, entry: FileCacheEntry) {
         e.data.len()
             + e.gz.as_ref().map(|b| b.len()).unwrap_or(0)
             + e.br.as_ref().map(|b| b.len()).unwrap_or(0)
+            + e.zst.as_ref().map(|b| b.len()).unwrap_or(0)
     }).sum();
     if total + entry.data.len() > FILE_CACHE_TOTAL_BYTES || cache.len() >= FILE_CACHE_MAX_ENTRIES {
         let to_remove: Vec<_> = cache.iter()

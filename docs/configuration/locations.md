@@ -161,3 +161,84 @@ value = "*"
 name  = "Access-Control-Allow-Methods"
 value = "GET, POST, PUT, DELETE, OPTIONS"
 ```
+
+## Rewrite / 伪静态
+
+`rewrite` 规则对请求路径进行正则匹配和替换，等价 Nginx 的 `rewrite` 指令。规则按数组顺序依次执行，匹配后根据 `flag` 决定后续行为。
+
+### 配置语法
+
+```toml
+[[sites.locations]]
+path = "/"
+handler = "reverse_proxy"
+upstream = "backend"
+
+[[sites.locations.rewrite]]
+pattern   = "^/old/(.*)$"     # 正则模式（支持捕获组）
+target    = "/new/$1"          # 替换目标（$1..$9 引用捕获组）
+flag      = "last"             # 行为标志（默认 last）
+condition = "!-f"              # 可选触发条件
+```
+
+### 捕获组替换
+
+| 占位符 | 说明 |
+|--------|------|
+| `$0` | 完整匹配 |
+| `$1` .. `$9` | 第 1 到第 9 个捕获组 |
+
+### 行为标志（flag）
+
+| 标志 | 说明 |
+|------|------|
+| `last` | 重写后停止后续 rewrite 规则，重新匹配 location（默认） |
+| `break` | 重写后停止后续 rewrite 规则，不重新匹配 |
+| `redirect` | 返回 302 临时重定向 |
+| `permanent` | 返回 301 永久重定向 |
+
+### 触发条件（condition）
+
+| 条件 | 说明 |
+|------|------|
+| `!-f` | 文件不存在时触发 |
+| `!-d` | 目录不存在时触发 |
+| `-f` | 文件存在时触发 |
+| `-d` | 目录存在时触发 |
+
+### 示例
+
+#### WordPress 伪静态
+
+```toml
+[[sites.locations.rewrite]]
+pattern   = "^/(.+)$"
+target    = "/index.php?$1"
+flag      = "last"
+condition = "!-f"
+```
+
+#### 旧路径 301 永久重定向
+
+```toml
+[[sites.locations.rewrite]]
+pattern = "^/blog/(.*)$"
+target  = "/articles/$1"
+flag    = "permanent"
+```
+
+#### 多规则链式处理
+
+```toml
+# 规则 1：去掉 .html 后缀
+[[sites.locations.rewrite]]
+pattern = "^(/.*)\\.html$"
+target  = "$1"
+flag    = "last"
+
+# 规则 2：API 版本路由
+[[sites.locations.rewrite]]
+pattern = "^/api/v1/(.*)$"
+target  = "/api/current/$1"
+flag    = "break"
+```

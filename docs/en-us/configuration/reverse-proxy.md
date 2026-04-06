@@ -261,6 +261,131 @@ upstream        = "backend"
 proxy_buffering = false   # Disable buffering for real-time push
 ```
 
+## Header Rewriting
+
+Sweety supports two dimensions of header manipulation: **request header rewriting** (sent to upstream) and **response header injection** (returned to client).
+
+### Request Header Rewriting (proxy_set_headers)
+
+Equivalent to Nginx `proxy_set_header`. Override or add headers when forwarding requests to upstream. Supports variable substitution.
+
+```toml
+[[sites.locations.proxy_set_headers]]
+name  = "X-Real-IP"
+value = "$remote_addr"
+
+[[sites.locations.proxy_set_headers]]
+name  = "X-Forwarded-For"
+value = "$remote_addr"
+
+[[sites.locations.proxy_set_headers]]
+name  = "X-Forwarded-Proto"
+value = "$scheme"
+
+[[sites.locations.proxy_set_headers]]
+name  = "Host"
+value = "$host"
+```
+
+> Sweety automatically injects `X-Real-IP`, `X-Forwarded-For`, and `X-Forwarded-Proto` by default. You only need to configure these when overriding defaults or adding custom headers.
+
+### Response Header Injection (add_headers)
+
+Equivalent to Nginx `add_header`. Inject custom headers into client responses. Also supports variable substitution.
+
+```toml
+[[sites.locations.add_headers]]
+name  = "X-Frame-Options"
+value = "DENY"
+
+[[sites.locations.add_headers]]
+name  = "X-Content-Type-Options"
+value = "nosniff"
+
+[[sites.locations.add_headers]]
+name  = "Access-Control-Allow-Origin"
+value = "*"
+```
+
+### Supported Variables
+
+| Variable | Description |
+|----------|-------------|
+| `$remote_addr` | Client IP |
+| `$host` | Request Host header |
+| `$scheme` | Request protocol (http / https) |
+| `$request_uri` | Full request path (including query string) |
+
+## Timeout Configuration
+
+Sweety splits upstream timeouts into three independent phases, each independently configurable:
+
+| Setting | Default | Nginx Equivalent | Description |
+|---------|---------|-----------------|-------------|
+| `connect_timeout` | 10s | `proxy_connect_timeout` | Timeout for establishing TCP connection to upstream |
+| `read_timeout` | 60s | `proxy_read_timeout` | Timeout for receiving upstream response (headers + body) |
+| `write_timeout` | 60s | `proxy_send_timeout` | Timeout for sending request body to upstream |
+
+```toml
+[[sites.upstreams]]
+name            = "backend"
+connect_timeout = 5     # Reduce for internal services
+read_timeout    = 120   # Increase for slow query endpoints
+write_timeout   = 30    # Adjust for file uploads
+```
+
+### Recommended Settings by Scenario
+
+- **Internal microservices**: `connect_timeout = 3`, `read_timeout = 30`
+- **File upload endpoints**: `write_timeout = 300` (large file uploads)
+- **SSE / long-lived connections**: `read_timeout = 3600`, `proxy_buffering = false`
+- **Slow APIs**: `read_timeout = 120`
+
+## Retry Control
+
+When upstream requests fail, Sweety can automatically retry. Retries operate at two levels:
+
+### Upstream-level Retries
+
+Configure `retry` and `retry_timeout` in the upstream block:
+
+```toml
+[[sites.upstreams]]
+name          = "backend"
+retry         = 2    # Retry up to 2 times (3 total attempts)
+retry_timeout = 1    # Wait 1 second before each retry
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `retry` | 0 | Number of retries on failure (0 = no retry) |
+| `retry_timeout` | 0 | Seconds to wait before retrying (0 = immediate) |
+
+### Retry Limitations
+
+- **Request body can only be consumed once**: If the request body (POST/PUT) has already started sending to upstream, retries are impossible. Sweety only retries when the body has not been consumed.
+- **GET / HEAD / OPTIONS** and other body-less requests can always be retried.
+- Large file uploads (streaming body) cannot be retried once sending begins.
+
+### Connection-level Retries
+
+Even with `retry = 0`, Sweety automatically retries once on **idle connection reuse failure**. Keep-alive connections may be silently closed by upstream; when the initial header send fails, Sweety transparently establishes a new connection and retries.
+
+### Combined with Circuit Breaker
+
+When a node's consecutive failures reach the circuit breaker threshold, the node is marked unavailable. Retries automatically skip that node and select other healthy nodes:
+
+```toml
+[[sites.upstreams]]
+name  = "backend"
+retry = 2
+
+[sites.upstreams.circuit_breaker]
+max_failures = 5
+window_secs  = 60
+fail_timeout = 30
+```
+
 ## Proxy Cache (proxy_cache)
 
 ```toml

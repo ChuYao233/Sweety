@@ -261,6 +261,131 @@ upstream        = "backend"
 proxy_buffering = false   # 关闭缓冲，确保实时推送
 ```
 
+## Header 改写
+
+Sweety 支持两种维度的 Header 改写：**请求头改写**（发送给上游）和**响应头注入**（返回给客户端）。
+
+### 请求头改写（proxy_set_headers）
+
+等价 Nginx `proxy_set_header`，在转发请求时覆盖或添加指定头。支持变量替换。
+
+```toml
+[[sites.locations.proxy_set_headers]]
+name  = "X-Real-IP"
+value = "$remote_addr"
+
+[[sites.locations.proxy_set_headers]]
+name  = "X-Forwarded-For"
+value = "$remote_addr"
+
+[[sites.locations.proxy_set_headers]]
+name  = "X-Forwarded-Proto"
+value = "$scheme"
+
+[[sites.locations.proxy_set_headers]]
+name  = "Host"
+value = "$host"
+```
+
+> Sweety 默认自动注入 `X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Proto`，无需手动配置。仅当需要覆盖默认行为或添加自定义头时才需要配置。
+
+### 响应头注入（add_headers）
+
+等价 Nginx `add_header`，向客户端响应中插入自定义头。同样支持变量替换。
+
+```toml
+[[sites.locations.add_headers]]
+name  = "X-Frame-Options"
+value = "DENY"
+
+[[sites.locations.add_headers]]
+name  = "X-Content-Type-Options"
+value = "nosniff"
+
+[[sites.locations.add_headers]]
+name  = "Access-Control-Allow-Origin"
+value = "*"
+```
+
+### 支持的变量
+
+| 变量 | 说明 |
+|------|------|
+| `$remote_addr` | 客户端 IP |
+| `$host` | 请求 Host 头 |
+| `$scheme` | 请求协议（http / https） |
+| `$request_uri` | 完整请求路径（含查询字符串） |
+
+## 超时细分
+
+Sweety 将上游超时拆分为三个独立阶段，每个阶段可独立配置：
+
+| 配置项 | 默认值 | 对应 Nginx | 说明 |
+|--------|--------|-----------|------|
+| `connect_timeout` | 10s | `proxy_connect_timeout` | 与上游建立 TCP 连接的超时 |
+| `read_timeout` | 60s | `proxy_read_timeout` | 等待上游响应的超时（包括响应头 + 响应体） |
+| `write_timeout` | 60s | `proxy_send_timeout` | 向上游发送请求体的超时 |
+
+```toml
+[[sites.upstreams]]
+name            = "backend"
+connect_timeout = 5     # 内网服务可缩短
+read_timeout    = 120   # 慢查询接口可放宽
+write_timeout   = 30    # 文件上传按需调整
+```
+
+### 场景建议
+
+- **内网微服务**：`connect_timeout = 3`，`read_timeout = 30`
+- **文件上传接口**：`write_timeout = 300`（大文件上传）
+- **SSE / 长连接**：`read_timeout = 3600`，`proxy_buffering = false`
+- **慢速 API**：`read_timeout = 120`
+
+## 重试控制
+
+当上游请求失败时，Sweety 可自动重试。重试分为两个层级：
+
+### 上游级别重试
+
+在 upstream 配置中设置 `retry` 和 `retry_timeout`：
+
+```toml
+[[sites.upstreams]]
+name          = "backend"
+retry         = 2    # 最多重试 2 次（总共 3 次尝试）
+retry_timeout = 1    # 每次重试前等待 1 秒
+```
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `retry` | 0 | 失败重试次数（0 = 不重试） |
+| `retry_timeout` | 0 | 重试前等待秒数（0 = 立即重试） |
+
+### 重试限制
+
+- **请求体只能消耗一次**：如果请求体（POST/PUT）已经开始发送给上游，则无法重试。Sweety 仅在请求体未消费时重试。
+- **GET / HEAD / OPTIONS** 等无 body 请求始终可重试。
+- 大文件上传（流式 body）一旦开始发送即不可重试。
+
+### 连接级别重试
+
+即使 `retry = 0`，Sweety 也会对 **空闲连接复用失败** 自动重试一次。这是因为 keep-alive 连接可能被上游静默关闭，首次发送请求头失败后会自动建立新连接重试，对用户透明。
+
+### 与断路器配合
+
+当节点连续失败达到断路器阈值时，该节点会被标记为不可用，重试会自动跳过该节点选择其他健康节点：
+
+```toml
+[[sites.upstreams]]
+name  = "backend"
+retry = 2
+
+[sites.upstreams.circuit_breaker]
+max_failures = 5
+window_secs  = 60
+fail_timeout = 30
+```
+
 ## 反代缓存（proxy_cache）
 
 ```toml

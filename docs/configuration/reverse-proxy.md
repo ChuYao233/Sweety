@@ -439,3 +439,63 @@ cacheable_methods  = ["GET", "HEAD"]
 bypass_headers     = ["Authorization", "Cookie"]
 ignore_headers     = []
 ```
+
+## 压缩
+
+Sweety 对反向代理响应内置支持 br / zstd / gzip 三种压缩，遵循与静态文件相同的全局配置 + 站点配置继承规则。
+
+### 工作原理
+
+```
+Sweety 请求 → 上游
+  Accept-Encoding: br, zstd, gzip 透传给上游（不修改）
+
+上游响应
+  有 Content-Encoding  → 直接透传（不重复压缩）
+  无 Content-Encoding  → Sweety 流式压缩后返回客户端
+```
+
+Sweety 不缓冲全量 body，直接包装为压缩 stream——对大响应也不增加内存占用。
+
+### 压缩条件（全部满足才压缩）
+
+| # | 条件 | 不满足时 |
+|---|------|----------|
+| 1 | 站点有至少一种压缩算法开启 | 直接透传，零开销 |
+| 2 | 上游响应无 `Content-Encoding` | 直接透传（上游已压缩）|
+| 3 | `Content-Type` 属于可压缩 mime | 直接透传（图片、二进制等）|
+| 4 | 客户端 `Accept-Encoding` 有匹配算法 | 直接透传 |
+
+**可压缩 mime**：`text/*`、`application/json`、`application/javascript`、`application/xml`、`image/svg+xml`
+
+### 配置示例
+
+```toml
+# 默认：全局开启三种算法，无需额外配置
+[global.compress]
+gzip   = true
+brotli = true
+zstd   = true
+
+# 站点级覆盖：API 站点只用 br/zstd，开高压缩等级
+[[sites]]
+name        = "api"
+server_name = ["api.example.com"]
+
+[sites.compress]
+gzip         = false    # API 客户端无需 gzip 兼容
+ brotli_level = 6       # 提高压缩等级（API body 小，CPU 开销可接受）
+zstd_level   = 6
+
+# 站点级关闭压缩（上游自己压缩，或中间已在压）
+[[sites]]
+name        = "already-compressed"
+server_name = ["cdn.example.com"]
+
+[sites.compress]
+gzip   = false
+brotli = false
+zstd   = false
+```
+
+详细压缩配置说明见 [压缩文档](compression.md)。

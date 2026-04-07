@@ -120,3 +120,68 @@ bypass_headers = []            # 不因请求头跳过缓存
 - **Unix Socket** 比 TCP 延迟低约 10-20%，同机部署时优先使用
 - `pool_size` 设置为 PHP-FPM `pm.max_children` 的 60-80%，避免连接排队
 - `ttl` 根据内容更新频率设置，新闻类站点可设 30-60 秒，静态内容可设 3600 秒
+
+## 压缩
+
+Sweety 对 PHP-FPM 响应内置支持 br / zstd / gzip 三种压缩，遵循与静态文件、反向代理相同的全局配置 + 站点配置继承规则。
+
+### 工作原理
+
+```
+PHP-FPM 响应
+  已输出 Content-Encoding  → Sweety 直接透传（不重复压缩）
+  未输出 Content-Encoding  → Sweety 流式压缩后返回客户端
+```
+
+**压缩条件**（全部满足才压缩）：
+
+1. 站点至少开启一种压缩算法
+2. PHP 响应无 `Content-Encoding`（PHP 未自行压缩）
+3. `Content-Type` 属于可压缩 mime（`text/html`、`application/json` 等）
+4. 客户端 `Accept-Encoding` 有匹配算法
+
+### 与 PHP 内置压缩的冲突
+
+PHP 有两种内置压缩方式，需避免与 Sweety 光压缩冲突：
+
+| PHP 压缩方式 | 处理建议 |
+|----------------|----------|
+| `zlib.output_compression = On` | **关闭**，交由 Sweety 压缩（支持 br/zstd，PHP 内置只有 gzip）|
+| `ob_gzhandler()` | 删除该调用，交由 Sweety 压缩 |
+| PHP 已输出 `Content-Encoding: gzip` | Sweety 自动识别并跳过，不重复压缩 |
+
+> PHP `zlib.output_compression` 只能输出 gzip，而 Sweety 可输出 br/zstd/gzip。建议关闭 PHP 内置压缩。
+
+### 配置示例
+
+```toml
+# 默认：全局开启，所有 PHP 站点自动压缩
+[global.compress]
+gzip   = true
+brotli = true
+zstd   = true
+
+# WordPress 站点：防止 PHP 内置压缩冲突（在 php.ini 关闭 zlib.output_compression）
+# Sweety 层面无需额外配置，默认即开启
+
+# 对高流量 API 站点提高压缩等级
+[[sites]]
+name        = "php-api"
+server_name = ["api.example.com"]
+
+[sites.compress]
+brotli_level = 6    # 默认 4，提高到 6
+ zstd_level   = 6   # 默认 3，提高到 6
+
+# 如果 PHP 已自己压缩，站点级关闭压缩
+[[sites]]
+name        = "self-compress-php"
+server_name = ["old.example.com"]
+
+[sites.compress]
+gzip   = false
+brotli = false
+zstd   = false
+```
+
+详细压缩配置说明见 [压缩文档](compression.md)。

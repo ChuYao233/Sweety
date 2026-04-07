@@ -2,6 +2,7 @@
 //! 每个子模块对应一种请求类型的处理逻辑
 
 pub mod auth_request;
+pub mod compress;
 pub mod error_page;
 pub mod fastcgi;
 pub mod fastcgi_pool;

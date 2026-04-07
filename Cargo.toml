@@ -29,7 +29,7 @@ quinn        = { version = "0.11", default-features = false, features = ["rustls
 
 [package]
 name        = "sweety"
-version     = "0.2.5"
+version     = "0.2.6"
 edition     = "2021"
 description = "A high-performance, single-binary, multi-site web server.  "
 license     = "Apache-2.0"
@@ -121,7 +121,7 @@ tokio-stream  = { version = "0.1", features = ["sync"] }
 h2            = "0.4"
 bytes        = "1"
 flate2       = "1"
-async-compression = { version = "0.4", features = ["brotli", "zstd", "tokio"] }
+async-compression = { version = "0.4", features = ["gzip", "brotli", "zstd", "tokio"] }
 async-stream      = "0.3"
 # mmap 零拷贝大文件传输（文件直接映射到进程地址空间，绕过 read() 内核→用户态拷贝）
 memmap2           = "0.9"

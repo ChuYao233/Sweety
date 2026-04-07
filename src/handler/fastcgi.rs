@@ -289,7 +289,15 @@ pub async fn handle_sweety(
                     read_tmo,
                     build_streaming_response(parsed, pool.clone(), addr_str, fcgi_cache.clone(), cache_key.clone()),
                 ).await {
-                    Ok(resp) => return resp,
+                    Ok(resp) => {
+                        let global_cfg = ctx.state().cfg.load();
+                        let (gz_en, gz_lv, br_en, br_lv, zst_en, zst_lv) =
+                            crate::handler::compress::effective_compress(site, &global_cfg.global);
+                        return crate::handler::compress::compress_response(
+                            resp, ctx.req().headers(),
+                            gz_en, gz_lv, br_en, br_lv, zst_en, zst_lv,
+                        );
+                    }
                     Err(_) => return fcgi_error(StatusCode::GATEWAY_TIMEOUT, "PHP-FPM body 读取超时"),
                 }
             }

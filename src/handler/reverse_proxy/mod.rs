@@ -327,6 +327,19 @@ pub async fn handle_sweety(
 
     // apply_extra_headers：向客户端响应注入自定义头（等价 Nginx add_header）
     apply_extra_headers(&mut resp, &add_headers, &cache_rules, &path, client_ip_str_ref, scheme_str);
+
+    // ── 代理压缩（等价 Nginx gzip_proxied）──────────────────────────────────
+    // 条件：上游未压缩（无 Content-Encoding）+ mime 可压缩 + 压缩已开启
+    {
+        let global_cfg = ctx.state().cfg.load();
+        let (gz_en, gz_lv, br_en, br_lv, zst_en, zst_lv) =
+            crate::handler::compress::effective_compress(site, &global_cfg.global);
+        resp = crate::handler::compress::compress_response(
+            resp, ctx.req().headers(),
+            gz_en, gz_lv, br_en, br_lv, zst_en, zst_lv,
+        );
+    }
+
     resp
 }
 

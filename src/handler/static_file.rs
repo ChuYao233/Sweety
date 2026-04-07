@@ -15,8 +15,8 @@ use sweety_web::{
     http::{
         StatusCode, WebResponse,
         header::{
-            ACCEPT_ENCODING, ACCEPT_RANGES, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
-            CONTENT_TYPE, ETAG, LAST_MODIFIED, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+            ACCEPT_RANGES, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
+            CONTENT_TYPE, ETAG, LAST_MODIFIED, IF_MODIFIED_SINCE, IF_NONE_MATCH, VARY,
             HeaderMap, HeaderValue,
         },
     },
@@ -41,24 +41,30 @@ use cache::{
     fd_cache_get_or_open_arc, make_cache_key_from_path,
     GZIP_MAX_INLINE, FILE_CACHE_MAX_BYTES,
 };
-use compress::{stream_file_response_pread, gzip_compress, brotli_compress, zstd_compress};
+use compress::{stream_file_response_pread, stream_file_response_compressed, CompressEncoding, gzip_compress, brotli_compress, zstd_compress};
 use range::parse_range;
 
+
 /// 根据 Accept-Encoding 头和缓存条目选出最优编码
-/// 优先级：br > zstd > gzip > 原始
+/// 传入实际文件大小实现自适应算法选择：小文件选 zstd（解压极快），大文件选 br（压缩率高）
 #[inline]
 fn pick_encoding<'a>(
-    accept_enc: &str,
+    req_headers: &sweety_web::http::header::HeaderMap,
     entry: &'a FileCacheEntry,
 ) -> (&'a Bytes, Option<&'static str>) {
-    if accept_enc.contains("br") {
-        if let Some(b) = &entry.br { return (b, Some("br")); }
-    }
-    if accept_enc.contains("zstd") {
-        if let Some(b) = &entry.zst { return (b, Some("zstd")); }
-    }
-    if accept_enc.contains("gzip") {
-        if let Some(b) = &entry.gz { return (b, Some("gzip")); }
+    let gz_avail  = entry.gz.is_some();
+    let br_avail  = entry.br.is_some();
+    let zst_avail = entry.zst.is_some();
+    // 传入实际文件大小，让算法选择能根据内容自适应
+    let file_size = entry.data.len() as u64;
+    let enc = crate::handler::compress::pick_best_encoding_sized(
+        req_headers, gz_avail, br_avail, zst_avail, Some(file_size),
+    );
+    match enc {
+        Some("br")   => if let Some(b) = &entry.br  { return (b, Some("br"));   }
+        Some("zstd") => if let Some(b) = &entry.zst { return (b, Some("zstd")); }
+        Some("gzip") => if let Some(b) = &entry.gz  { return (b, Some("gzip")); }
+        _ => {}
     }
     (&entry.data, None)
 }
@@ -147,9 +153,8 @@ pub async fn handle_sweety(
                 // Range 解析失败（超出范围等），回落到下方常规路径
             }
 
-            // 选择最优编码（br > zstd > gzip > 原始），复用缓存中预压缩结果
-            let accept_enc = req_headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or("");
-            let (body_bytes, enc) = pick_encoding(accept_enc, &entry);
+            // 选择最优编码（br > zstd > gzip > 原始），严格 q= 解析，复用缓存中预压缩结果
+            let (body_bytes, enc) = pick_encoding(req_headers, &entry);
             let body_bytes = body_bytes.clone();
 
             // 直接插入预构建的头，零 from_str 分配
@@ -161,6 +166,8 @@ pub async fn handle_sweety(
                 if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_bytes.len())) {
                     h.insert(CONTENT_LENGTH, v);
                 }
+                // 压缩响应必须携带 Vary: Accept-Encoding（RFC 7231 §7.1.4）
+                h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
             } else {
                 h.insert(CONTENT_LENGTH, entry.hv_content_length.clone());
             }
@@ -291,9 +298,8 @@ pub async fn handle_sweety(
                 hv_last_modified:   HeaderValue::from_str(&http_date).unwrap_or_else(|_| HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")),
                 hv_cache_control:   HeaderValue::from_str(cc).unwrap_or_else(|_| HeaderValue::from_static("public, max-age=3600")),
             };
-            // 选择最优编码写缓存并直接返回
-            let accept_enc2 = req_headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or("");
-            let (resp_bytes_ref, enc_name) = pick_encoding(accept_enc2, &entry);
+            // 选择最优编码写缓存并直接返回（严格 q= 解析）
+            let (resp_bytes_ref, enc_name) = pick_encoding(req_headers, &entry);
             let resp_bytes = resp_bytes_ref.clone();
             let enc_hv = enc_name.map(|n| HeaderValue::from_static(n));
             let hv_ct = entry.hv_content_type.clone();
@@ -320,7 +326,10 @@ pub async fn handle_sweety(
             h.insert(ETAG,           hv_et);
             h.insert(LAST_MODIFIED,  hv_lm);
             h.insert(CACHE_CONTROL,  hv_cc);
-            if let Some(enc) = enc_hv { h.insert(CONTENT_ENCODING, enc); }
+            if let Some(enc) = enc_hv {
+                h.insert(CONTENT_ENCODING, enc);
+                h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+            }
             return resp;
         }
 
@@ -367,7 +376,46 @@ pub async fn handle_sweety(
             // Range 解析失败（超出范围），回落到全量传输
         }
 
-        return stream_file_response_pread(arc_fd, &file_path, file_size, 0, file_size, &etag_val, modified_secs, location);
+        // 大文件非 Range：尝试流式压缩（Range 请求不压缩，语义不兼容）
+        let global = &ctx.state().cfg.load().global;
+        let eff = site.compress.resolve(&global.compress);
+        let gz_enabled  = eff.gzip   || site.gzip.unwrap_or(global.gzip);
+        let gz_level    = if site.compress.gzip_level.is_some() { eff.gzip_level }
+                          else { site.gzip_comp_level.unwrap_or(eff.gzip_level) };
+        let br_enabled  = eff.brotli;
+        let zst_enabled = eff.zstd;
+        let min_bytes   = (eff.min_length as u64) * 1024;
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let already_compressed = matches!(ext,
+            "gz" | "br" | "zst" | "zip" | "png" | "jpg" | "jpeg"
+            | "gif" | "webp" | "avif" | "mp4" | "webm" | "woff" | "woff2"
+            | "bin" | "dat" | "raw" | "iso" | "exe" | "dll" | "so"
+        );
+        let mime = crate::middleware::cache::mime_type_for(ext);
+        let compressible_mime = mime.starts_with("text/")
+            || mime == "application/json"
+            || mime == "application/javascript"
+            || mime == "application/x-javascript"
+            || mime == "application/xml"
+            || mime == "application/xhtml+xml"
+            || mime == "application/rss+xml"
+            || mime == "application/atom+xml"
+            || mime == "image/svg+xml";
+        let can_compress = !already_compressed && compressible_mime && file_size >= min_bytes;
+        let stream_enc = if can_compress {
+            // 严格解析 Accept-Encoding + 自适应算法选择（传入实际文件大小）
+            crate::handler::compress::pick_best_encoding_sized(
+                req_headers, gz_enabled, br_enabled, zst_enabled, Some(file_size),
+            ).and_then(|name| match name {
+                "br"   => Some(CompressEncoding::Brotli(eff.brotli_level)),
+                "zstd" => Some(CompressEncoding::Zstd(eff.zstd_level)),
+                "gzip" => Some(CompressEncoding::Gzip(gz_level)),
+                _      => None,
+            })
+        } else {
+            None
+        };
+        return stream_file_response_compressed(arc_fd, &file_path, file_size, &etag_val, modified_secs, location, stream_enc);
     }
 
     // ── HEAD / Range 路径：必须读 metadata ────────────────────────────────────
@@ -530,6 +578,35 @@ fn set_file_headers(
     }
 
     // RFC 7233: 声明支持 Range 请求（与 Nginx 行为一致）
+    headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+}
+
+/// 设置静态文件响应头（不含 Content-Length，供流式压缩路径使用）
+pub(super) fn set_file_headers_no_length(
+    headers: &mut HeaderMap,
+    path: &Path,
+    etag: &str,
+    modified_secs: u64,
+    location: &LocationConfig,
+) {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let mime = mime_type_for(ext);
+    if let Ok(v) = HeaderValue::from_str(mime) {
+        headers.insert(CONTENT_TYPE, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(etag) {
+        headers.insert(ETAG, v);
+    }
+    let modified_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(modified_secs);
+    let http_date = httpdate::fmt_http_date(modified_time);
+    if let Ok(v) = HeaderValue::from_str(&http_date) {
+        headers.insert(LAST_MODIFIED, v);
+    }
+    let cc = location.cache_control.as_deref()
+        .unwrap_or_else(|| default_cache_control(ext));
+    if let Ok(v) = HeaderValue::from_str(cc) {
+        headers.insert(CACHE_CONTROL, v);
+    }
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 }
 

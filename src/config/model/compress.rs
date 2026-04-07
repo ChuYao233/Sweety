@@ -11,17 +11,20 @@ fn default_zstd_level() -> u32 { 3 }
 fn default_min_length() -> usize { 1 }
 
 /// 压缩配置（全局或站点级）
+///
+/// 通过 `Default::default()` 构造时三种算法均默认开启；
+/// 通过 YAML/JSON 反序列化时各字段默认值如注释所示。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompressConfig {
-    /// 是否启用 gzip（默认 false）
+    /// 是否启用 gzip（配置文件默认 false，Default::default() 为 true）
     #[serde(default)]
     pub gzip: bool,
 
-    /// gzip 压缩等级 1-9（默认 5，等价 Nginx gzip_comp_level）
+    /// gzip 压缩等级 1-9（默认 6，等价 Nginx gzip_comp_level 6）
     #[serde(default = "default_gzip_level")]
     pub gzip_level: u32,
 
-    /// 是否启用 brotli（默认 false）
+    /// 是否启用 brotli（配置文件默认 false，Default::default() 为 true）
     #[serde(default)]
     pub brotli: bool,
 
@@ -29,7 +32,7 @@ pub struct CompressConfig {
     #[serde(default = "default_brotli_level")]
     pub brotli_level: u32,
 
-    /// 是否启用 zstd（默认 false）
+    /// 是否启用 zstd（配置文件默认 false，Default::default() 为 true）
     #[serde(default)]
     pub zstd: bool,
 

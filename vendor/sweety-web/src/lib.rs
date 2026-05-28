@@ -319,5 +319,5 @@ pub use sweety_http_core::bytes;
 pub use sweety_http_core::set_proxy_protocol_ports;
 #[cfg(feature = "http3")]
 pub use sweety_http_core::set_h3_max_connections;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use sweety_http_core::sendfile_ext::SendFileInfo;

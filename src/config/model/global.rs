@@ -16,6 +16,9 @@ fn default_gzip_min_length() -> usize { 1 }
 fn default_gzip_comp_level() -> u32 { 5 }
 fn default_prometheus_path() -> String { "/metrics".into() }
 fn default_log_level() -> String { "info".into() }
+fn default_open_file_cache_max() -> usize { 200000 }
+fn default_open_file_cache_inactive() -> u64 { 60 }
+fn default_open_file_cache_total_mb() -> usize { 512 }
 fn default_h2_max_concurrent_streams() -> u32 { 128 }
 fn default_h2_max_concurrent_reset_streams() -> usize { 200 }
 fn default_h2_max_frame_size() -> u32 { 65535 }
@@ -102,6 +105,18 @@ pub struct GlobalConfig {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
+    /// 静态文件缓存最大条目数（等价 Nginx open_file_cache max=N，默认 65536）
+    #[serde(default = "default_open_file_cache_max")]
+    pub open_file_cache_max: usize,
+
+    /// 静态文件缓存不活跃淘汰时间（秒，等价 Nginx open_file_cache inactive=60s）
+    #[serde(default = "default_open_file_cache_inactive")]
+    pub open_file_cache_inactive: u64,
+
+    /// 静态文件内存缓存总量上限（MB，默认 256）
+    #[serde(default = "default_open_file_cache_total_mb")]
+    pub open_file_cache_total_mb: usize,
+
     /// HTTP/2 单连接最大并发流数（等价 Nginx http2_max_concurrent_streams，默认 128）
     #[serde(default = "default_h2_max_concurrent_streams")]
     pub h2_max_concurrent_streams: u32,
@@ -146,6 +161,9 @@ impl Default for GlobalConfig {
             prometheus_enabled: true,
             prometheus_path: "/metrics".into(),
             log_level: "info".into(),
+            open_file_cache_max: default_open_file_cache_max(),
+            open_file_cache_inactive: default_open_file_cache_inactive(),
+            open_file_cache_total_mb: default_open_file_cache_total_mb(),
             h2_max_concurrent_streams: default_h2_max_concurrent_streams(),
             h2_max_pending_per_conn: 0,
             h2_max_concurrent_reset_streams: default_h2_max_concurrent_reset_streams(),

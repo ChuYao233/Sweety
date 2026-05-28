@@ -309,6 +309,12 @@ impl SweetyServer {
             });
         }
 
+        // 从全局配置初始化静态文件缓存参数（等价 Nginx open_file_cache）
+        crate::handler::static_file::init_cache_limits(
+            cfg.global.open_file_cache_max,
+            cfg.global.open_file_cache_total_mb,
+        );
+
         // 启动文件缓存 notify 监听：文件修改时自动淘汰内存缓存，无需每请求 stat
         {
             let roots: Vec<std::path::PathBuf> = cfg.sites.iter()

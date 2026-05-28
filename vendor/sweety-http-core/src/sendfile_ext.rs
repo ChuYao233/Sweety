@@ -6,7 +6,7 @@
 /// ```
 /// 如果连接是 TLS 或者平台不支持 sendfile，dispatcher 会忽略此 extension，
 /// 回退到正常的 body stream 路径（response body 应同时设置为 pread_stream）。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone)]
 pub struct SendFileInfo {
     pub fd:     std::sync::Arc<std::fs::File>,
@@ -17,7 +17,7 @@ pub struct SendFileInfo {
 /// Linux sendfile(2)：把文件 fd 的 [offset, offset+len) 字节写入 AsyncIo socket，零用户态拷贝。
 ///
 /// `#[allow(unsafe_code)]` 局部覆盖模块级 deny，仅此函数使用 unsafe。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(unsafe_code)]
 pub async fn sendfile_to_io<St: sweety_io_compat::io::AsyncIo>(
     io: &mut St,
@@ -35,9 +35,28 @@ pub async fn sendfile_to_io<St: sweety_io_compat::io::AsyncIo>(
 
     while rem > 0 {
         io.ready(Interest::WRITABLE).await?;
+
+        #[cfg(target_os = "linux")]
         let n = unsafe {
             libc::sendfile(sock_fd, file_fd, &mut off, rem.min(1 << 21))
         };
+
+        #[cfg(target_os = "macos")]
+        let n = {
+            let mut sent_len = rem.min(1 << 21) as libc::off_t;
+            let ret = unsafe {
+                libc::sendfile(file_fd, sock_fd, off, &mut sent_len, std::ptr::null_mut(), 0)
+            };
+            if sent_len > 0 {
+                off += sent_len;
+                sent_len as isize
+            } else if ret == 0 {
+                0
+            } else {
+                -1
+            }
+        };
+
         match n {
             n if n > 0 => rem -= n as usize,
             0 => break,

@@ -118,8 +118,8 @@ pub(super) fn stream_file_response_pread(
     let mut resp = WebResponse::new(body);
     super::set_file_headers(resp.headers_mut(), file_path, content_len, etag_val, modified_secs, location);
 
-    // Linux H1 非 TLS：注入 SendFileInfo，dispatcher 检测后走 sendfile(2) 零拷贝
-    #[cfg(target_os = "linux")]
+    // Linux/macOS H1 非 TLS：注入 SendFileInfo，dispatcher 检测后走 sendfile(2) 零拷贝
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     resp.extensions_mut().insert(
         sweety_web::SendFileInfo { fd, offset, len }
     );

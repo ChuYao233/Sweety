@@ -238,7 +238,7 @@ where
             };
 
             // 在 parts 被 encode_head 消耗前，提取 SendFileInfo
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             let send_file_info: Option<crate::sendfile_ext::SendFileInfo> =
                 parts.extensions.get::<crate::sendfile_ext::SendFileInfo>().cloned();
 
@@ -247,7 +247,7 @@ where
 
             // sendfile(2) 快路径：通过 sendfile_fd() 编译期 dispatch
             // 裸 TCP socket 返回 Some(fd)，TLS 等封装类型返回 None（编译期单态化，零开销）
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             let did_sendfile = 'sf: {
                 let Some(sf) = send_file_info else { break 'sf false; };
                 let Some(sock_fd) = self.io.io.sendfile_fd() else { break 'sf false; };
@@ -255,7 +255,7 @@ where
                 crate::sendfile_ext::sendfile_to_io(self.io.io, sock_fd, &sf.fd, sf.offset, sf.len).await?;
                 true
             };
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let did_sendfile = false;
 
             if !did_sendfile {

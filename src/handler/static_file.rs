@@ -33,7 +33,7 @@ mod compress;
 mod path;
 mod range;
 
-pub use cache::start_file_cache_watcher;
+pub use cache::{start_file_cache_watcher, init_cache_limits};
 pub use path::{TryFilesResult, try_files_resolve, resolve_safe_path, resolve_safe_path_fast};
 
 use cache::{
@@ -307,11 +307,14 @@ pub async fn handle_sweety(
             let hv_et = entry.hv_etag.clone();
             let hv_lm = entry.hv_last_modified.clone();
             let hv_cc = entry.hv_cache_control.clone();
-            // 同时插入 canonical key 和 fast_key，保证两条查询路径都能命中
+            // min_uses 门控（等价 Nginx open_file_cache_min_uses）：
+            // 只有访问 ≥2 次的文件才写入内存缓存，防止爬虫/扫描器一次性污染
             let canonical_key = make_cache_key_from_path(&file_path);
-            cache_insert(canonical_key.clone(), entry.clone());
-            let fast_key_str = make_cache_key(root, relative);
-            if fast_key_str != canonical_key { cache_insert(fast_key_str, entry); }
+            if cache::access_count_check(&canonical_key) {
+                cache_insert(canonical_key.clone(), entry.clone());
+                let fast_key_str = make_cache_key(root, relative);
+                if fast_key_str != canonical_key { cache_insert(fast_key_str, entry); }
+            }
             let mut resp = WebResponse::new(ResponseBody::from(resp_bytes.clone()));
             let h = resp.headers_mut();
             h.insert(CONTENT_TYPE,   hv_ct);

@@ -667,7 +667,20 @@ async fn send_recv_pooled(
     } else {
         resp_conn_close = true; // EOF 模式：读完即关
         let mut b = Vec::new();
-        let _ = buf.read_to_end(&mut b).await;
+        let mut tmp = [0u8; 65536];
+        loop {
+            match buf.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    b.extend_from_slice(&tmp[..n]);
+                    if b.len() > BUFFERED_MAX_BODY {
+                        tracing::warn!("上游 EOF 模式响应体超过 {}B 限制，截断", BUFFERED_MAX_BODY);
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
         (b, Vec::new())
     };
 
@@ -720,13 +733,17 @@ async fn send_recv_pooled(
 // 响应体读取辅助函数
 // ─────────────────────────────────────────────
 
+/// buffered 响应体最大大小（256 MiB），与 chunked 路径对齐
+const BUFFERED_MAX_BODY: usize = 256 << 20;
+
 /// 读取固定长度响应体（循环读取，正确处理 TLS UnexpectedEof）
 async fn read_exact_body<R>(buf: &mut BufReader<R>, len: usize) -> Result<Vec<u8>>
 where R: AsyncRead + Unpin {
-    let mut b = Vec::with_capacity(len);
+    let capped = len.min(BUFFERED_MAX_BODY);
+    let mut b = Vec::with_capacity(capped);
     // 64KB 栈 buf：减少 syscall 次数，对标 Nginx proxy_buffer_size 64k
     let mut tmp = [0u8; 65536];
-    let mut remaining = len;
+    let mut remaining = capped;
     loop {
         if remaining == 0 { break; }
         match buf.read(&mut tmp[..remaining.min(65536)]).await {
@@ -745,6 +762,15 @@ where R: AsyncRead + Unpin {
 ///
 /// `collect_trailers = true` 时收集 0-chunk 后面的 trailer 头（RFC 7230 §4.1.2），
 /// 返回 `(body_bytes, trailer_headers)`。
+/// buffered chunked body 最大累积大小（256 MiB）
+/// 超过此限制截断返回已读部分，防止恶意上游 OOM
+const CHUNKED_MAX_BODY: usize = 256 << 20;
+/// 单个 chunk 最大声明长度（64 MiB）
+/// 防止恶意 chunk size 值一次性分配数 GB 内存
+const CHUNKED_MAX_CHUNK: usize = 64 << 20;
+/// trailer 头最大数量
+const CHUNKED_MAX_TRAILERS: usize = 100;
+
 pub async fn read_chunked_body<R>(
     buf: &mut BufReader<R>,
     collect_trailers: bool,
@@ -768,6 +794,7 @@ where R: AsyncRead + Unpin {
             if collect_trailers {
                 let mut tline = String::new();
                 loop {
+                    if trailers.len() >= CHUNKED_MAX_TRAILERS { break; }
                     tline.clear();
                     match buf.read_line(&mut tline).await {
                         Ok(0) | Err(_) => break,
@@ -786,6 +813,15 @@ where R: AsyncRead + Unpin {
                 let mut skip = String::new();
                 let _ = buf.read_line(&mut skip).await;
             }
+            break;
+        }
+
+        // 安全限制：单个 chunk 声明超过 64MB 或累积超过 256MB 则截断
+        if chunk_size > CHUNKED_MAX_CHUNK || body.len().saturating_add(chunk_size) > CHUNKED_MAX_BODY {
+            tracing::warn!(
+                "上游 chunked body 超过大小限制（chunk_size={}, total={}），截断",
+                chunk_size, body.len()
+            );
             break;
         }
 
@@ -903,7 +939,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// - 慢路径：逐字节替换 \r \n 为空格（栈上操作，无堆分配）
 /// - 比 Nginx 更安全：Nginx proxy_set_header 不过滤 CRLF
 #[inline(always)]
-fn push_sanitized_value(buf: &mut String, val: &str) {
+pub(super) fn push_sanitized_value(buf: &mut String, val: &str) {
     // 快路径：绝大多数正常值不含控制字符
     if !val.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
         buf.push_str(val);
@@ -921,7 +957,7 @@ fn push_sanitized_value(buf: &mut String, val: &str) {
 
 /// 安全地追加一行 header（name: value\r\n），过滤 CRLF 注入
 #[inline(always)]
-fn push_safe_header(buf: &mut String, name: &str, value: &str) {
+pub(super) fn push_safe_header(buf: &mut String, name: &str, value: &str) {
     push_sanitized_value(buf, name);
     buf.push_str(": ");
     push_sanitized_value(buf, value);

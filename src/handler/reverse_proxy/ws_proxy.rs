@@ -240,10 +240,11 @@ async fn do_ws_proxy(
     upgrade_req.push_str(" HTTP/1.1\r\nHost: "); upgrade_req.push_str(upstream_host);
     upgrade_req.push_str("\r\n");
     for (k, v) in extra_headers {
-        upgrade_req.push_str(k); upgrade_req.push_str(": "); upgrade_req.push_str(v); upgrade_req.push_str("\r\n");
+        // CRLF 注入防护：过滤 header name/value 中的 \r \n，防止 HTTP Request Smuggling
+        super::conn::push_safe_header(&mut upgrade_req, k, v);
     }
-    upgrade_req.push_str("X-Real-IP: "); upgrade_req.push_str(client_ip); upgrade_req.push_str("\r\n");
-    upgrade_req.push_str("X-Forwarded-For: "); upgrade_req.push_str(client_ip); upgrade_req.push_str("\r\n");
+    upgrade_req.push_str("X-Real-IP: "); super::conn::push_sanitized_value(&mut upgrade_req, client_ip); upgrade_req.push_str("\r\n");
+    upgrade_req.push_str("X-Forwarded-For: "); super::conn::push_sanitized_value(&mut upgrade_req, client_ip); upgrade_req.push_str("\r\n");
     // 对标 Nginx: proxy_http_version 1.1 + proxy_set_header Upgrade $http_upgrade
     // 必须显式加上 Upgrade + Connection，上游才能完成 WebSocket 升级握手
     let is_already_upgrade = extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("upgrade"));

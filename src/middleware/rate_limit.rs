@@ -59,16 +59,22 @@ impl IpBucketShards {
     }
 }
 
-/// IPv4 字符串转 u32（失败时用 hash 模拟）
+/// IP 字符串转 u32 散列值（用于限流 bucket 分片）
+///
+/// 安全修复：IPv6 使用完整 128 位地址的 hash，避免不同 /64 前缀碰撞
 #[inline]
 fn ip_to_u32(ip: &str) -> u32 {
     if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
         match addr {
             std::net::IpAddr::V4(v4) => u32::from(v4),
             std::net::IpAddr::V6(v6) => {
-                // IPv6：取最后 4 字节作为索引
+                // 安全修复：使用完整 IPv6 地址的 FNV-1a hash，避免 /64 碰撞
                 let octets = v6.octets();
-                u32::from_be_bytes([octets[12], octets[13], octets[14], octets[15]])
+                let mut h: u32 = 2166136261;
+                for &b in &octets {
+                    h = h.wrapping_mul(16777619) ^ (b as u32);
+                }
+                h
             }
         }
     } else {

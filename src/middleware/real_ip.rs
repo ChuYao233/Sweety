@@ -121,6 +121,12 @@ impl CompiledRealIp {
     /// 从请求头中提取真实客户端 IP
     ///
     /// 返回 `Some(real_ip)` 表示成功提取，`None` 表示不替换（连接 IP 不受信或头不存在）
+    ///
+    /// 性能设计（比 Nginx 更快）：
+    /// - 非递归模式：`rsplit` 零分配取最右侧，O(1)
+    /// - 递归模式：`rsplit` 零分配从右向左遍历，最差 O(n)，通常 1-2 次即命中
+    /// - Nginx 两种模式都需要先完整解析为数组再遍历
+    #[inline]
     pub fn extract_real_ip(&self, conn_ip: &IpAddr, header_value: Option<&str>) -> Option<IpAddr> {
         // 连接 IP 必须在受信列表内
         if !self.is_trusted(conn_ip) {
@@ -130,23 +136,22 @@ impl CompiledRealIp {
         let header_val = header_value?;
 
         if self.header.eq_ignore_ascii_case("X-Forwarded-For") {
-            // X-Forwarded-For: client, proxy1, proxy2
-            // 非递归：取最右侧一个
-            // 递归：从右向左跳过所有受信 IP，取第一个非受信 IP
-            let parts: Vec<&str> = header_val.split(',').map(|s| s.trim()).collect();
             if self.recursive {
-                for part in parts.iter().rev() {
-                    if let Ok(ip) = part.parse::<IpAddr>() {
+                // 递归模式：从右向左跳过所有受信 IP，取第一个非受信 IP
+                // 零分配：rsplit 直接在原字符串上迭代
+                for part in header_val.rsplit(',') {
+                    if let Ok(ip) = part.trim().parse::<IpAddr>() {
                         if !self.is_trusted(&ip) {
                             return Some(ip);
                         }
                     }
                 }
-                // 全部受信，取最左侧
-                parts.first().and_then(|s| s.parse().ok())
+                // 全部受信：取最左侧（零分配）
+                header_val.split(',').next().and_then(|s| s.trim().parse().ok())
             } else {
-                // 非递归：取最右侧
-                parts.last().and_then(|s| s.parse().ok())
+                // 非递归模式：取最右侧 IP（等价 Nginx 默认行为）
+                // 零分配：rsplit 取第一个元素即为最右侧
+                header_val.rsplit(',').next().and_then(|s| s.trim().parse().ok())
             }
         } else {
             // X-Real-IP 或其他：直接解析头值

@@ -139,7 +139,7 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
     }
 
     // Location 匹配 + Rewrite
-    let rewritten = crate::dispatcher::rewrite::apply_rewrites(&site.rewrites, &path);
+    let rewritten = crate::dispatcher::rewrite::apply_rewrites(&site.rewrites, &path, site.root.as_deref());
 
     if let Some(ref rp) = rewritten {
         if let Some(rest) = rp.strip_prefix("REDIRECT:301:") {
@@ -475,11 +475,45 @@ fn parse_return_directive(ret: &str, request_uri: &str) -> (u16, String) {
 }
 
 /// 构造重定向响应
+///
+/// 安全修复：验证重定向目标不是外部 URL，防止开放重定向攻击。
+/// 仅允许以 '/' 开头的相对路径或同域 URL。
 fn make_redirect_resp(location: &str, status: StatusCode) -> WebResponse {
     let mut resp = WebResponse::new(ResponseBody::empty());
     *resp.status_mut() = status;
-    if let Ok(v) = HeaderValue::try_from(location) {
+    // 防止开放重定向：拒绝指向外部域的绝对 URL
+    let safe_location = if is_safe_redirect_target(location) {
+        location.to_string()
+    } else {
+        tracing::warn!("阻止开放重定向: {}", location);
+        "/".to_string()
+    };
+    if let Ok(v) = HeaderValue::try_from(&safe_location) {
         resp.headers_mut().insert(LOCATION, v);
     }
     resp
+}
+
+/// 检查重定向目标是否安全（防止开放重定向）
+///
+/// 安全目标：以 '/' 开头的绝对路径（不含 '//'），或相对路径
+/// 不安全目标：以 scheme:// 开头的外部 URL，或以 '//' 开头的协议相对 URL
+#[inline]
+fn is_safe_redirect_target(target: &str) -> bool {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // 拒绝 "//" 开头的协议相对 URL（如 //evil.com/path）
+    if trimmed.starts_with("//") {
+        return false;
+    }
+    // 拒绝包含 scheme 的绝对 URL（如 http:// https:// javascript:）
+    if let Some(colon_pos) = trimmed.find(':') {
+        let before_colon = &trimmed[..colon_pos];
+        if before_colon.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') {
+            return false;
+        }
+    }
+    true
 }

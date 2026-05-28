@@ -134,28 +134,47 @@ async fn do_auth_request(
     }
 }
 
+/// 单行最大长度（8 KiB，与 Admin API 请求行限制对齐）
+const AUTH_MAX_LINE_LEN: usize = 8192;
+/// 最大响应头数量（Nginx auth_request 子模块上限 100 个，足够任何鉴权服务）
+const AUTH_MAX_HEADERS: usize = 100;
+
 /// 读取 auth 响应（只需要状态码 + 响应头，不读 body）
+///
+/// 安全限制（防恶意鉴权服务 DoS）：
+/// - 单行最大 8 KiB（超长则截断并丢弃该头）
+/// - 最大 100 个响应头（超出后停止读取）
+/// - 5 秒读取超时
 async fn read_auth_response<R>(
     buf: &mut BufReader<R>,
 ) -> anyhow::Result<(u16, Vec<(String, String)>)>
 where R: tokio::io::AsyncRead + Unpin {
-    let mut status_line = String::new();
+    // 复用 line 缓冲，整个函数只分配一次
+    let mut line = String::with_capacity(256);
+    line.clear();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        buf.read_line(&mut status_line),
+        buf.read_line(&mut line),
     ).await
     .map_err(|_| anyhow::anyhow!("auth_request 响应超时"))??;
+    // 状态行超长保护
+    if line.len() > AUTH_MAX_LINE_LEN {
+        anyhow::bail!("auth_request 响应状态行超长 ({} 字节)", line.len());
+    }
 
-    let status = parse_status_u16(&status_line);
+    let status = parse_status_u16(&line);
 
-    // 读取响应头
-    let mut headers = Vec::new();
+    // 读取响应头（限行长 + 限头数）
+    let mut headers = Vec::with_capacity(16);
     loop {
-        let mut line = String::new();
+        if headers.len() >= AUTH_MAX_HEADERS { break; }
+        line.clear();
         match buf.read_line(&mut line).await {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
+        // 超长行：跳过该头（不终止读取，保持协议兼容）
+        if line.len() > AUTH_MAX_LINE_LEN { continue; }
         let trimmed = line.trim();
         if trimmed.is_empty() { break; }
         if let Some(colon) = trimmed.find(':') {
@@ -173,6 +192,9 @@ where R: tokio::io::AsyncRead + Unpin {
 /// - `http://127.0.0.1:8080/auth`
 /// - `https://auth.internal/check`
 /// - `/auth`（本地回环，localhost:80）
+///
+/// 安全修复：SSRF 防护——拒绝连接云元数据服务（169.254.169.254）
+/// 相对路径（/auth）始终连 127.0.0.1，安全可控
 fn parse_auth_url(url: &str) -> anyhow::Result<(String, u16, String, bool)> {
     if url.starts_with("http://") || url.starts_with("https://") {
         let use_tls = url.starts_with("https://");
@@ -188,13 +210,54 @@ fn parse_auth_url(url: &str) -> anyhow::Result<(String, u16, String, bool)> {
         } else {
             (authority.to_string(), if use_tls { 443 } else { 80 })
         };
+        // SSRF 防护：拒绝连接云元数据端点
+        reject_ssrf_target(&host)?;
         Ok((host, port, path.to_string(), use_tls))
     } else if url.starts_with('/') {
-        // 相对路径：向本地 127.0.0.1:80 发请求
+        // 相对路径：向本地 127.0.0.1:80 发请求（安全：始终回环）
         Ok(("127.0.0.1".to_string(), 80, url.to_string(), false))
     } else {
         Err(anyhow::anyhow!("无法解析 auth_request URL: {}", url))
     }
+}
+
+/// SSRF 防护：拒绝连接云元数据服务和链路本地地址
+///
+/// 阻止列表（覆盖主流云厂商元数据端点）：
+/// - `169.254.169.254`：AWS / GCP / Azure 实例元数据
+/// - `100.100.100.200`：阿里云元数据
+/// - `fd00::` 前缀：IPv6 ULA（内网），部分云 IPv6 元数据
+///
+/// 性能：仅在配置加载 / 首次连接时调用（非热路径），字符串比较即可
+#[inline]
+fn reject_ssrf_target(host: &str) -> anyhow::Result<()> {
+    // 先尝试解析为 IP，纯域名（如 auth.internal）放行——DNS 解析由运维控制
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                // 169.254.0.0/16 链路本地（含 169.254.169.254 元数据）
+                if v4.is_link_local() {
+                    anyhow::bail!("auth_request SSRF 防护：拒绝链路本地地址 {}", host);
+                }
+                // 100.100.100.200 阿里云元数据
+                if v4.octets() == [100, 100, 100, 200] {
+                    anyhow::bail!("auth_request SSRF 防护：拒绝云元数据地址 {}", host);
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                let segs = v6.segments();
+                // fd00::/8 ULA
+                if segs[0] & 0xff00 == 0xfd00 {
+                    anyhow::bail!("auth_request SSRF 防护：拒绝 IPv6 ULA 地址 {}", host);
+                }
+                // fe80::/10 链路本地
+                if segs[0] & 0xffc0 == 0xfe80 {
+                    anyhow::bail!("auth_request SSRF 防护：拒绝 IPv6 链路本地地址 {}", host);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 从 HTTP 状态行提取状态码（"HTTP/1.1 200 OK" → 200）

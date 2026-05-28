@@ -138,3 +138,16 @@ System level:
 ulimit -n 65535
 # Or configure in /etc/security/limits.conf
 ```
+
+### Static File Cache Tuning
+
+For CDN or multi-site deployments, default cache parameters may be insufficient:
+
+```toml
+[global]
+open_file_cache_max      = 500000  # Increase entry limit (default 200000)
+open_file_cache_total_mb = 1024    # Increase memory limit to 1GB (default 512MB)
+open_file_cache_inactive = 120     # Extend inactivity timeout (default 60s)
+```
+
+See [Global Configuration → Static File Cache](../configuration/global.md#static-file-cache) for details.

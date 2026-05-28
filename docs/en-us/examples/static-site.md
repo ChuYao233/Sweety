@@ -139,7 +139,9 @@ cache_control = "public, max-age=86400, s-maxage=604800"
 
 ## Performance Notes
 
-- Small files (< 512KB) are automatically memory-cached — no disk I/O on hot requests
-- Supports `Range` requests (video/audio resume)
-- Automatic `gzip`/`brotli` compression negotiation (based on `Accept-Encoding`)
-- Large files (> 512KB) use `pread` streaming to avoid loading entirely into memory
+- Small files (≤ 64KB) are automatically memory-cached (with pre-compressed gzip/brotli/zstd variants), zero syscall on hot requests
+- Large files use fd cache + sendfile(2) zero-copy (Linux/macOS H1 non-TLS) or pread streaming
+- Supports `Range` requests (video/audio resume) — memory-cached files are sliced directly
+- Automatic `gzip`/`brotli`/`zstd` compression negotiation (based on `Accept-Encoding`)
+- File changes are detected via inotify/kqueue and evicted immediately
+- Cache parameters are configurable in `[global]`, see [Global Configuration → Static File Cache](../configuration/global.md#static-file-cache)

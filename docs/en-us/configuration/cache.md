@@ -50,13 +50,34 @@ ignore_headers     = []
 
 ---
 
-## Static File Memory Cache
+## Static File Cache
 
-Static files are automatically cached in memory (LRU) — no configuration needed. Cache behavior:
+Static files are cached automatically. Three-tier cache:
 
-- Returns `304 Not Modified` when file content hash matches
-- Supports `ETag` and `Last-Modified`
-- Compressed versions (gzip/brotli) are cached separately
+| Tier | Condition | Description |
+|------|-----------|-------------|
+| **Content cache** | File ≤ 64KB | Full content in memory with pre-compressed gzip/brotli/zstd variants |
+| **fd cache** | File > 64KB | Caches file descriptor + stat metadata, avoids repeated open |
+| **sendfile(2)** | Linux/macOS H1 non-TLS | Kernel zero-copy transfer |
+
+### Configuration (`[global]`)
+
+```toml
+[global]
+open_file_cache_max      = 200000  # Max cached entries (default 200000)
+open_file_cache_inactive = 60      # Inactivity eviction timeout (seconds, default 60)
+open_file_cache_total_mb = 512     # Content cache memory limit (MB, default 512)
+```
+
+### Behavior
+
+- **min_uses = 2**: Files are cached only after 2 accesses to prevent cache pollution
+- **inotify real-time eviction**: File changes evict the cache entry immediately
+- **Pre-compression**: First cache write generates gzip/brotli/zstd variants automatically
+- **ETag / Last-Modified**: Returns `304 Not Modified` on cache hit
+- **Range requests**: Memory-cached files are sliced directly, zero disk I/O
+
+For CDN / multi-site deployments, increase `open_file_cache_max` and `open_file_cache_total_mb`.
 
 ---
 

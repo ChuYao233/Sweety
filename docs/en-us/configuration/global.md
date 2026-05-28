@@ -37,6 +37,13 @@ zstd         = true    # Enable zstd (default: true)
 zstd_level   = 3       # 1-22, default 3 (fastest)
 min_length   = 1       # Min file size in KB to compress
 
+# ─── Static File Cache ──────────────────────────────────────────
+# Equivalent to Nginx: open_file_cache max=200000 inactive=60s;
+#                      open_file_cache_min_uses 2;
+open_file_cache_max      = 200000  # Max cached entries
+open_file_cache_inactive = 60      # Inactivity eviction timeout (seconds)
+open_file_cache_total_mb = 512     # Content cache memory limit (MB)
+
 # ─── HTTP/2 ──────────────────────────────────────────────────────
 h2_max_concurrent_streams       = 128   # Max concurrent streams per connection
 h2_max_pending_per_conn         = 0     # Max queued requests (0 = unlimited)
@@ -116,6 +123,30 @@ The following fields are still supported with lower priority than `[global.compr
 | `gzip` | `false` | Enable gzip globally, equivalent to `nginx gzip on` |
 | `gzip_min_length` | `1` KB | Equivalent to `nginx gzip_min_length` |
 | `gzip_comp_level` | `6` | Compression level 1-9 |
+
+### Static File Cache
+
+Three-tier file cache, enabled automatically:
+
+| Tier | Condition | Description |
+|------|-----------|-------------|
+| **Content cache** | File ≤ 64KB | Full content cached in memory with pre-compressed gzip/brotli/zstd variants |
+| **fd cache** | File > 64KB | Caches file descriptor + stat metadata, avoids repeated open |
+| **sendfile(2)** | Linux/macOS H1 non-TLS | Kernel zero-copy transfer |
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `open_file_cache_max` | `200000` | Max cached entries (content + fd cache) |
+| `open_file_cache_inactive` | `60` sec | Inactivity eviction timeout |
+| `open_file_cache_total_mb` | `512` MB | Content cache memory limit |
+
+**Behavior**:
+
+- Files are cached only after 2 accesses (`min_uses = 2`) to prevent cache pollution
+- File changes are detected via inotify/kqueue and evicted immediately
+- First cache write generates gzip/brotli/zstd compressed variants automatically
+
+For CDN / multi-site deployments, increase `open_file_cache_max` (e.g. `500000`) and `open_file_cache_total_mb` (e.g. `1024`).
 
 ### HTTP/2
 

@@ -22,13 +22,16 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 
 ### Request Handling
 - Static files: in-memory LRU cache + Range + ETag/Last-Modified + try_files (`3633cb7`)
-- sendfile(2) zero-copy fast path: kernel direct transfer for H1 non-TLS (`b6c4d09`, `767151b`)
+- sendfile(2) zero-copy fast path: Linux + macOS H1 non-TLS kernel direct transfer (`b6c4d09`, `767151b`)
+- Configurable static file cache: `open_file_cache_max` / `open_file_cache_inactive` / `open_file_cache_total_mb`, equivalent to Nginx `open_file_cache`
+- `min_uses` cache pollution prevention: files cached only after ≥2 accesses (equivalent to Nginx `open_file_cache_min_uses`)
+- pread streaming: async chunked read for large files + H2 flow-control backpressure, replaces mmap
 - PHP/FastCGI: Unix socket / TCP connection pool, fastcgi_cache, correct HTTP/2 Cookie merging (RFC 7540 §8.1.2.5) (`2fa052d`)
 - Reverse proxy: round-robin / weighted / least-conn / IP hash + connection pool + circuit breaker + active health checks + proxy_cache (`71d885c`)
 - HTTP/2 upstream support (h2c + h2 over TLS) (`8c95acc`)
 - gRPC proxy: application/grpc + gRPC-Web + Trailer passthrough
 - auth_request subrequest authentication
-- Brotli + gzip dual compression (br preferred)
+- Brotli + zstd + gzip triple compression (priority: br > zstd > gzip), pre-compressed memory cache (`1a3d305`, `97b338f`)
 - sub_filter response body content replacement (`d830ba7`)
 - Cache `ignore_headers` to bypass Cache-Control/Set-Cookie (`98d8238`)
 - Expect: 100-continue correct handling (RFC 7231 §5.1.1) (`79a2f12`)
@@ -51,6 +54,18 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 - HSTS + force_https (`d1d30c7`)
 - 304 response body forced empty (RFC 7230 §3.3)
 - H2 RST flood protection (CVE-2023-44487): `h2_max_concurrent_reset_streams` (`4dd4062`)
+- CRLF injection protection: auto-filtering in proxy headers and WebSocket handshake (`dd0d1ba`, `31b1a66`)
+- Chunked body OOM protection: 16MB/chunk, 256MB total hard limit (`31b1a66`)
+- ReDoS protection: 1MB DFA `size_limit` for rewrite / rate_limit regex (`ce16d1d`, `22fd570`)
+- Sensitive path interception: phf O(1) matching for `.git` / `.env` etc. (`c1dca65`)
+- Automatic security headers: X-Content-Type-Options / X-Frame-Options / Referrer-Policy (`c1dca65`)
+- auth_request SSRF protection: block internal/loopback addresses (`62206a1`)
+- Admin API security: constant-time token comparison, request line length limit (`042bb38`)
+- WebSocket connection limit: lock-free CAS counter (`74e03bc`)
+- `proxy_next_upstream`: fine-grained retry conditions error/timeout/http_502-504 (`c597309`)
+- `proxy_hide_header`: hide upstream response headers (`c597309`)
+- IP access control: `allow` / `deny` CIDR whitelist/blacklist, location-level (`c597309`)
+- `real_ip` module: trusted proxy CIDR validation + recursive X-Forwarded-For parsing (`c597309`)
 
 ### Performance Architecture
 - SO_REUSEPORT multi-core scaling: each worker thread independently binds, kernel load-balances (`3de171b`)
@@ -98,14 +113,11 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 
 | Feature | Nginx Equivalent | Description |
 |---------|-----------------|-------------|
-| `proxy_next_upstream` | `proxy_next_upstream` | Fine-grained retry conditions: error / timeout / http_502 / http_503 / http_504 / non_idempotent |
-| `proxy_hide_header` | `proxy_hide_header` | Hide upstream response headers (X-Powered-By / Server, etc.), complements `add_headers` |
-| IP access control | `allow` / `deny` | IP / CIDR whitelist/blacklist, location-level |
-| `limit_req` | `limit_req` | Request rate limiting: token bucket + burst buffer + nodelay mode, anti-CC |
-| `real_ip` | `set_real_ip_from` | Extract real client IP from X-Forwarded-For behind multi-layer proxies |
-| `error_page` | `error_page` | Custom error pages (404 / 502 / 503, etc.), supports internal redirect |
+| `limit_req` burst | `limit_req burst=N nodelay` | Token bucket burst buffer + nodelay mode |
+| `error_page` internal redirect | `error_page` | Custom error pages with internal redirect (`=` prefix to change status code) |
 | Graceful shutdown | — | Wait for active connections to complete before exit, essential for rolling deployments |
 | TCP/UDP L4 proxy | `stream {}` module | Raw byte forwarding, no protocol parsing, supports database/SSH/any TCP proxy |
+| Windows TransmitFile | — | Zero-copy file transfer on Windows |
 
 ### Medium Priority
 
@@ -154,4 +166,4 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 
 ---
 
-*Last updated: 2026-04-06*
+*Last updated: 2026-05-28*

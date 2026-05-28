@@ -20,13 +20,13 @@ Sweety is a high-performance, multi-site web server written in Rust, aiming to c
 ### Site Features
 | Feature | Description |
 |---------|-------------|
-| Static Files | In-memory cache, Range, gzip/brotli compression |
+| Static Files | In-memory cache (≤ 64KB with pre-compressed gz/br/zst), fd cache, Range, sendfile(2) zero-copy, inotify eviction |
 | FastCGI/PHP | Connection pool, Unix socket/TCP, response cache |
 | Reverse Proxy | HTTP/1.1 + HTTP/2 upstream, connection pool, circuit breaker, load balancing |
 | gRPC Proxy | Transparent gRPC/gRPC-Web forwarding |
 | WebSocket | Forward proxy WS/WSS |
 | auth_request | Subrequest authentication (equivalent to Nginx auth_request) |
-| Rate Limiting | IP or Header-based request rate limiting |
+| Rate Limiting | 5-dimension token bucket (IP / path / IP+path / header / UA) |
 | Rewrite | Regex URL rewriting (last / break / redirect / permanent) |
 | Error Pages | Custom `error_pages` |
 | HTTPS Redirect | `force_https = true` |

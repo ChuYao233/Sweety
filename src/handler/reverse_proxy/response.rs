@@ -16,14 +16,25 @@ static HOP_BY_HOP_SET: phf::Set<&'static str> = phf::phf_set! {
     "host", "proxy-connection",
 };
 
-/// 检查头名是否为 hop-by-hop（大小写不敏感，用栈 buffer 转小写）
+/// 检查头名是否为 hop-by-hop（大小写不敏感，栈 buffer 转小写）
+///
+/// 热路径优化：
+/// - 栈 buffer 零分配，`to_ascii_lowercase` 是纯 ALU 操作
+/// - phf 完美哈希 O(1) 查找（Nginx 用数组线性扫描）
+/// - 输入来自 HTTP 解析器，保证 ASCII，`from_utf8` 永远成功但保留安全检查
 #[inline]
 pub fn is_hop_by_hop(name: &str) -> bool {
-    let mut buf = [0u8; 32];
     let b = name.as_bytes();
+    // hop-by-hop 头名最长 "proxy-authorization" = 19 字节，32 字节绰绰有余
     if b.len() > 32 { return false; }
+    let mut buf = [0u8; 32];
     for (i, &c) in b.iter().enumerate() { buf[i] = c.to_ascii_lowercase(); }
-    let lower = unsafe { std::str::from_utf8_unchecked(&buf[..b.len()]) };
+    // 安全修复：使用安全的 from_utf8 替代 from_utf8_unchecked
+    // 输入来自 HTTP 头名（ASCII），此检查零开销（分支预测近 100% 命中）
+    let lower = match std::str::from_utf8(&buf[..b.len()]) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
     HOP_BY_HOP_SET.contains(lower)
 }
 
@@ -75,9 +86,18 @@ fn sub_filter_regex(pattern: &str) -> Option<regex::Regex> {
     if let Some(re) = map.get(pattern) {
         return Some(re.clone());
     }
-    match regex::Regex::new(pattern) {
+    // ReDoS 防护：限制 DFA 大小 1 MiB，防止恶意正则导致 CPU 耗尽
+    // 性能：仅首次编译时检查，缓存后零开销
+    match regex::RegexBuilder::new(pattern)
+        .size_limit(1 << 20)      // 编译后 NFA 大小上限 1 MiB
+        .dfa_size_limit(1 << 20)   // DFA 缓存上限 1 MiB
+        .build()
+    {
         Ok(re) => { map.insert(pattern.to_string(), re.clone()); Some(re) }
-        Err(_) => None,
+        Err(e) => {
+            tracing::warn!("sub_filter 正则编译失败（可能过于复杂）: {} → {}", pattern, e);
+            None
+        }
     }
 }
 

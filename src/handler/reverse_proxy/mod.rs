@@ -153,7 +153,9 @@ pub async fn handle_sweety(
     let sub_filter           = &location.sub_filter;
 
     // ── proxy_cache 查询（读缓存，O(1) 内存匹配） ─────────────────────
-    let cache_key = CacheKey::new(method, upstream_host, path);
+    // 安全修复：缓存键使用客户端请求的 Host（非 upstream_host），防止多域名共享上游时缓存投毒
+    // 攻击场景：evil.com 和 good.com 映射到同一 upstream_host 时，用 upstream_host 做 key 会跨域名命中
+    let cache_key = CacheKey::new(method, client_host, path);
     let proxy_cache: Option<std::sync::Arc<ProxyCache>> = site.proxy_cache_arc.clone();
 
     if let Some(ref cache) = proxy_cache {
@@ -171,9 +173,13 @@ pub async fn handle_sweety(
                         resp.headers_mut().insert(name, val);
                     }
                 }
-                // X-Cache: HIT 头标识缓存命中（与 Nginx 行为一致）
+                // X-Cache / X-Cache-Status 是业界通用缓存状态头（Varnish / Nginx / CDN 均使用）
                 resp.headers_mut().insert(
                     HeaderName::from_static("x-cache"),
+                    HeaderValue::from_static("HIT"),
+                );
+                resp.headers_mut().insert(
+                    HeaderName::from_static("x-cache-status"),
                     HeaderValue::from_static("HIT"),
                 );
                 return resp;
@@ -352,12 +358,20 @@ fn cache_rule_regex(pattern: &str) -> Option<regex::Regex> {
     if let Some(re) = map.get(pattern) {
         return Some(re.clone());
     }
-    match regex::Regex::new(pattern) {
+    // ReDoS 防护：限制 DFA 大小 1 MiB，防止恶意正则导致 CPU 耗尽
+    match regex::RegexBuilder::new(pattern)
+        .size_limit(1 << 20)
+        .dfa_size_limit(1 << 20)
+        .build()
+    {
         Ok(re) => {
             map.insert(pattern.to_string(), re.clone());
             Some(re)
         }
-        Err(_) => None,
+        Err(e) => {
+            tracing::warn!("cache_rule 正则编译失败（可能过于复杂）: {} → {}", pattern, e);
+            None
+        }
     }
 }
 

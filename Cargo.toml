@@ -183,4 +183,4 @@ lto             = "fat"
 codegen-units   = 1
 panic           = "abort"
 strip           = true
-overflow-checks = false   # release 构建禁用整数溢出检查，等价 C 发布模式
+overflow-checks = true    # 安全修复：启用整数溢出检查，防止溢出导致缓冲区分配不足

@@ -363,8 +363,6 @@ async fn send_recv_pooled(
     }
     req.push_str("\r\n");
 
-    debug!("→ {} {} Host:{} chunked={} expect_continue={}", method, path, host, use_chunked, has_expect_continue);
-
     let mut conn = conn;
 
     // ── 发送请求头 ──────────────────────────────────────────────────────────
@@ -551,6 +549,7 @@ async fn send_recv_pooled(
             // chunked 上游：解码后用 BytesMut.freeze() 零拷贝转 Bytes
             // 读完整个 chunked 流后把连接归还到池
             // spawn_local：连接归还在同一 worker 线程执行，正确写回 thread_local ConnPool
+            const STREAM_CHUNKED_MAX_CHUNK: usize = 16 * 1024 * 1024; // 16 MiB per chunk
             tokio::task::spawn_local(async move {
                 let mut reader = buf;
                 let mut size_line = String::new();
@@ -561,8 +560,11 @@ async fn send_recv_pooled(
                         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => { ok = false; break; }
                         Ok(Ok(_)) => {}
                     }
+                    // Prevent unbounded size_line allocation from malicious upstream
+                    if size_line.len() > 64 { ok = false; break; }
                     let size_str = size_line.trim().split(';').next().unwrap_or("0");
                     let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+                    if chunk_size > STREAM_CHUNKED_MAX_CHUNK { ok = false; break; }
                     if chunk_size == 0 {
                         // 0-chunk: 读完结束行
                         let mut trailer = String::new();
@@ -674,7 +676,7 @@ async fn send_recv_pooled(
                 Ok(n) => {
                     b.extend_from_slice(&tmp[..n]);
                     if b.len() > BUFFERED_MAX_BODY {
-                        tracing::warn!("上游 EOF 模式响应体超过 {}B 限制，截断", BUFFERED_MAX_BODY);
+                        tracing::warn!("upstream EOF body exceeded {}B limit, truncated", BUFFERED_MAX_BODY);
                         break;
                     }
                 }
@@ -785,6 +787,8 @@ where R: AsyncRead + Unpin {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
+        // Prevent unbounded allocation from malicious upstream (no newline)
+        if size_line.len() > 64 { break; }
         // 去掉可能的 chunk extension（分号后面的部分）
         let size_str = size_line.trim().split(';').next().unwrap_or("0");
         let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
@@ -819,7 +823,7 @@ where R: AsyncRead + Unpin {
         // 安全限制：单个 chunk 声明超过 64MB 或累积超过 256MB 则截断
         if chunk_size > CHUNKED_MAX_CHUNK || body.len().saturating_add(chunk_size) > CHUNKED_MAX_BODY {
             tracing::warn!(
-                "上游 chunked body 超过大小限制（chunk_size={}, total={}），截断",
+                "upstream chunked body exceeded size limit (chunk_size={}, total={}), truncated",
                 chunk_size, body.len()
             );
             break;

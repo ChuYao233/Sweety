@@ -496,8 +496,12 @@ fn make_redirect_resp(location: &str, status: StatusCode) -> WebResponse {
 
 /// 检查重定向目标是否安全（防止开放重定向）
 ///
-/// 安全目标：以 '/' 开头的绝对路径（不含 '//'），或相对路径
-/// 不安全目标：以 scheme:// 开头的外部 URL，或以 '//' 开头的协议相对 URL
+/// 安全目标：
+/// - 以 '/' 开头的绝对路径（不含 '//'）
+/// - http:// 或 https:// 开头的 URL（配置驱动，管理员控制）
+/// 不安全目标：
+/// - 以 '//' 开头的协议相对 URL（如 //evil.com/path）
+/// - javascript:、data:、vbscript: 等危险 scheme
 #[inline]
 fn is_safe_redirect_target(target: &str) -> bool {
     let trimmed = target.trim();
@@ -508,7 +512,11 @@ fn is_safe_redirect_target(target: &str) -> bool {
     if trimmed.starts_with("//") {
         return false;
     }
-    // 拒绝包含 scheme 的绝对 URL（如 http:// https:// javascript:）
+    // 允许 http(s):// — 所有调用方的 URL 都是配置驱动（force_https / return 指令）
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        return true;
+    }
+    // 拒绝其他 scheme（javascript:、data:、vbscript: 等）
     if let Some(colon_pos) = trimmed.find(':') {
         let before_colon = &trimmed[..colon_pos];
         if before_colon.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') {

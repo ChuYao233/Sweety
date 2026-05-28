@@ -126,6 +126,7 @@ pub async fn handle_sweety(
             })
     );
 
+
     // 应用 proxy_set_headers：重写指定请求头（支持 $remote_addr/$host/$scheme/$request_uri 变量）
     for h in &location.proxy_set_headers {
         let val = h.value
@@ -144,7 +145,10 @@ pub async fn handle_sweety(
     let request_body = ctx.take_body_ref();
 
     // ── Location 配置 ─────────────────────────────────────────────────────
-    let strip_cookie_secure  = location.strip_cookie_secure;
+    // 自动检测：上游 TLS + 客户端非 TLS → 自动剥离 Set-Cookie 的 Secure 标志
+    // 否则浏览器通过 HTTP 访问时不会回传 Secure cookie，导致上游认证失败
+    let client_is_tls = ctx.req().body().is_tls();
+    let strip_cookie_secure  = location.strip_cookie_secure || (node.tls && !client_is_tls);
     let proxy_cookie_domain  = location.proxy_cookie_domain.as_deref();
     let proxy_redirect_from  = location.proxy_redirect_from.as_deref();
     let proxy_redirect_to    = location.proxy_redirect_to.as_deref();

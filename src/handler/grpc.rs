@@ -102,16 +102,26 @@ pub async fn handle_sweety(
     }
 
     // ── 读取请求体（gRPC 帧，全量收集）──────────────────────────────────
+    let max_body = (ctx.state().cfg.load().global.client_max_body_size as usize) * 1024 * 1024;
     let cap = ctx.req().headers()
         .get(sweety_web::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
-    let mut req_body = Vec::with_capacity(cap);
+    if max_body > 0 && cap > max_body {
+        return grpc_error(StatusCode::BAD_REQUEST, 8, "request body too large");
+    }
+    let mut req_body = Vec::with_capacity(cap.min(16 * 1024 * 1024));
     let mut body_stream = ctx.body_borrow_mut();
     while let Some(chunk) = body_stream.next().await {
         match chunk {
-            Ok(b) => req_body.extend_from_slice(b.as_ref()),
+            Ok(b) => {
+                req_body.extend_from_slice(b.as_ref());
+                if max_body > 0 && req_body.len() > max_body {
+                    drop(body_stream);
+                    return grpc_error(StatusCode::BAD_REQUEST, 8, "request body too large");
+                }
+            }
             Err(_) => break,
         }
     }

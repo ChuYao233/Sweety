@@ -65,6 +65,26 @@ impl ParsedRequest {
 
 /// 启动管理 HTTP API 服务器（独立 TCP listener，不影响主服务器性能）
 pub async fn start(ctx: AdminContext) -> anyhow::Result<()> {
+    // Security: warn when binding admin API to a non-loopback address
+    let is_loopback = ctx.listen_addr.starts_with("127.")
+        || ctx.listen_addr.starts_with("localhost")
+        || ctx.listen_addr.starts_with("[::1]");
+    if !is_loopback {
+        if ctx.token.is_empty() {
+            tracing::warn!(
+                "admin API bound to non-loopback address {} without admin_token configured; \
+                 all non-health-check requests will be rejected. \
+                 Set admin_token or bind to 127.0.0.1",
+                ctx.listen_addr
+            );
+        } else {
+            tracing::warn!(
+                "admin API bound to non-loopback address {}, \
+                 ensure network-level protection (firewall/VPN) is in place",
+                ctx.listen_addr
+            );
+        }
+    }
     let listener = TcpListener::bind(&ctx.listen_addr).await?;
     info!("管理 API 监听: http://{}", ctx.listen_addr);
 

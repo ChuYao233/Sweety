@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 use crate::config::model::LocationConfig;
 use crate::middleware::access_control::CompiledAccessRule;
@@ -67,11 +67,11 @@ impl CompiledLocation {
     /// 从 LocationConfig 构建，预编译正则并确定类型
     pub fn new(cfg: LocationConfig) -> Self {
         let (kind, regex) = if let Some(p) = cfg.path.strip_prefix("~* ") {
-            let re = Regex::new(&format!("(?i){}", p)).ok();
+            let re = RegexBuilder::new(&format!("(?i){}", p)).size_limit(1 << 20).build().ok();
             let k = re.clone().map(LocationKind::Regex).unwrap_or(LocationKind::Prefix);
             (k, re)
         } else if let Some(p) = cfg.path.strip_prefix("~ ") {
-            let re = Regex::new(p).ok();
+            let re = RegexBuilder::new(p).size_limit(1 << 20).build().ok();
             let k = re.clone().map(LocationKind::Regex).unwrap_or(LocationKind::Prefix);
             (k, re)
         } else if let Some(p) = cfg.path.strip_prefix("= ") {

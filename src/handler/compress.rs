@@ -68,8 +68,9 @@ fn parse_accept_encoding(header: &str) -> AcceptEncoding {
         }
     }
 
-    // 未显式设置的编码：用 wildcard 填充，wildcard 也未设置则默认 1.0
-    let default_q = if wildcard >= 0.0 { wildcard } else { 1.0 };
+    // 未显式设置的编码：用 wildcard 填充；wildcard 也未设置则默认 0（不接受）
+    // 修正：之前 default_q=1.0 导致客户端只发 gzip 时 zstd/br 也被当作可用
+    let default_q = if wildcard >= 0.0 { wildcard } else { 0.0 };
     AcceptEncoding {
         gzip:   if gz  >= 0.0 { gz  } else { default_q },
         brotli: if br  >= 0.0 { br  } else { default_q },

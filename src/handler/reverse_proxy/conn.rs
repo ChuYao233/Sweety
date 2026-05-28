@@ -342,11 +342,12 @@ async fn send_recv_pooled(
             || k.eq_ignore_ascii_case("expect") {
             continue;
         }
-        req.push_str(k); req.push_str(": "); req.push_str(v); req.push_str("\r\n");
+        // CRLF 注入防护：过滤 header name/value 中的 \r \n，防止 HTTP Request Smuggling
+        push_safe_header(&mut req, k, v);
     }
-    req.push_str("X-Real-IP: "); req.push_str(client_ip); req.push_str("\r\n");
-    req.push_str("X-Forwarded-For: "); req.push_str(client_ip); req.push_str("\r\n");
-    req.push_str("X-Forwarded-Proto: "); req.push_str(client_proto); req.push_str("\r\nConnection: keep-alive\r\n");
+    req.push_str("X-Real-IP: "); push_sanitized_value(&mut req, client_ip); req.push_str("\r\n");
+    req.push_str("X-Forwarded-For: "); push_sanitized_value(&mut req, client_ip); req.push_str("\r\n");
+    req.push_str("X-Forwarded-Proto: "); push_sanitized_value(&mut req, client_proto); req.push_str("\r\nConnection: keep-alive\r\n");
     if has_body {
         if use_chunked {
             req.push_str("Transfer-Encoding: chunked\r\n");
@@ -459,12 +460,26 @@ async fn send_recv_pooled(
     let mut response_headers: Vec<(String, String)> = Vec::with_capacity(24);
     // 复用 line 缓冲，避免每行都堆分配
     let mut line = String::with_capacity(128);
+    // 安全限制：最大 200 个响应头（Nginx 默认 large_client_header_buffers 不限制上游响应头数，Sweety 更安全）
+    // 单行最大 16 KiB（超长则跳过该头，不终止解析，保持协议兼容）
+    const RESP_MAX_HEADERS: usize = 200;
+    const RESP_MAX_LINE_LEN: usize = 16384;
+    let mut header_count: usize = 0;
     loop {
+        if header_count >= RESP_MAX_HEADERS {
+            tracing::warn!("上游响应头超过 {} 个上限，截断解析", RESP_MAX_HEADERS);
+            break;
+        }
         line.clear();
         match buf.read_line(&mut line).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err((e.into(), true)),
+        }
+        // 超长行：跳过该头（不终止解析，保持协议兼容）
+        if line.len() > RESP_MAX_LINE_LEN {
+            header_count += 1;
+            continue;
         }
         let trimmed = line.trim();
         if trimmed.is_empty() { break; }
@@ -485,6 +500,7 @@ async fn send_recv_pooled(
                 resp_conn_close = true;
             }
             response_headers.push((k, v));
+            header_count += 1;
         }
     }
 
@@ -879,3 +895,35 @@ pub async fn probe_health(addr: &UpstreamAddr, path: &str, use_tls: bool, sni: &
 
 // 让泛型约束更简洁
 use tokio::io::{AsyncRead, AsyncWrite};
+
+/// CRLF 注入防护：将值中的 \r \n 替换为空格后追加到 buf
+///
+/// 性能设计：
+/// - 快路径（99.99% 命中）：值不含控制字符 → 直接 push_str，零拷贝
+/// - 慢路径：逐字节替换 \r \n 为空格（栈上操作，无堆分配）
+/// - 比 Nginx 更安全：Nginx proxy_set_header 不过滤 CRLF
+#[inline(always)]
+fn push_sanitized_value(buf: &mut String, val: &str) {
+    // 快路径：绝大多数正常值不含控制字符
+    if !val.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
+        buf.push_str(val);
+        return;
+    }
+    // 慢路径：逐字节过滤
+    for &b in val.as_bytes() {
+        if b == b'\r' || b == b'\n' {
+            buf.push(' ');
+        } else {
+            buf.push(b as char);
+        }
+    }
+}
+
+/// 安全地追加一行 header（name: value\r\n），过滤 CRLF 注入
+#[inline(always)]
+fn push_safe_header(buf: &mut String, name: &str, value: &str) {
+    push_sanitized_value(buf, name);
+    buf.push_str(": ");
+    push_sanitized_value(buf, value);
+    buf.push_str("\r\n");
+}

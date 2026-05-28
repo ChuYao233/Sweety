@@ -44,6 +44,35 @@ impl WsRegistry {
         counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// 原子 CAS 增加计数（仅当未超过上限时成功）
+    ///
+    /// 性能优于 Nginx limit_conn：无锁 CAS 操作，不阻塞其他连接
+    /// 返回 true 表示成功增加，false 表示已达上限
+    pub async fn inc_if_under(&self, site_name: &str, max: u64) -> bool {
+        let map = self.sites.read().await;
+        if let Some(counter) = map.get(site_name) {
+            loop {
+                let cur = counter.load(Ordering::Relaxed);
+                if cur >= max { return false; }
+                if counter.compare_exchange_weak(
+                    cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed
+                ).is_ok() {
+                    return true;
+                }
+            }
+        }
+        drop(map);
+        // 首次插入：写锁路径（仅新站点第一次连接触发）
+        let mut map = self.sites.write().await;
+        let counter = map
+            .entry(site_name.to_string())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+        let cur = counter.load(Ordering::Relaxed);
+        if cur >= max { return false; }
+        counter.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     /// 减少指定站点的活跃连接计数
     pub async fn dec(&self, site_name: &str) {
         let map = self.sites.read().await;
@@ -75,7 +104,23 @@ pub async fn handle_sweety(
     ctx: &WebContext<'_, AppState>,
     location: &LocationConfig,
 ) -> WebResponse {
-    let _max_conn = location.max_connections.unwrap_or(10000);
+    let max_conn = location.max_connections.unwrap_or(10000) as u64;
+
+    // 并发连接数限制：原子 CAS 无锁检查，性能优于 Nginx limit_conn 的互斥锁
+    if max_conn > 0 {
+        let site_name = ctx.req().uri().authority()
+            .map(|a| a.as_str())
+            .or_else(|| ctx.req().headers().get("host").and_then(|v| v.to_str().ok()))
+            .unwrap_or("_default");
+        if !ctx.state().ws_registry.inc_if_under(site_name, max_conn).await {
+            warn!("WebSocket 连接数已达上限 {} （站点: {}）", max_conn, site_name);
+            let mut resp = WebResponse::new(ResponseBody::from(
+                crate::handler::error_page::build_default_html(503)
+            ));
+            *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            return resp;
+        }
+    }
 
     // 验证 WebSocket 握手请求头
     let handshake_result = http_ws::handshake(ctx.req().method(), ctx.req().headers());

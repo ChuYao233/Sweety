@@ -9,6 +9,7 @@ use crate::dispatcher::vhost::VHostRegistry;
 use crate::handler::reverse_proxy::pool::ConnPool;
 use crate::handler::reverse_proxy::upstream_h2::H2UpstreamPools;
 use crate::handler::fastcgi_pool::FcgiPool;
+use crate::handler::websocket::WsRegistry;
 use crate::middleware::metrics::GlobalMetrics;
 use super::tls::SniResolver;
 
@@ -40,6 +41,8 @@ pub struct AppState {
     pub fcgi_pool: Arc<FcgiPool>,
     /// HTTP/3 QUIC 端口集合（用于注入 Alt-Svc 响应头）
     pub h3_ports: Arc<HashSet<u16>>,
+    /// WebSocket 连接注册表（按站点隔离，无锁 CAS 并发计数）
+    pub ws_registry: Arc<WsRegistry>,
 }
 
 /// active_requests RAII 守卫：Drop 时自动调用 metrics.dec_active()

@@ -189,6 +189,7 @@ impl SweetyServer {
                 cfg.global.fastcgi_connect_timeout,
                 cfg.global.fastcgi_read_timeout,
             )),
+            ws_registry: Arc::new(crate::handler::websocket::WsRegistry::new()),
         };
 
         // 第三步：构建 sweety-web App

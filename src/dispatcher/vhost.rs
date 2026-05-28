@@ -411,6 +411,12 @@ mod tests {
             force_https: true,
             error_pages: std::collections::HashMap::new(),
             proxy_cache: None,
+            compress: Default::default(),
+            php_fastcgi: None,
+            acme_email: None,
+            real_ip: None,
+            proxy_protocol: false,
+            preset: None,
         }
     }
 

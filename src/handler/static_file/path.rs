@@ -74,7 +74,7 @@ async fn try_files_resolve_inner(
     TryFilesResult::NotFound
 }
 
-async fn find_index(dir: &Path, index_files: &[String]) -> Option<PathBuf> {
+pub(super) async fn find_index(dir: &Path, index_files: &[String]) -> Option<PathBuf> {
     for name in index_files {
         let candidate = dir.join(name);
         if candidate.is_file() {

@@ -210,6 +210,14 @@ pub fn parse(buf: &[u8]) -> Result<(ProxyHeader, usize), ParseError> {
     if buf.len() >= 16 && buf[..12] == V2_SIGNATURE {
         return parse_v2(buf);
     }
+    // 部分 v2 签名（前缀匹配但长度不足 16 字节）→ 需要更多数据
+    if buf.len() < 16 && buf.len() >= 12 && buf[..12] == V2_SIGNATURE {
+        return Err(ParseError::Incomplete);
+    }
+    // 更短的部分 v2 签名前缀匹配 → 也需要更多数据
+    if buf.len() < 12 && V2_SIGNATURE.starts_with(buf) {
+        return Err(ParseError::Incomplete);
+    }
 
     // 检测 v1 前缀 "PROXY "
     if buf.starts_with(b"PROXY ") {

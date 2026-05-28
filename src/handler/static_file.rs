@@ -632,6 +632,7 @@ mod tests {
     #[test]
     fn test_resolve_safe_path_normal() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), b"hello").unwrap();
         let result = resolve_safe_path(dir.path(), "/index.html");
         assert!(result.is_some());
     }
@@ -654,14 +655,14 @@ mod tests {
     async fn test_find_index_found() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), b"hi").unwrap();
-        let result = find_index(dir.path(), &["index.html".to_string()]).await;
+        let result = super::path::find_index(dir.path(), &["index.html".to_string()]).await;
         assert!(result.is_some());
     }
 
     #[tokio::test]
     async fn test_find_index_not_found() {
         let dir = tempfile::tempdir().unwrap();
-        let result = find_index(dir.path(), &["index.html".to_string()]).await;
+        let result = super::path::find_index(dir.path(), &["index.html".to_string()]).await;
         assert!(result.is_none());
     }
 }

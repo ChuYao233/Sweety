@@ -340,7 +340,7 @@ mod tests {
             write_timeout: 60,
             retry: 0,
             retry_timeout: 0,
-            next_upstream_flags: super::retry::NextUpstreamFlags::DEFAULT,
+            next_upstream_flags: crate::handler::reverse_proxy::retry::NextUpstreamFlags::DEFAULT,
         }
     }
 
@@ -362,10 +362,11 @@ mod tests {
     }
 
     #[test]
-    fn test_all_unhealthy_returns_none() {
+    fn test_all_unhealthy_degrades_to_any() {
+        // 全部 unhealthy 时降级选任意节点（与 Nginx 行为一致）
         let pool = make_pool(LoadBalanceStrategy::RoundRobin, &[("a:80", 1)]);
         pool.nodes[0].mark_unhealthy();
-        assert!(pool.pick(None).is_none());
+        assert_eq!(pool.pick(None).unwrap().addr.as_str(), "a:80");
     }
 
     #[test]

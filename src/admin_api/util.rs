@@ -191,7 +191,8 @@ mod tests {
     fn test_cors_preflight() {
         let resp = cors_preflight_response();
         assert!(resp.contains("204"));
-        assert!(resp.contains("Access-Control-Allow-Origin"));
+        // 安全修复：Admin API 不应允许任意来源 CORS，已移除 Access-Control-Allow-Origin
+        assert!(!resp.contains("Access-Control-Allow-Origin"));
     }
 
     #[test]

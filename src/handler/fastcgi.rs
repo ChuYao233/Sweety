@@ -69,8 +69,14 @@ pub async fn handle_sweety(
                         resp.headers_mut().append(name, val);
                     }
                 }
+                // X-Cache / X-Cache-Status 是业界通用的缓存状态头
+                // WordPress 健康检查、Varnish、Nginx 缓存均使用此头
                 resp.headers_mut().insert(
-                    sweety_web::http::header::HeaderName::from_static("x-fastcgi-cache"),
+                    sweety_web::http::header::HeaderName::from_static("x-cache"),
+                    HeaderValue::from_static("HIT"),
+                );
+                resp.headers_mut().insert(
+                    sweety_web::http::header::HeaderName::from_static("x-cache-status"),
                     HeaderValue::from_static("HIT"),
                 );
                 return resp;
@@ -169,17 +175,20 @@ pub async fn handle_sweety(
         Vec::new()
     };
 
-    // ── REMOTE_ADDR：优先 X-Real-IP，再 X-Forwarded-For，最后直连 IP ─────
-    let remote_addr = ctx.req().headers()
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string())
-        .or_else(|| ctx.req().headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .map(|s| s.trim().to_string()))
-        .unwrap_or_else(|| peer_ip.clone());
+    // ── REMOTE_ADDR：使用 router 层 real_ip 中间件提取的可信客户端 IP ────
+    // 安全修复：不再无条件信任 X-Real-IP / X-Forwarded-For 头，
+    // 而是通过 real_ip 中间件的受信代理检查后提取（已在 router 层完成）。
+    // 此处从 site.real_ip 配置重新安全提取，与 router 行为一致。
+    let remote_addr = if let Some(ref rip) = site.real_ip {
+        let header_val = ctx.req().headers()
+            .get(rip.header_name())
+            .and_then(|v| v.to_str().ok());
+        rip.extract_real_ip(&peer.ip(), header_val)
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| peer_ip.clone())
+    } else {
+        peer_ip.clone()
+    };
 
     // ── CGI 参数（对标 Nginx /etc/nginx/fastcgi_params）─────────────────
     // 固定参数 + HTTP_* 动态头，预分配避免 realloc

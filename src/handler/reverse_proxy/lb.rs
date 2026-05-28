@@ -19,7 +19,7 @@ use super::circuit_breaker::CircuitBreaker;
 /// 单个上游节点运行时状态
 pub struct NodeState {
     pub addr: UpstreamAddr,
-    pub weight: u32,
+    pub weight: AtomicU32,
     /// 健康标志（1 = 健康，0 = 不健康）
     pub healthy: AtomicU32,
     /// 当前活跃连接数（least_conn 策略使用）
@@ -67,7 +67,7 @@ impl NodeState {
         });
         Self {
             addr: node.addr.clone(),
-            weight: node.weight,
+            weight: AtomicU32::new(node.weight),
             healthy: AtomicU32::new(1),
             active_connections: AtomicU32::new(0),
             fail_count: AtomicU32::new(0),
@@ -214,14 +214,14 @@ impl UpstreamPool {
             }
             LoadBalanceStrategy::Weighted => {
                 let total_weight: u32 = self.nodes.iter()
-                    .filter(|n| n.is_available()).map(|n| n.weight).sum();
+                    .filter(|n| n.is_available()).map(|n| n.weight.load(Ordering::Relaxed)).sum();
                 if total_weight == 0 {
                     return self.nodes.iter().find(|n| n.is_available()).cloned();
                 }
                 let target = (self.rr_counter.fetch_add(1, Ordering::Relaxed) as u32) % total_weight;
                 let mut cumulative = 0u32;
                 for node in self.nodes.iter().filter(|n| n.is_available()) {
-                    cumulative += node.weight;
+                    cumulative += node.weight.load(Ordering::Relaxed);
                     if target < cumulative { return Some(node.clone()); }
                 }
                 self.nodes.iter().filter(|n| n.is_available()).last().cloned()

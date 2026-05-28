@@ -183,6 +183,9 @@ fn apply_diff(old: &AppConfig, new: &AppConfig, ctx: &HotReloadContext) {
     // 不影响已建立连接的行为（h2_max_concurrent_streams 等连接级参数对新连接生效）
     ctx.cfg_swap.store(Arc::new(new.clone()));
 
+    // 清空 rewrite 条件的文件元数据缓存（配置变更后 root 可能改变）
+    crate::dispatcher::rewrite::clear_meta_cache();
+
     // log_level 热更新：通过全局 tracing reload handle 动态切换过滤级别
     if old.global.log_level != new.global.log_level {
         if let Err(e) = set_log_level(&new.global.log_level) {

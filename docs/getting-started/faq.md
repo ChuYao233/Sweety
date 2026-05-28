@@ -138,3 +138,16 @@ max_connections    = 50000
 ulimit -n 65535
 # 或在 /etc/security/limits.conf 中配置
 ```
+
+### 静态文件缓存调优
+
+CDN 或多站点场景下，默认缓存参数可能不够用：
+
+```toml
+[global]
+open_file_cache_max      = 500000  # 提高条目上限（默认 200000）
+open_file_cache_total_mb = 1024    # 提高内存上限到 1GB（默认 512MB）
+open_file_cache_inactive = 120     # 延长不活跃淘汰时间（默认 60s）
+```
+
+详见 [全局配置 → 静态文件缓存](../configuration/global.md#静态文件缓存)。

@@ -27,7 +27,7 @@ The underlying HTTP stack is forked from [xitca-web](https://github.com/HFQR/xit
 
 ### Request Handling
 
-- 📁 **Static Files** — in-memory cache + Range + ETag/Last-Modified + `try_files` + pread streaming
+- 📁 **Static Files** — in-memory cache (configurable `open_file_cache max=200000`) + fd cache + Range + ETag/Last-Modified + `try_files` + sendfile(2) zero-copy (Linux/macOS) + pread streaming
 - 🐘 **PHP / FastCGI** — Unix socket / TCP connection pool + `fastcgi_cache`; correct HTTP/2 Cookie merging (RFC 7540 §8.1.2.5), compatible with WordPress / Laravel
 - 🔄 **Reverse Proxy** — round-robin / weighted / least-conn / IP hash + connection pool + active health checks + `proxy_cache`
 - 📡 **gRPC Proxy** — automatic `application/grpc` + Trailer handling
@@ -45,12 +45,16 @@ The underlying HTTP stack is forked from [xitca-web](https://github.com/HFQR/xit
 - 🚀 **H2 Per-Connection Writer Loop** — dedicated writer task per connection, HEADERS-priority + round-robin DATA scheduling, eliminates head-of-line blocking
 - ⚖️ **Write Fairness** — fixed 16KB chunk round-robin, prevents large downloads from starving small requests
 - 💤 **Zero CPU Idle Spin** — writer loop is `tokio::select!` event-driven, no busy spin
+- 📦 **Zero-Copy I/O** — `sendfile(2)` on Linux/macOS for H1 non-TLS; `pread` + H2 flow-control backpressure for TLS/H2/H3
+- 🗂️ **Smart File Cache** — small-file content cache with pre-compressed variants (gzip/brotli/zstd), `min_uses` anti-pollution, inotify real-time invalidation
 
-### Reliability
+### Reliability & Security
 
 - 🛡️ **Circuit Breaker** — three-state machine (Closed → Open → Half-Open), more precise than Nginx `max_fails`
 - 🚦 **5-Dimension Rate Limiting** — IP / path / IP+path / header / User-Agent token buckets
 - 🔥 **Hot Reload** — reload config without dropping existing connections (`nginx -s reload` equivalent)
+- 🔒 **Security Hardening** — CRLF injection filtering, chunked body OOM protection (16MB/chunk, 256MB total), ReDoS prevention (`regex size_limit`), sensitive path interception, automatic security headers (HSTS/CSP/X-Frame-Options)
+- 🌐 **Real IP Extraction** — trusted proxy CIDR validation, recursive X-Forwarded-For parsing (Nginx `set_real_ip_from` equivalent)
 
 ### Operations
 

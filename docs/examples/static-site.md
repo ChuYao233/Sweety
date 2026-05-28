@@ -139,7 +139,9 @@ cache_control = "public, max-age=86400, s-maxage=604800"
 
 ## 性能注意
 
-- 小文件（< 512KB）自动内存缓存，热请求无磁盘 I/O
-- 支持 `Range` 请求（视频/音频断点续传）
-- 自动协商 `gzip`/`brotli` 压缩（基于 `Accept-Encoding`）
-- 大文件（> 512KB）使用 `pread` 流式传输，避免一次性加载到内存
+- 小文件（≤ 64KB）自动内存缓存（含预压缩 gzip/brotli/zstd 变体），热请求零 syscall
+- 大文件使用 fd 缓存 + sendfile(2) 零拷贝（Linux/macOS H1 非 TLS）或 pread 流式传输
+- 支持 `Range` 请求（视频/音频断点续传），内存缓存命中时直接 slice
+- 自动协商 `gzip`/`brotli`/`zstd` 压缩（基于 `Accept-Encoding`）
+- 文件变更通过 inotify/kqueue 实时淘汰缓存，无延迟
+- 缓存参数可在 `[global]` 中调整，详见 [全局配置 → 静态文件缓存](../configuration/global.md#静态文件缓存)

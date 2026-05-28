@@ -37,6 +37,13 @@ zstd         = true    # 启用 zstd（默认 true）
 zstd_level   = 3       # 1-22，默认 3（极速）
 min_length   = 1       # 触发压缩的最小文件大小（KB）
 
+# ─── 静态文件缓存 ─────────────────────────────────────────────────
+# 等价 Nginx: open_file_cache max=200000 inactive=60s;
+#             open_file_cache_min_uses 2;
+open_file_cache_max      = 200000  # 最大缓存条目数
+open_file_cache_inactive = 60      # 不活跃淘汰时间（秒）
+open_file_cache_total_mb = 512     # 内容缓存总量上限（MB）
+
 # ─── HTTP/2 ─────────────────────────────────────────────────────
 h2_max_concurrent_streams       = 128   # 单连接最大并发流
 h2_max_pending_per_conn         = 0     # 最大排队请求数（0 = 不限制）
@@ -116,6 +123,30 @@ Sweety **原生支持三种压缩算法**，默认全部开启，按客户端 `A
 | `gzip` | `false` | 全局启用 gzip，等价 `nginx gzip on` |
 | `gzip_min_length` | `1` KB | 等价 `nginx gzip_min_length` |
 | `gzip_comp_level` | `6` | 压缩等级 1-9 |
+
+### 静态文件缓存
+
+内置三级文件缓存：
+
+| 层级 | 说明 |
+|------|------|
+| **内容缓存** | ≤ 64KB 文件全量缓存在内存，含预压缩 gz/br/zst 变体 |
+| **fd 缓存** | 大文件缓存文件描述符 + stat 元数据，避免重复 open |
+| **sendfile(2)** | Linux/macOS H1 非 TLS 零拷贝内核直传 |
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `open_file_cache_max` | `200000` | 最大缓存条目数（内容缓存 + fd 缓存） |
+| `open_file_cache_inactive` | `60` 秒 | 不活跃淘汰时间 |
+| `open_file_cache_total_mb` | `512` MB | 内容缓存内存总量上限 |
+
+**行为说明**：
+
+- 文件被访问 2 次后才写入内容缓存（`min_uses = 2`），防止缓存污染
+- 文件变更通过 inotify/kqueue 实时淘汰缓存条目
+- 首次缓存写入时自动生成 gzip/brotli/zstd 压缩版本
+
+CDN / 多站点场景建议调大 `open_file_cache_max`（如 `500000`）和 `open_file_cache_total_mb`（如 `1024`）。
 
 ### HTTP/2
 

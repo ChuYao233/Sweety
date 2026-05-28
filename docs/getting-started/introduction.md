@@ -20,13 +20,13 @@ Sweety 是用 Rust 编写的高性能多站点 Web 服务器，目标是兼顾 *
 ### 站点功能
 | 功能 | 说明 |
 |------|------|
-| 静态文件 | 内存缓存、Range、gzip/brotli 压缩 |
+| 静态文件 | 内存缓存（≤ 64KB 预压缩 gz/br/zst）、fd 缓存、Range、sendfile(2) 零拷贝、inotify 实时淘汰 |
 | FastCGI/PHP | 连接池、Unix socket/TCP、响应缓存 |
 | 反向代理 | HTTP/1.1 + HTTP/2 upstream、连接池、熔断器、负载均衡 |
 | gRPC 代理 | 透明转发 gRPC/gRPC-Web |
 | WebSocket | 正向代理 WS/WSS |
 | auth_request | 子请求鉴权（等价 Nginx auth_request） |
-| 速率限制 | 基于 IP 或 Header 的请求速率限制 |
+| 速率限制 | 五维度令牌桶（IP / 路径 / IP+路径 / Header / UA） |
 | Rewrite | 正则 URL 重写（last / break / redirect / permanent） |
 | 错误页 | 自定义 `error_pages` |
 | HTTPS 强制跳转 | `force_https = true` |

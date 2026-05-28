@@ -27,7 +27,7 @@
 
 ### 请求处理
 
-- 📁 **静态文件** — 内存缓存 + Range + ETag/Last-Modified + `try_files` + pread 流式传输
+- 📁 **静态文件** — 内存缓存（可配置 `open_file_cache max=200000`）+ fd 缓存 + Range + ETag/Last-Modified + `try_files` + sendfile(2) 零拷贝（Linux/macOS）+ pread 流式传输
 - 🐘 **PHP / FastCGI** — Unix Socket / TCP 连接池 + `fastcgi_cache`；正确处理 HTTP/2 Cookie 合并（RFC 7540 §8.1.2.5），兼容 WordPress / Laravel
 - 🔄 **反向代理** — 轮询 / 加权 / 最少连接 / IP 哈希 + 连接池 + 主动健康检查 + `proxy_cache`
 - 📡 **gRPC 代理** — 自动处理 `application/grpc` + Trailer
@@ -45,12 +45,16 @@
 - 🚀 **H2 Per-Connection Writer Loop** — 每连接单独 writer task，HEADERS 优先 + round-robin DATA 调度，消除 head-of-line blocking
 - ⚖️ **写公平性** — 固定 16KB chunk 轮转调度，防止大流下载饿死小请求
 - 💤 **零 CPU 空转** — writer loop 基于 `tokio::select!` 事件驱动，无 busy spin
+- 📦 **零拷贝 I/O** — Linux/macOS H1 非 TLS 走 `sendfile(2)`；TLS/H2/H3 走 `pread` + 流控背压
+- 🗂️ **智能文件缓存** — 小文件全量内存缓存 + 预压缩（gzip/brotli/zstd），`min_uses` 防缓存污染，inotify 实时淘汰
 
-### 可靠性
+### 可靠性与安全
 
 - 🛡️ **断路器** — 三状态机（Closed → Open → Half-Open），比 Nginx `max_fails` 更精确
 - 🚦 **五维度令牌桶限流** — IP / 路径 / IP+路径 / Header / User-Agent
 - 🔥 **配置热重载** — 不断开现有连接，等价 `nginx -s reload`
+- 🔒 **安全加固** — CRLF 注入过滤、chunked body OOM 防护（16MB/chunk、256MB 总量）、ReDoS 防护（`regex size_limit`）、敏感路径拦截、自动安全响应头（HSTS/CSP/X-Frame-Options）
+- 🌐 **Real IP 提取** — 受信代理 CIDR 验证、递归 X-Forwarded-For 解析（等价 Nginx `set_real_ip_from`）
 
 ### 运维
 

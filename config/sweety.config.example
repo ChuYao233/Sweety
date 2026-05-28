@@ -96,6 +96,25 @@ prometheus_path = "/metrics"
 # Log level: error / warn / info / debug / trace
 log_level = "info"
 
+# ─── Static File Cache ──────────────────────────────────────────────────────
+# Equivalent to Nginx: open_file_cache max=200000 inactive=60s;
+#                      open_file_cache_min_uses 2;
+
+# Max cached file entries (content cache + fd cache)
+# Higher values benefit CDN nodes or multi-site deployments
+# Equivalent to Nginx: open_file_cache max=N
+open_file_cache_max = 200000
+
+# Inactivity timeout for cached entries (seconds)
+# Entries not accessed within this period are eligible for eviction
+# Equivalent to Nginx: open_file_cache inactive=Ns
+open_file_cache_inactive = 60
+
+# Total memory limit for in-memory file content cache (MB)
+# Only files ≤ 64KB are cached in memory (with pre-compressed gzip/brotli/zstd variants)
+# Larger files use fd cache + sendfile(2)/pread streaming
+open_file_cache_total_mb = 512
+
 # ─── HTTP/2 Settings ──────────────────────────────────────────────────────────
 
 # Max concurrent streams per H2 connection

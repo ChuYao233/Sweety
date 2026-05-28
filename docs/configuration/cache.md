@@ -50,13 +50,34 @@ ignore_headers     = []
 
 ---
 
-## 静态文件内存缓存
+## 静态文件缓存
 
-静态文件自动缓存到内存（LRU），无需配置。缓存策略：
+静态文件自动缓存，无需手动开启。内置三级缓存：
 
-- 文件内容哈希匹配时返回 `304 Not Modified`
-- 支持 `ETag` 和 `Last-Modified`
-- 压缩版本（gzip/brotli）单独缓存
+| 层级 | 条件 | 说明 |
+|------|------|------|
+| **内容缓存** | 文件 ≤ 64KB | 全量缓存在内存，含预压缩 gzip/brotli/zstd 变体，命中时零 syscall |
+| **fd 缓存** | 文件 > 64KB | 缓存文件描述符 + stat 元数据，避免重复 open |
+| **sendfile(2)** | Linux/macOS H1 非 TLS | 内核零拷贝直传 |
+
+### 配置（`[global]`）
+
+```toml
+[global]
+open_file_cache_max      = 200000  # 最大缓存条目数（默认 200000）
+open_file_cache_inactive = 60      # 不活跃淘汰时间（秒，默认 60）
+open_file_cache_total_mb = 512     # 内容缓存内存上限（MB，默认 512）
+```
+
+### 行为
+
+- **min_uses = 2**：文件被访问 2 次后才写入内容缓存，防止缓存污染
+- **inotify 实时淘汰**：文件变更立即淘汰对应缓存条目
+- **预压缩**：首次缓存时自动生成 gzip/brotli/zstd 压缩版本
+- **ETag / Last-Modified**：命中时返回 `304 Not Modified`
+- **Range 请求**：内存缓存命中时直接 slice，零磁盘 I/O
+
+CDN / 多站点场景建议调大 `open_file_cache_max` 和 `open_file_cache_total_mb`。
 
 ---
 

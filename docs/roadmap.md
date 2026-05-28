@@ -22,13 +22,16 @@
 
 ### 请求处理
 - 静态文件：内存 LRU 缓存 + Range + ETag/Last-Modified + try_files (`3633cb7`)
-- sendfile(2) 零拷贝快路径：H1 非 TLS 场景内核直传 (`b6c4d09`, `767151b`)
+- sendfile(2) 零拷贝快路径：Linux + macOS H1 非 TLS 内核直传 (`b6c4d09`, `767151b`)
+- 静态文件缓存可配置化：`open_file_cache_max` / `open_file_cache_inactive` / `open_file_cache_total_mb`，对标 Nginx `open_file_cache`
+- `min_uses` 缓存污染防护：访问 ≥2 次才写入内容缓存，防止爬虫一次性污染（对标 Nginx `open_file_cache_min_uses`）
+- pread 流式传输：大文件异步分块读取 + H2 流控背压，替代 mmap
 - PHP/FastCGI：Unix Socket / TCP 连接池，fastcgi_cache，正确处理 HTTP/2 Cookie 合并（RFC 7540 §8.1.2.5）(`2fa052d`)
 - 反向代理：轮询 / 加权 / 最少连接 / IP 哈希 + 连接池 + 断路器 + 主动健康检查 + proxy_cache (`71d885c`)
 - HTTP/2 上游支持（h2c + h2 over TLS）(`8c95acc`)
 - gRPC 代理：application/grpc + gRPC-Web + Trailer 透传
 - auth_request 子请求鉴权
-- Brotli + gzip 双压缩（优先 br）
+- Brotli + zstd + gzip 三算法压缩（优先级 br > zstd > gzip），预压缩内存缓存 (`1a3d305`, `97b338f`)
 - sub_filter 响应体内容替换 (`d830ba7`)
 - cache `ignore_headers` 绕过 Cache-Control/Set-Cookie (`98d8238`)
 - Expect: 100-continue 正确处理（RFC 7231 §5.1.1）(`79a2f12`)
@@ -51,6 +54,18 @@
 - HSTS + force_https (`d1d30c7`)
 - 304 响应体强制为空（RFC 7230 §3.3）
 - H2 RST 洪水防护（CVE-2023-44487）：`h2_max_concurrent_reset_streams` (`4dd4062`)
+- CRLF 注入防护：反代头部、WebSocket 握手头自动过滤 (`dd0d1ba`, `31b1a66`)
+- chunked body OOM 防护：16MB/chunk、256MB 总量硬上限 (`31b1a66`)
+- ReDoS 防护：rewrite / rate_limit 正则 1MB DFA `size_limit` (`ce16d1d`, `22fd570`)
+- 敏感路径拦截：phf O(1) 匹配 `.git` / `.env` 等 (`c1dca65`)
+- 自动安全响应头：X-Content-Type-Options / X-Frame-Options / Referrer-Policy (`c1dca65`)
+- auth_request SSRF 防护：禁止内网回环地址 (`62206a1`)
+- Admin API 安全：constant-time token 比较、请求行长度限制 (`042bb38`)
+- WebSocket 连接数限制：lock-free CAS 计数器 (`74e03bc`)
+- `proxy_next_upstream`：重试条件细粒度控制 error/timeout/http_502-504 (`c597309`)
+- `proxy_hide_header`：隐藏上游响应头 (`c597309`)
+- IP 访问控制：`allow` / `deny` CIDR 白名单黑名单，location 级别 (`c597309`)
+- `real_ip` 模块：受信代理 CIDR 验证 + 递归 X-Forwarded-For 解析 (`c597309`)
 
 ### 性能架构
 - SO_REUSEPORT 多核扩展：每 worker 线程独立 bind，内核连接负载均衡 (`3de171b`)
@@ -98,14 +113,11 @@
 
 | 功能 | 对应 Nginx | 说明 |
 |------|-----------|------|
-| `proxy_next_upstream` | `proxy_next_upstream` | 重试条件细粒度控制：error / timeout / http_502 / http_503 / http_504 / non_idempotent |
-| `proxy_hide_header` | `proxy_hide_header` | 隐藏上游响应头（X-Powered-By / Server 等），与 `add_headers` 互补 |
-| IP 访问控制 | `allow` / `deny` | IP / CIDR 白名单黑名单，location 级别生效 |
-| `limit_req` | `limit_req` | 请求速率限制：令牌桶 + burst 缓冲 + nodelay 模式，防 CC 攻击 |
-| `real_ip` | `set_real_ip_from` | 多层代理下从 X-Forwarded-For 提取真实客户端 IP |
-| `error_page` | `error_page` | 自定义错误页面（404 / 502 / 503 等），支持内部重定向 |
+| `limit_req` burst | `limit_req burst=N nodelay` | 令牌桶 burst 缓冲 + nodelay 模式 |
+| `error_page` 内部重定向 | `error_page` | 自定义错误页面支持内部重定向（`=` 前缀改状态码） |
 | Graceful shutdown | — | 优雅关闭：等待活跃连接处理完毕再退出，滚动部署必备 |
 | TCP/UDP 四层代理 | `stream {}` 模块 | 纯字节转发，无协议解析，支持数据库/SSH/任意 TCP 代理 |
+| Windows TransmitFile | — | Windows 平台零拷贝文件传输 |
 
 ### 中优先级
 
@@ -154,4 +166,4 @@
 
 ---
 
-*最后更新：2026-04-06*
+*最后更新：2026-05-28*

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 use crate::config::model::{RewriteFlag, RewriteRule};
 
@@ -141,7 +141,7 @@ pub struct CompiledRewrite {
 impl CompiledRewrite {
     /// 从 RewriteRule 构建，编译失败返回 None
     pub fn new(rule: RewriteRule) -> Option<Self> {
-        match Regex::new(&rule.pattern) {
+        match RegexBuilder::new(&rule.pattern).size_limit(1 << 20).build() {
             Ok(regex) => Some(Self { rule, regex }),
             Err(e) => {
                 tracing::warn!("Rewrite 规则正则编译失败 '{}': {}", rule.pattern, e);

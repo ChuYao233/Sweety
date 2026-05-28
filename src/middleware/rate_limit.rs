@@ -172,7 +172,7 @@ pub struct RateLimiter {
 impl RateLimiter {
     pub fn new(rule: RateLimitRule) -> Self {
         let path_regex = rule.path_pattern.as_deref()
-            .and_then(|p| match regex::Regex::new(p) {
+            .and_then(|p| match regex::RegexBuilder::new(p).size_limit(1 << 20).build() {
                 Ok(re) => Some(re),
                 Err(e) => {
                     tracing::warn!("限流规则路径正则编译失败 '{}': {}", p, e);

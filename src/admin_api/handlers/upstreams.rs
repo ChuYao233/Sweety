@@ -1,6 +1,5 @@
 //! Upstreams 端点：列表 / 详情 / 节点操作 / Caddy 兼容格式
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use tracing::info;
@@ -111,9 +110,8 @@ pub async fn route_upstream_node_action(ctx: &AdminContext, req: &ParsedRequest)
                         match serde_json::from_slice::<serde_json::Value>(&req.body) {
                             Ok(v) => {
                                 if let Some(w) = v.get("weight").and_then(|w| w.as_u64()) {
-                                    let node_ptr = Arc::as_ptr(node) as *mut crate::handler::reverse_proxy::lb::NodeState;
-                                    // SAFETY: weight 字段在 pick() 中只做读取，admin API 单线程写入
-                                    unsafe { (*node_ptr).weight = w as u32; }
+                                    // 安全修复：使用 AtomicU32::store 替代 unsafe 指针写入
+                                    node.weight.store(w as u32, std::sync::atomic::Ordering::Relaxed);
                                     info!("管理 API 修改节点权重: {} / {} → {}", name, addr, w);
                                     return Some((200, ok_json(&format!("节点 {} 权重已更新为 {}", addr, w))));
                                 }

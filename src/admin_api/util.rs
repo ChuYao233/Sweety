@@ -28,24 +28,19 @@ pub fn build_response(status: u16, body: &str, content_type: &str) -> String {
         404 => "Not Found", 405 => "Method Not Allowed",
         500 => "Internal Server Error", _ => "Unknown",
     };
+    // 安全修复：移除 CORS 通配符，Admin API 不应允许任意来源跨域访问
     format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Authorization, Content-Type\r\n\
          Connection: close\r\n\r\n{}",
         status, status_text, content_type, body.len(), body
     )
 }
 
+/// 安全修复：preflight 不设置通配符 CORS，仅允许同源请求
 pub fn cors_preflight_response() -> String {
     "HTTP/1.1 204 No Content\r\n\
-     Access-Control-Allow-Origin: *\r\n\
-     Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
-     Access-Control-Allow-Headers: Authorization, Content-Type\r\n\
-     Access-Control-Max-Age: 86400\r\n\
      Content-Length: 0\r\n\
      Connection: close\r\n\r\n"
         .to_string()
